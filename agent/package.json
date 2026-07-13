@@ -1,0 +1,12 @@
+{
+  "name": "zocoia-agent-sandbox",
+  "version": "1.0.0",
+  "description": "Agente de ejemplo de Zoco IA: pide codigo al modelo via el gateway y lo ejecuta en un sandbox Docker real",
+  "main": "agent.js",
+  "scripts": {
+    "start": "node agent.js"
+  },
+  "dependencies": {
+    "node-fetch": "^2.7.0"
+  }
+}
