@@ -3,10 +3,20 @@ const express = require('express');
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
 const fetch = require('node-fetch');
+const fs = require('fs');
+const path = require('path');
 
 const PORT = process.env.PORT || 4000;
 const VLLM_URL = process.env.VLLM_URL || 'http://localhost:8000/v1';
 const DB_PATH = process.env.DB_PATH || './data/gateway.db';
+
+// better-sqlite3 no crea el directorio padre por si solo: si falta, falla al
+// arrancar. Lo creamos aqui para que funcione tanto en Docker (donde el
+// volumen ya lo crea) como en local.
+const dbDir = path.dirname(DB_PATH);
+if (dbDir && dbDir !== '.' && !fs.existsSync(dbDir)) {
+  fs.mkdirSync(dbDir, { recursive: true });
+}
 
 const db = new Database(DB_PATH);
 db.exec(`
