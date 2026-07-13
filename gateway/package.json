@@ -1,0 +1,15 @@
+{
+  "name": "zocoia-gateway",
+  "version": "1.0.0",
+  "description": "Gateway de Zoco IA: autenticacion y medicion de uso delante de vLLM",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "create-key": "node server.js create-key"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "better-sqlite3": "^11.3.0",
+    "node-fetch": "^2.7.0"
+  }
+}
