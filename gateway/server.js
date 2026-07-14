@@ -23,17 +23,32 @@ if (dbDir && dbDir !== '.' && !fs.existsSync(dbDir)) {
 // ─── Base de datos ────────────────────────────────────────────────────────────
 const db = new Database(DB_PATH);
 db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    nombre TEXT NOT NULL,
+    rol TEXT DEFAULT 'cliente',
+    saldo REAL DEFAULT 0,
+    tokens_comprados INTEGER DEFAULT 0,
+    tokens_usados INTEGER DEFAULT 0,
+    activo INTEGER DEFAULT 1,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+
   CREATE TABLE IF NOT EXISTS api_keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     key_hash TEXT UNIQUE NOT NULL,
     owner_name TEXT NOT NULL,
     owner_email TEXT DEFAULT NULL,
+    owner_id INTEGER,
     active INTEGER DEFAULT 1,
     monthly_token_limit INTEGER DEFAULT NULL,
     monthly_usd_limit REAL DEFAULT NULL,
     price_per_1k_tokens REAL DEFAULT 0.001,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    notes TEXT DEFAULT NULL
+    notes TEXT DEFAULT NULL,
+    FOREIGN KEY (owner_id) REFERENCES users(id)
   );
 
   CREATE TABLE IF NOT EXISTS usage_log (
@@ -57,6 +72,29 @@ db.exec(`
     price_per_1k_tokens REAL DEFAULT 0.001,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
   );
+
+  CREATE TABLE IF NOT EXISTS agents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    nombre TEXT NOT NULL,
+    modelo TEXT NOT NULL,
+    estado TEXT DEFAULT 'inactivo',
+    sesiones INTEGER DEFAULT 0,
+    ultima_actividad TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    tipo TEXT,
+    monto REAL,
+    tokens INTEGER,
+    descripcion TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
 `);
 
 // Registrar modelos por defecto si no existen
@@ -73,17 +111,29 @@ for (const m of modelosDefecto) {
   }
 }
 
+// Crear usuario admin si no existe
+const adminExists = db.prepare('SELECT id FROM users WHERE email = ?').get('rrhh.milchollos@gmail.com');
+if (!adminExists) {
+  const adminPasswordHash = crypto.createHash('sha256').update('19862210Des').digest('hex');
+  db.prepare('INSERT INTO users (email, password_hash, nombre, rol, saldo, tokens_comprados) VALUES (?, ?, ?, ?, ?, ?)')
+    .run('rrhh.milchollos@gmail.com', adminPasswordHash, 'Administrador', 'admin', 0, 0);
+}
+
 // ─── Utilidades ───────────────────────────────────────────────────────────────
 function hashKey(rawKey) {
   return crypto.createHash('sha256').update(rawKey).digest('hex');
 }
 
-function generateApiKey(ownerName, ownerEmail, monthlyTokenLimit, monthlyUsdLimit, notes) {
+function hashPassword(password) {
+  return crypto.createHash('sha256').update(password).digest('hex');
+}
+
+function generateApiKey(ownerName, ownerEmail, ownerUserId, monthlyTokenLimit, monthlyUsdLimit, notes) {
   const rawKey = 'sk-marisai-' + crypto.randomBytes(24).toString('hex');
   const keyHash = hashKey(rawKey);
   db.prepare(
-    'INSERT INTO api_keys (key_hash, owner_name, owner_email, monthly_token_limit, monthly_usd_limit, notes) VALUES (?, ?, ?, ?, ?, ?)'
-  ).run(keyHash, ownerName, ownerEmail || null, monthlyTokenLimit || null, monthlyUsdLimit || null, notes || null);
+    'INSERT INTO api_keys (key_hash, owner_name, owner_email, owner_id, monthly_token_limit, monthly_usd_limit, notes) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(keyHash, ownerName, ownerEmail || null, ownerUserId || null, monthlyTokenLimit || null, monthlyUsdLimit || null, notes || null);
   return rawKey;
 }
 
@@ -144,6 +194,59 @@ function authMiddleware(req, res, next) {
   req.apiKeyRow = keyRow;
   next();
 }
+
+// ─── Endpoints de autenticacion ───────────────────────────────────────────────
+
+app.post('/auth/register', (req, res) => {
+  const { email, password, nombre } = req.body;
+  
+  if (!email || !password || !nombre) {
+    return res.status(400).json({ error: 'Email, contraseña y nombre son requeridos' });
+  }
+
+  const exists = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+  if (exists) {
+    return res.status(400).json({ error: 'El email ya está registrado' });
+  }
+
+  const passwordHash = hashPassword(password);
+  try {
+    db.prepare('INSERT INTO users (email, password_hash, nombre, rol) VALUES (?, ?, ?, ?)')
+      .run(email, passwordHash, nombre, 'cliente');
+    res.json({ message: 'Usuario registrado correctamente' });
+  } catch (err) {
+    res.status(500).json({ error: 'Error al registrar usuario' });
+  }
+});
+
+app.post('/auth/login', (req, res) => {
+  const { email, password } = req.body;
+  
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email y contraseña son requeridos' });
+  }
+
+  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  
+  if (!user) {
+    return res.status(401).json({ error: 'Email o contraseña incorrectos' });
+  }
+
+  const passwordHash = hashPassword(password);
+  if (user.password_hash !== passwordHash) {
+    return res.status(401).json({ error: 'Email o contraseña incorrectos' });
+  }
+
+  res.json({
+    id: user.id,
+    email: user.email,
+    nombre: user.nombre,
+    rol: user.rol,
+    saldo: user.saldo,
+    tokens_comprados: user.tokens_comprados,
+    tokens_usados: user.tokens_usados,
+  });
+});
 
 // ─── Endpoints de inferencia (compatibles con OpenAI) ────────────────────────
 
@@ -217,7 +320,7 @@ app.post('/admin/keys', authMiddleware, (req, res) => {
   if (!req.isAdmin) return res.status(403).json({ error: 'Solo accesible con ADMIN_KEY' });
   const { owner_name, owner_email, monthly_token_limit, monthly_usd_limit, notes } = req.body;
   if (!owner_name) return res.status(400).json({ error: 'owner_name es requerido' });
-  const rawKey = generateApiKey(owner_name, owner_email, monthly_token_limit, monthly_usd_limit, notes);
+  const rawKey = generateApiKey(owner_name, owner_email, null, monthly_token_limit, monthly_usd_limit, notes);
   res.json({ api_key: rawKey, message: 'Guarda esta clave ahora, no se puede recuperar despues.' });
 });
 
@@ -225,6 +328,12 @@ app.delete('/admin/keys/:id', authMiddleware, (req, res) => {
   if (!req.isAdmin) return res.status(403).json({ error: 'Solo accesible con ADMIN_KEY' });
   db.prepare('UPDATE api_keys SET active = 0 WHERE id = ?').run(req.params.id);
   res.json({ message: 'Clave desactivada correctamente' });
+});
+
+app.get('/admin/users', authMiddleware, (req, res) => {
+  if (!req.isAdmin) return res.status(403).json({ error: 'Solo accesible con ADMIN_KEY' });
+  const users = db.prepare('SELECT id, email, nombre, rol, saldo, tokens_comprados, tokens_usados, activo, created_at FROM users').all();
+  res.json(users);
 });
 
 app.get('/admin/stats', authMiddleware, (req, res) => {
@@ -238,10 +347,12 @@ app.get('/admin/stats', authMiddleware, (req, res) => {
     WHERE strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
   `).get();
   const activeKeys = db.prepare('SELECT COUNT(*) AS total FROM api_keys WHERE active = 1').get();
+  const activeUsers = db.prepare('SELECT COUNT(*) AS total FROM users WHERE activo = 1').get();
   res.json({
     tokens_this_month: totalTokens.total,
     requests_this_month: totalRequests.total,
     active_keys: activeKeys.total,
+    active_users: activeUsers.total,
   });
 });
 
@@ -256,7 +367,7 @@ if (require.main === module) {
     const owner = args[1] || 'sin-nombre';
     const email = args[2] || null;
     const tokenLimit = args[3] ? parseInt(args[3], 10) : null;
-    const key = generateApiKey(owner, email, tokenLimit, null, null);
+    const key = generateApiKey(owner, email, null, tokenLimit, null, null);
     console.log(`\nAPI key creada para "${owner}":`);
     console.log(key);
     console.log('\nGuardala ahora, no se puede recuperar despues (solo se almacena el hash).\n');
