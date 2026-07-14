@@ -1,7 +1,7 @@
 {
-  "name": "zocoia-gateway",
-  "version": "1.0.0",
-  "description": "Gateway de Zoco IA: autenticacion y medicion de uso delante de vLLM",
+  "name": "maris-ai-gateway",
+  "version": "2.0.0",
+  "description": "Maris AI Gateway: autenticacion, medicion de uso y facturacion delante de vLLM/Ollama",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

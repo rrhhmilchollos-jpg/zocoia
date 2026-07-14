@@ -1,4 +1,7 @@
-// Zoco IA — gateway de autenticacion y medicion de uso delante de vLLM
+// Maris AI — Gateway de autenticacion y medicion de uso delante de vLLM/Ollama
+// Capa propia en Express: sin esto no puedes controlar ni cobrar a nadie.
+// Compatible con OpenAI API: cualquier cliente que use openai-python, curl, etc.
+
 const express = require('express');
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
@@ -9,24 +12,28 @@ const path = require('path');
 const PORT = process.env.PORT || 4000;
 const VLLM_URL = process.env.VLLM_URL || 'http://localhost:8000/v1';
 const DB_PATH = process.env.DB_PATH || './data/gateway.db';
+const ADMIN_KEY = process.env.ADMIN_KEY || null;
 
-// better-sqlite3 no crea el directorio padre por si solo: si falta, falla al
-// arrancar. Lo creamos aqui para que funcione tanto en Docker (donde el
-// volumen ya lo crea) como en local.
+// Crear directorio de base de datos si no existe
 const dbDir = path.dirname(DB_PATH);
 if (dbDir && dbDir !== '.' && !fs.existsSync(dbDir)) {
   fs.mkdirSync(dbDir, { recursive: true });
 }
 
+// ─── Base de datos ────────────────────────────────────────────────────────────
 const db = new Database(DB_PATH);
 db.exec(`
   CREATE TABLE IF NOT EXISTS api_keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     key_hash TEXT UNIQUE NOT NULL,
     owner_name TEXT NOT NULL,
+    owner_email TEXT DEFAULT NULL,
     active INTEGER DEFAULT 1,
     monthly_token_limit INTEGER DEFAULT NULL,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    monthly_usd_limit REAL DEFAULT NULL,
+    price_per_1k_tokens REAL DEFAULT 0.001,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    notes TEXT DEFAULT NULL
   );
 
   CREATE TABLE IF NOT EXISTS usage_log (
@@ -35,38 +42,78 @@ db.exec(`
     prompt_tokens INTEGER DEFAULT 0,
     completion_tokens INTEGER DEFAULT 0,
     model TEXT,
+    endpoint TEXT DEFAULT '/v1/chat/completions',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (key_id) REFERENCES api_keys(id)
   );
+
+  CREATE TABLE IF NOT EXISTS models_registry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_id TEXT UNIQUE NOT NULL,
+    display_name TEXT NOT NULL,
+    equivalencia TEXT DEFAULT NULL,
+    backend_url TEXT NOT NULL,
+    active INTEGER DEFAULT 1,
+    price_per_1k_tokens REAL DEFAULT 0.001,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
 `);
 
+// Registrar modelos por defecto si no existen
+const modelosDefecto = [
+  { model_id: 'maris-velox-1b', display_name: 'Maris Velox 1B', equivalencia: 'Equiv. Haiku 4.5', active: 1, price: 0.0005 },
+  { model_id: 'maris-core-7b', display_name: 'Maris Core 7B', equivalencia: 'Equiv. Sonnet 5', active: 0, price: 0.002 },
+  { model_id: 'maris-pro-32b', display_name: 'Maris Pro 32B', equivalencia: 'Equiv. Opus 4.8', active: 0, price: 0.01 },
+];
+for (const m of modelosDefecto) {
+  const exists = db.prepare('SELECT id FROM models_registry WHERE model_id = ?').get(m.model_id);
+  if (!exists) {
+    db.prepare('INSERT INTO models_registry (model_id, display_name, equivalencia, backend_url, active, price_per_1k_tokens) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(m.model_id, m.display_name, m.equivalencia, VLLM_URL, m.active, m.price);
+  }
+}
+
+// ─── Utilidades ───────────────────────────────────────────────────────────────
 function hashKey(rawKey) {
   return crypto.createHash('sha256').update(rawKey).digest('hex');
 }
 
-function generateApiKey(ownerName, monthlyLimit = null) {
-  const rawKey = 'sk-priv-' + crypto.randomBytes(24).toString('hex');
+function generateApiKey(ownerName, ownerEmail, monthlyTokenLimit, monthlyUsdLimit, notes) {
+  const rawKey = 'sk-marisai-' + crypto.randomBytes(24).toString('hex');
   const keyHash = hashKey(rawKey);
   db.prepare(
-    'INSERT INTO api_keys (key_hash, owner_name, monthly_token_limit) VALUES (?, ?, ?)'
-  ).run(keyHash, ownerName, monthlyLimit);
+    'INSERT INTO api_keys (key_hash, owner_name, owner_email, monthly_token_limit, monthly_usd_limit, notes) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(keyHash, ownerName, ownerEmail || null, monthlyTokenLimit || null, monthlyUsdLimit || null, notes || null);
   return rawKey;
 }
 
 function getUsageThisMonth(keyId) {
   const row = db.prepare(`
-    SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS total
+    SELECT
+      COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS total_tokens,
+      COUNT(*) AS total_requests
     FROM usage_log
     WHERE key_id = ?
       AND strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
   `).get(keyId);
-  return row.total;
+  return row;
 }
 
+// ─── Aplicacion Express ───────────────────────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
+// CORS
 app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
+// Middleware de autenticacion
+function authMiddleware(req, res, next) {
   const authHeader = req.headers['authorization'] || '';
   const rawKey = authHeader.replace('Bearer ', '').trim();
 
@@ -74,75 +121,153 @@ app.use((req, res, next) => {
     return res.status(401).json({ error: 'Falta cabecera Authorization: Bearer <api_key>' });
   }
 
+  if (ADMIN_KEY && rawKey === ADMIN_KEY) {
+    req.isAdmin = true;
+    req.apiKeyRow = { id: 0, owner_name: 'admin', active: 1 };
+    return next();
+  }
+
   const keyHash = hashKey(rawKey);
-  const keyRow = db.prepare(
-    'SELECT * FROM api_keys WHERE key_hash = ? AND active = 1'
-  ).get(keyHash);
+  const keyRow = db.prepare('SELECT * FROM api_keys WHERE key_hash = ? AND active = 1').get(keyHash);
 
   if (!keyRow) {
-    return res.status(401).json({ error: 'API key inválida o desactivada' });
+    return res.status(401).json({ error: 'API key invalida o desactivada' });
   }
 
   if (keyRow.monthly_token_limit) {
-    const used = getUsageThisMonth(keyRow.id);
-    if (used >= keyRow.monthly_token_limit) {
-      return res.status(429).json({ error: 'Límite mensual de tokens alcanzado para esta key' });
+    const usage = getUsageThisMonth(keyRow.id);
+    if (usage.total_tokens >= keyRow.monthly_token_limit) {
+      return res.status(429).json({ error: 'Limite mensual de tokens alcanzado para esta key' });
     }
   }
 
   req.apiKeyRow = keyRow;
   next();
-});
+}
 
-app.post('/v1/chat/completions', async (req, res) => {
+// ─── Endpoints de inferencia (compatibles con OpenAI) ────────────────────────
+
+app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
   try {
-    const upstream = await fetch(`${VLLM_URL}/chat/completions`, {
+    const modelId = req.body.model || 'maris-velox-1b';
+    const modelRow = db.prepare('SELECT * FROM models_registry WHERE model_id = ? AND active = 1').get(modelId);
+    const backendUrl = modelRow ? modelRow.backend_url : VLLM_URL;
+
+    const upstream = await fetch(`${backendUrl}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body)
+      body: JSON.stringify(req.body),
     });
 
     const data = await upstream.json();
-
     const promptTokens = data.usage?.prompt_tokens || 0;
     const completionTokens = data.usage?.completion_tokens || 0;
 
-    db.prepare(`
-      INSERT INTO usage_log (key_id, prompt_tokens, completion_tokens, model)
-      VALUES (?, ?, ?, ?)
-    `).run(req.apiKeyRow.id, promptTokens, completionTokens, req.body.model || 'desconocido');
+    if (req.apiKeyRow.id !== 0) {
+      db.prepare('INSERT INTO usage_log (key_id, prompt_tokens, completion_tokens, model, endpoint) VALUES (?, ?, ?, ?, ?)')
+        .run(req.apiKeyRow.id, promptTokens, completionTokens, modelId, '/v1/chat/completions');
+    }
 
     res.status(upstream.status).json(data);
   } catch (err) {
-    console.error('Error al reenviar a vLLM:', err.message);
-    res.status(502).json({ error: 'El servidor de inferencia no respondió' });
+    console.error('Error al reenviar a backend:', err.message);
+    res.status(502).json({ error: 'El servidor de inferencia no respondio', detail: err.message });
   }
 });
 
-app.get('/v1/usage', (req, res) => {
-  const used = getUsageThisMonth(req.apiKeyRow.id);
+app.get('/v1/models', authMiddleware, (req, res) => {
+  const modelos = db.prepare('SELECT * FROM models_registry WHERE active = 1').all();
   res.json({
-    owner: req.apiKeyRow.owner_name,
-    tokens_used_this_month: used,
-    monthly_limit: req.apiKeyRow.monthly_token_limit
+    object: 'list',
+    data: modelos.map(m => ({
+      id: m.model_id,
+      object: 'model',
+      created: Math.floor(new Date(m.created_at).getTime() / 1000),
+      owned_by: 'maris-ai',
+      display_name: m.display_name,
+      equivalencia: m.equivalencia,
+    }))
   });
 });
 
+app.get('/v1/usage', authMiddleware, (req, res) => {
+  const usage = getUsageThisMonth(req.apiKeyRow.id);
+  res.json({
+    owner: req.apiKeyRow.owner_name,
+    tokens_used_this_month: usage.total_tokens,
+    requests_this_month: usage.total_requests,
+    monthly_token_limit: req.apiKeyRow.monthly_token_limit,
+    monthly_usd_limit: req.apiKeyRow.monthly_usd_limit,
+  });
+});
+
+// ─── Endpoints de administracion ──────────────────────────────────────────────
+
+app.get('/admin/keys', authMiddleware, (req, res) => {
+  if (!req.isAdmin) return res.status(403).json({ error: 'Solo accesible con ADMIN_KEY' });
+  const keys = db.prepare('SELECT id, owner_name, owner_email, active, monthly_token_limit, monthly_usd_limit, created_at, notes FROM api_keys').all();
+  const result = keys.map(k => {
+    const usage = getUsageThisMonth(k.id);
+    return { ...k, tokens_this_month: usage.total_tokens, requests_this_month: usage.total_requests };
+  });
+  res.json(result);
+});
+
+app.post('/admin/keys', authMiddleware, (req, res) => {
+  if (!req.isAdmin) return res.status(403).json({ error: 'Solo accesible con ADMIN_KEY' });
+  const { owner_name, owner_email, monthly_token_limit, monthly_usd_limit, notes } = req.body;
+  if (!owner_name) return res.status(400).json({ error: 'owner_name es requerido' });
+  const rawKey = generateApiKey(owner_name, owner_email, monthly_token_limit, monthly_usd_limit, notes);
+  res.json({ api_key: rawKey, message: 'Guarda esta clave ahora, no se puede recuperar despues.' });
+});
+
+app.delete('/admin/keys/:id', authMiddleware, (req, res) => {
+  if (!req.isAdmin) return res.status(403).json({ error: 'Solo accesible con ADMIN_KEY' });
+  db.prepare('UPDATE api_keys SET active = 0 WHERE id = ?').run(req.params.id);
+  res.json({ message: 'Clave desactivada correctamente' });
+});
+
+app.get('/admin/stats', authMiddleware, (req, res) => {
+  if (!req.isAdmin) return res.status(403).json({ error: 'Solo accesible con ADMIN_KEY' });
+  const totalTokens = db.prepare(`
+    SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS total
+    FROM usage_log WHERE strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
+  `).get();
+  const totalRequests = db.prepare(`
+    SELECT COUNT(*) AS total FROM usage_log
+    WHERE strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
+  `).get();
+  const activeKeys = db.prepare('SELECT COUNT(*) AS total FROM api_keys WHERE active = 1').get();
+  res.json({
+    tokens_this_month: totalTokens.total,
+    requests_this_month: totalRequests.total,
+    active_keys: activeKeys.total,
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', service: 'maris-ai-gateway', version: '2.0.0' });
+});
+
+// ─── CLI ──────────────────────────────────────────────────────────────────────
 if (require.main === module) {
   const args = process.argv.slice(2);
   if (args[0] === 'create-key') {
     const owner = args[1] || 'sin-nombre';
-    const limit = args[2] ? parseInt(args[2], 10) : null;
-    const key = generateApiKey(owner, limit);
-    console.log(`API key creada para "${owner}":`);
+    const email = args[2] || null;
+    const tokenLimit = args[3] ? parseInt(args[3], 10) : null;
+    const key = generateApiKey(owner, email, tokenLimit, null, null);
+    console.log(`\nAPI key creada para "${owner}":`);
     console.log(key);
-    console.log('Guárdala ahora, no se puede recuperar después (solo se almacena el hash).');
+    console.log('\nGuardala ahora, no se puede recuperar despues (solo se almacena el hash).\n');
     process.exit(0);
   }
-}
 
-app.listen(PORT, () => {
-  console.log(`Zoco IA — gateway escuchando en el puerto ${PORT}, reenviando a ${VLLM_URL}`);
-});
+  app.listen(PORT, () => {
+    console.log(`Maris AI Gateway v2.0 — escuchando en puerto ${PORT}`);
+    console.log(`Backend de inferencia: ${VLLM_URL}`);
+    console.log(`Base de datos: ${DB_PATH}`);
+  });
+}
 
 module.exports = { app, generateApiKey };
