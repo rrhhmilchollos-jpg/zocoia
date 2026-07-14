@@ -842,7 +842,7 @@ export default function App() {
           {/* Navegación */}
           {usuarioActual?.rol === 'admin' ? (
             <>
-              <sectionLabel>ADMINISTRACIÓN</sectionLabel>
+              {sectionLabel('ADMINISTRACIÓN')}
               {navItem('admin', '⚙️', 'Dashboard Admin')}
               {navItem('usuarios', '👥', 'Usuarios')}
               {navItem('facturacion', '💳', 'Facturación')}
@@ -851,7 +851,7 @@ export default function App() {
             </>
           ) : (
             <>
-              <sectionLabel>CLIENTE</sectionLabel>
+              {sectionLabel('CLIENTE')}
               {navItem('control', '📊', 'Panel de Control')}
               {navItem('tokens', '💰', 'Comprar Tokens')}
               {navItem('claves', '🔑', 'Claves API')}
