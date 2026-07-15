@@ -91,9 +91,38 @@ db.exec(`
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id)
   );
+
+  CREATE TABLE IF NOT EXISTS agent_memory (
+    id TEXT PRIMARY KEY,
+    agente_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (agente_id) REFERENCES resources(id),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS prompt_cache (
+    cache_key TEXT PRIMARY KEY,
+    agente_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    token_estimate INTEGER NOT NULL DEFAULT 0,
+    hits INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    expires_at INTEGER NOT NULL
+  );
 `);
 
+// Migración simple: añade la columna modelo_activo si no existe todavía.
+const userColumns = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
+if (!userColumns.includes('modelo_activo')) {
+  db.exec("ALTER TABLE users ADD COLUMN modelo_activo TEXT DEFAULT 'maris-core-7b'");
+}
+
 const RESOURCE_TYPES = ['agente', 'archivo', 'habilidad', 'lote', 'sesion', 'implementacion', 'entorno', 'credencial', 'memoria'];
+const MODELOS_VALIDOS = ['maris-beta-70b', 'maris-pro-32b', 'maris-core-7b', 'maris-velox-1b'];
+const PROMPT_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutos, igual que la caché efímera de Anthropic
 
 function seedAdminAccount() {
   const email = process.env.ADMIN_EMAIL;
@@ -138,8 +167,14 @@ function publicUser(user) {
     isSupport: !!user.is_support,
     creditos: user.creditos,
     activo: !!user.activo,
+    modeloActivo: user.modelo_activo || 'maris-core-7b',
     createdAt: user.created_at,
   };
+}
+
+function estimateTokens(text) {
+  // Estimación simple (~4 caracteres por token), suficiente para simular la caché.
+  return Math.max(1, Math.ceil((text || '').length / 4));
 }
 
 function authMiddleware(req, res, next) {
@@ -182,14 +217,105 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/v1/chat/completions', authMiddleware, (req, res) => {
+  const { agentId, messages } = req.body || {};
+  const userMessage = Array.isArray(messages) && messages.length ? messages[messages.length - 1] : null;
+
+  // Sin agentId: comportamiento simple sin memoria (compatibilidad hacia atrás).
+  if (!agentId) {
+    return res.json({
+      choices: [{ message: { role: 'assistant', content: 'Conexión en vivo completada desde el servidor de Zoco IA.' } }],
+      usage: { input_tokens: estimateTokens(userMessage?.content), output_tokens: 12, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+  }
+
+  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(agentId, req.auth.sub, 'agente');
+  if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
+
+  // Recupera el historial persistente (memoria) del agente.
+  const historial = db.prepare('SELECT role, content FROM agent_memory WHERE agente_id = ? ORDER BY created_at ASC').all(agentId);
+
+  // La clave de caché representa el "prefijo" estable (system prompt + historial previo).
+  const cachePrefix = JSON.stringify(historial);
+  const cacheKey = crypto.createHash('sha256').update(`${agentId}:${cachePrefix}`).digest('hex');
+  const now = Date.now();
+
+  const existingCache = db.prepare('SELECT * FROM prompt_cache WHERE cache_key = ?').get(cacheKey);
+  let cacheReadTokens = 0;
+  let cacheCreationTokens = 0;
+
+  if (existingCache && existingCache.expires_at > now) {
+    cacheReadTokens = existingCache.token_estimate;
+    db.prepare('UPDATE prompt_cache SET hits = hits + 1, expires_at = ? WHERE cache_key = ?').run(now + PROMPT_CACHE_TTL_MS, cacheKey);
+  } else {
+    cacheCreationTokens = estimateTokens(cachePrefix);
+    db.prepare(
+      'INSERT OR REPLACE INTO prompt_cache (cache_key, agente_id, user_id, token_estimate, hits, expires_at) VALUES (?, ?, ?, ?, 0, ?)'
+    ).run(cacheKey, agentId, req.auth.sub, cacheCreationTokens, now + PROMPT_CACHE_TTL_MS);
+  }
+
+  const respuesta = `[${agente.name}] Conexión en vivo completada. Memoria persistente: ${historial.length} mensajes previos considerados.`;
+
+  // Persiste el mensaje del usuario y la respuesta como parte de la memoria del agente.
+  if (userMessage?.content) {
+    db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)')
+      .run(uuidv4(), agentId, req.auth.sub, 'user', String(userMessage.content));
+  }
+  db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)')
+    .run(uuidv4(), agentId, req.auth.sub, 'assistant', respuesta);
+
   res.json({
-    choices: [{
-      message: {
-        role: 'assistant',
-        content: 'Conexión en vivo completada desde el servidor de Zoco IA.',
-      },
-    }],
+    choices: [{ message: { role: 'assistant', content: respuesta } }],
+    usage: {
+      input_tokens: estimateTokens(userMessage?.content),
+      output_tokens: estimateTokens(respuesta),
+      cache_creation_input_tokens: cacheCreationTokens,
+      cache_read_input_tokens: cacheReadTokens,
+    },
   });
+});
+
+// ─── Selección de modelo activo ────────────────────────────────────────────────
+app.put('/api/user/modelo', authMiddleware, (req, res) => {
+  const { modelo } = req.body || {};
+  if (!MODELOS_VALIDOS.includes(modelo)) return res.status(400).json({ error: 'Modelo no válido' });
+
+  db.prepare('UPDATE users SET modelo_activo = ? WHERE id = ?').run(modelo, req.auth.sub);
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.auth.sub);
+  res.json({ user: publicUser(user) });
+});
+
+// ─── Memoria persistente por agente ─────────────────────────────────────────────
+app.get('/api/agentes/:id/memoria', authMiddleware, (req, res) => {
+  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(req.params.id, req.auth.sub, 'agente');
+  if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
+
+  const mensajes = db.prepare('SELECT id, role, content, created_at FROM agent_memory WHERE agente_id = ? ORDER BY created_at ASC').all(req.params.id);
+  const cacheActiva = db.prepare('SELECT COUNT(*) as count FROM prompt_cache WHERE agente_id = ? AND expires_at > ?').get(req.params.id, Date.now()).count;
+
+  res.json({ mensajes, cacheActiva: cacheActiva > 0 });
+});
+
+app.post('/api/agentes/:id/memoria', authMiddleware, (req, res) => {
+  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(req.params.id, req.auth.sub, 'agente');
+  if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
+
+  const { role, content } = req.body || {};
+  if (!content || !content.trim()) return res.status(400).json({ error: 'El contenido es obligatorio' });
+
+  const id = uuidv4();
+  db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)')
+    .run(id, req.params.id, req.auth.sub, role === 'assistant' ? 'assistant' : 'user', content.trim());
+
+  res.status(201).json({ id, role: role === 'assistant' ? 'assistant' : 'user', content: content.trim() });
+});
+
+app.delete('/api/agentes/:id/memoria', authMiddleware, (req, res) => {
+  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(req.params.id, req.auth.sub, 'agente');
+  if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
+
+  db.prepare('DELETE FROM agent_memory WHERE agente_id = ?').run(req.params.id);
+  db.prepare('DELETE FROM prompt_cache WHERE agente_id = ?').run(req.params.id);
+  res.json({ ok: true });
 });
 
 app.post('/auth/register', (req, res) => {
@@ -387,6 +513,10 @@ app.delete('/api/resources/:id', authMiddleware, (req, res) => {
   const row = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
   if (!row) return res.status(404).json({ error: 'Recurso no encontrado' });
   db.prepare('DELETE FROM resources WHERE id = ?').run(row.id);
+  if (row.type === 'agente') {
+    db.prepare('DELETE FROM agent_memory WHERE agente_id = ?').run(row.id);
+    db.prepare('DELETE FROM prompt_cache WHERE agente_id = ?').run(row.id);
+  }
   res.json({ ok: true });
 });
 
