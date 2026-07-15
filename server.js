@@ -19,9 +19,6 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const port = process.env.PORT || 8080;
 
-// JWT_SECRET: en produccion SIEMPRE debe venir de una variable de entorno.
-// Si no está definida, generamos una aleatoria en cada arranque (las sesiones
-// se invalidarán al reiniciar). Ponla en Railway como JWT_SECRET.
 if (!process.env.JWT_SECRET) {
   console.warn('⚠️  JWT_SECRET no está definido. Usando uno temporal generado al vuelo.');
   console.warn('   Configura JWT_SECRET en las variables de entorno de Railway para producción.');
@@ -30,7 +27,6 @@ const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString('he
 const JWT_EXPIRES_IN = '7d';
 const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hora
 
-// En Railway con volumen persistente, el volumen se monta en /data
 const DB_PATH = process.env.DB_PATH || (process.env.RAILWAY_VOLUME_MOUNT_PATH ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'app.db') : path.join(__dirname, 'data', 'app.db'));
 const dbDir = path.dirname(DB_PATH);
 if (dbDir && !fs.existsSync(dbDir)) {
@@ -62,9 +58,43 @@ db.exec(`
     used INTEGER DEFAULT 0,
     FOREIGN KEY (user_id) REFERENCES users(id)
   );
+
+  CREATE TABLE IF NOT EXISTS api_keys (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    key_prefix TEXT NOT NULL,
+    key_hash TEXT NOT NULL,
+    last_used_at TEXT,
+    revoked INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS resources (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    data TEXT DEFAULT '{}',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS usage_log (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    amount REAL NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'gasto',
+    description TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
 `);
 
-// ─── Sembrado de la cuenta de administracion ──────────────────────────────────
+const RESOURCE_TYPES = ['agente', 'archivo', 'habilidad', 'lote', 'sesion', 'implementacion', 'entorno', 'credencial', 'memoria'];
+
 function seedAdminAccount() {
   const email = process.env.ADMIN_EMAIL;
   const passwordPlain = process.env.ADMIN_PASSWORD;
@@ -91,7 +121,6 @@ seedAdminAccount();
 app.use(cors());
 app.use(express.json());
 
-// ─── Utilidades ────────────────────────────────────────────────────────────────
 function signToken(user) {
   return jwt.sign(
     { sub: user.id, email: user.email, isAdmin: !!user.is_admin, isSupport: !!user.is_support },
@@ -108,6 +137,7 @@ function publicUser(user) {
     isAdmin: !!user.is_admin,
     isSupport: !!user.is_support,
     creditos: user.creditos,
+    activo: !!user.activo,
     createdAt: user.created_at,
   };
 }
@@ -124,11 +154,29 @@ function authMiddleware(req, res, next) {
   }
 }
 
+function requireAdmin(req, res, next) {
+  if (!req.auth.isAdmin && !req.auth.isSupport) return res.status(403).json({ error: 'No autorizado' });
+  next();
+}
+
 function isValidEmail(email) {
   return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
-// ─── Rutas de salud / existentes ────────────────────────────────────────────────
+function getUserOr404(id, res) {
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+  if (!user) {
+    res.status(404).json({ error: 'Usuario no encontrado' });
+    return null;
+  }
+  return user;
+}
+
+function firstOfMonthISO() {
+  const d = new Date();
+  return new Date(d.getFullYear(), d.getMonth(), 1).toISOString();
+}
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'Zoco IA conectado con éxito' });
 });
@@ -144,7 +192,6 @@ app.post('/v1/chat/completions', authMiddleware, (req, res) => {
   });
 });
 
-// ─── Autenticación: registro ────────────────────────────────────────────────────
 app.post('/auth/register', (req, res) => {
   const { email, password, nombre } = req.body || {};
   if (!isValidEmail(email)) return res.status(400).json({ error: 'Email no válido' });
@@ -166,7 +213,6 @@ app.post('/auth/register', (req, res) => {
   res.status(201).json({ token, user: publicUser(user) });
 });
 
-// ─── Autenticación: login ───────────────────────────────────────────────────────
 app.post('/auth/login', (req, res) => {
   const { email, password } = req.body || {};
   if (!isValidEmail(email) || !password) {
@@ -182,14 +228,12 @@ app.post('/auth/login', (req, res) => {
   res.json({ token, user: publicUser(user) });
 });
 
-// ─── Autenticación: usuario actual ──────────────────────────────────────────────
 app.get('/auth/me', authMiddleware, (req, res) => {
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.auth.sub);
   if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
   res.json({ user: publicUser(user) });
 });
 
-// ─── Autenticación: olvidé mi contraseña ───────────────────────────────────────
 app.post('/auth/forgot-password', async (req, res) => {
   const { email } = req.body || {};
   const genericResponse = { message: 'Si el email existe en nuestro sistema, recibirás un enlace de recuperación.' };
@@ -213,7 +257,6 @@ app.post('/auth/forgot-password', async (req, res) => {
   res.json(genericResponse);
 });
 
-// ─── Autenticación: restablecer contraseña ─────────────────────────────────────
 app.post('/auth/reset-password', (req, res) => {
   const { token, password } = req.body || {};
   if (!token || !password || password.length < 8) {
@@ -230,7 +273,6 @@ app.post('/auth/reset-password', (req, res) => {
   res.json({ message: 'Contraseña actualizada correctamente' });
 });
 
-// ─── Envío de email (opcional, vía Resend) ─────────────────────────────────────
 async function sendPasswordResetEmail(toEmail, resetLink) {
   const apiKey = process.env.RESEND_API_KEY;
   const fromEmail = process.env.RESEND_FROM_EMAIL;
@@ -256,23 +298,184 @@ async function sendPasswordResetEmail(toEmail, resetLink) {
   }
 }
 
-// ─── Admin: listar clientes (protegido) ────────────────────────────────────────
-app.get('/admin/clientes', authMiddleware, (req, res) => {
-  if (!req.auth.isAdmin && !req.auth.isSupport) return res.status(403).json({ error: 'No autorizado' });
-  const users = db.prepare('SELECT id, email, nombre, is_admin, is_support, creditos, activo, created_at FROM users ORDER BY created_at DESC').all();
-  res.json(users);
+// ─── Claves de API ──────────────────────────────────────────────────────────────
+app.get('/api/keys', authMiddleware, (req, res) => {
+  const rows = db.prepare(
+    'SELECT id, name, key_prefix, last_used_at, revoked, created_at FROM api_keys WHERE user_id = ? ORDER BY created_at DESC'
+  ).all(req.auth.sub);
+  res.json(rows.map(r => ({
+    id: r.id,
+    name: r.name,
+    display: `${r.key_prefix}${'•'.repeat(16)}`,
+    lastUsedAt: r.last_used_at,
+    revoked: !!r.revoked,
+    createdAt: r.created_at,
+  })));
 });
 
-// ─── Servir el frontend (build de Vite) ────────────────────────────────────────
-// El Dockerfile copia el resultado de "npm run build" (carpeta dist/) aquí como "public".
+app.post('/api/keys', authMiddleware, (req, res) => {
+  const { name } = req.body || {};
+  if (!name || !name.trim()) return res.status(400).json({ error: 'El nombre de la clave es obligatorio' });
+
+  const rawSecret = crypto.randomBytes(24).toString('hex');
+  const fullKey = `sk-zoco-${rawSecret}`;
+  const keyPrefix = `sk-zoco-${rawSecret.slice(0, 6)}`;
+  const keyHash = crypto.createHash('sha256').update(fullKey).digest('hex');
+  const id = uuidv4();
+
+  db.prepare(
+    'INSERT INTO api_keys (id, user_id, name, key_prefix, key_hash) VALUES (?, ?, ?, ?, ?)'
+  ).run(id, req.auth.sub, name.trim(), keyPrefix, keyHash);
+
+  res.status(201).json({ id, name: name.trim(), key: fullKey, createdAt: new Date().toISOString() });
+});
+
+app.delete('/api/keys/:id', authMiddleware, (req, res) => {
+  const key = db.prepare('SELECT * FROM api_keys WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
+  if (!key) return res.status(404).json({ error: 'Clave no encontrada' });
+  db.prepare('DELETE FROM api_keys WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// ─── Recursos genéricos ─────────────────────────────────────────────────────────
+app.get('/api/resources', authMiddleware, (req, res) => {
+  const { type } = req.query;
+  if (type && !RESOURCE_TYPES.includes(type)) return res.status(400).json({ error: 'Tipo de recurso no válido' });
+
+  const rows = type
+    ? db.prepare('SELECT * FROM resources WHERE user_id = ? AND type = ? ORDER BY created_at DESC').all(req.auth.sub, type)
+    : db.prepare('SELECT * FROM resources WHERE user_id = ? ORDER BY created_at DESC').all(req.auth.sub);
+
+  res.json(rows.map(r => ({
+    id: r.id,
+    type: r.type,
+    name: r.name,
+    data: JSON.parse(r.data || '{}'),
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  })));
+});
+
+app.post('/api/resources', authMiddleware, (req, res) => {
+  const { type, name, data } = req.body || {};
+  if (!RESOURCE_TYPES.includes(type)) return res.status(400).json({ error: 'Tipo de recurso no válido' });
+  if (!name || !name.trim()) return res.status(400).json({ error: 'El nombre es obligatorio' });
+
+  const id = uuidv4();
+  db.prepare(
+    'INSERT INTO resources (id, user_id, type, name, data) VALUES (?, ?, ?, ?, ?)'
+  ).run(id, req.auth.sub, type, name.trim(), JSON.stringify(data || {}));
+
+  const row = db.prepare('SELECT * FROM resources WHERE id = ?').get(id);
+  res.status(201).json({ id: row.id, type: row.type, name: row.name, data: JSON.parse(row.data), createdAt: row.created_at });
+});
+
+app.put('/api/resources/:id', authMiddleware, (req, res) => {
+  const row = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
+  if (!row) return res.status(404).json({ error: 'Recurso no encontrado' });
+
+  const { name, data } = req.body || {};
+  const newName = (name && name.trim()) || row.name;
+  const newData = data !== undefined ? JSON.stringify(data) : row.data;
+
+  db.prepare('UPDATE resources SET name = ?, data = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(newName, newData, row.id);
+  const updated = db.prepare('SELECT * FROM resources WHERE id = ?').get(row.id);
+  res.json({ id: updated.id, type: updated.type, name: updated.name, data: JSON.parse(updated.data), updatedAt: updated.updated_at });
+});
+
+app.delete('/api/resources/:id', authMiddleware, (req, res) => {
+  const row = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
+  if (!row) return res.status(404).json({ error: 'Recurso no encontrado' });
+  db.prepare('DELETE FROM resources WHERE id = ?').run(row.id);
+  res.json({ ok: true });
+});
+
+// ─── Facturación / uso real ─────────────────────────────────────────────────────
+app.get('/api/billing/summary', authMiddleware, (req, res) => {
+  const user = getUserOr404(req.auth.sub, res);
+  if (!user) return;
+
+  const monthStart = firstOfMonthISO();
+  const spendRow = db.prepare(
+    "SELECT COALESCE(SUM(amount), 0) as total FROM usage_log WHERE user_id = ? AND kind = 'gasto' AND created_at >= ?"
+  ).get(user.id, monthStart);
+
+  const resourceCounts = db.prepare(
+    'SELECT type, COUNT(*) as count FROM resources WHERE user_id = ? GROUP BY type'
+  ).all(user.id);
+
+  const countsByType = {};
+  RESOURCE_TYPES.forEach(t => { countsByType[t] = 0; });
+  resourceCounts.forEach(r => { countsByType[r.type] = r.count; });
+
+  const keysCount = db.prepare('SELECT COUNT(*) as count FROM api_keys WHERE user_id = ? AND revoked = 0').get(user.id).count;
+
+  res.json({
+    creditos: user.creditos,
+    gastoEsteMes: spendRow.total,
+    recursos: countsByType,
+    clavesActivas: keysCount,
+  });
+});
+
+app.post('/api/billing/topup', authMiddleware, (req, res) => {
+  const { amount } = req.body || {};
+  const value = Number(amount);
+  if (!value || value <= 0) return res.status(400).json({ error: 'El importe debe ser mayor que 0' });
+
+  db.prepare('UPDATE users SET creditos = creditos + ? WHERE id = ?').run(value, req.auth.sub);
+  db.prepare(
+    'INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)'
+  ).run(uuidv4(), req.auth.sub, value, 'recarga', 'Recarga de créditos');
+
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.auth.sub);
+  res.json({ creditos: user.creditos });
+});
+
+// ─── Ollama ──────────────────────────────────────────────────────────────────────
+app.get('/api/system/ollama', authMiddleware, async (req, res) => {
+  const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
+  try {
+    const resp = await fetch(`${ollamaUrl}/api/tags`, { signal: AbortSignal.timeout(3000) });
+    if (!resp.ok) return res.json({ online: false });
+    const data = await resp.json();
+    res.json({ online: true, models: (data.models || []).map(m => m.name) });
+  } catch (err) {
+    res.json({ online: false });
+  }
+});
+
+// ─── Admin: listar clientes ─────────────────────────────────────────────────────
+app.get('/admin/clientes', authMiddleware, requireAdmin, (req, res) => {
+  const users = db.prepare('SELECT id, email, nombre, is_admin, is_support, creditos, activo, created_at FROM users ORDER BY created_at DESC').all();
+  res.json(users.map(publicUser));
+});
+
+// ─── Admin: editar un cliente ───────────────────────────────────────────────────
+app.put('/admin/clientes/:id', authMiddleware, requireAdmin, (req, res) => {
+  const target = getUserOr404(req.params.id, res);
+  if (!target) return;
+
+  const { creditos, activo, isAdmin, isSupport, nombre } = req.body || {};
+  const newCreditos = creditos !== undefined ? Number(creditos) : target.creditos;
+  const newActivo = activo !== undefined ? (activo ? 1 : 0) : target.activo;
+  const newIsAdmin = isAdmin !== undefined ? (isAdmin ? 1 : 0) : target.is_admin;
+  const newIsSupport = isSupport !== undefined ? (isSupport ? 1 : 0) : target.is_support;
+  const newNombre = (nombre && nombre.trim()) || target.nombre;
+
+  db.prepare(
+    'UPDATE users SET creditos = ?, activo = ?, is_admin = ?, is_support = ?, nombre = ? WHERE id = ?'
+  ).run(newCreditos, newActivo, newIsAdmin, newIsSupport, newNombre, target.id);
+
+  const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(target.id);
+  res.json(publicUser(updated));
+});
+
+// ─── Servir el frontend ──────────────────────────────────────────────────────────
 const publicDir = path.join(__dirname, 'public');
 if (fs.existsSync(publicDir)) {
   app.use(express.static(publicDir));
-
-  // Cualquier ruta que NO sea de la API debe devolver index.html,
-  // para que el router de React (react-router-dom) funcione al recargar la página
-  // (por ejemplo /login, /dashboard, /restablecer-password).
-  app.get(/^(?!\/(auth|v1|admin|health)).*/, (req, res) => {
+  app.get(/^(?!\/(auth|v1|admin|health|api)).*/, (req, res) => {
     res.sendFile(path.join(publicDir, 'index.html'));
   });
 } else {
