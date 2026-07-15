@@ -239,7 +239,7 @@ export default function App() {
       id: Date.now(),
       nombre: nuevoKeyNombre,
       token: `sk-marisai-${rnd}...`,
-      limite: nuevoKeyLimite ? `${nuevoKeyLimite} US$` : 'ILIMITADO',
+      limite: nuevoKeyLimite ? `${nuevoKeyLimite} €` : 'ILIMITADO',
       estado: 'Activa',
       uso: 0,
       creada: new Date().toLocaleDateString('es-ES')
@@ -390,7 +390,7 @@ export default function App() {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '16px' }}>
         <Card>
           <div style={{ fontSize: '12px', color: C.gray, marginBottom: '8px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Saldo de la cuenta</div>
-          <div style={{ fontSize: '28px', fontWeight: '700', color: saldo < 0 ? C.red : C.green, marginBottom: '14px' }}>{saldo.toFixed(2)} US$</div>
+          <div style={{ fontSize: '28px', fontWeight: '700', color: saldo < 0 ? C.red : C.green, marginBottom: '14px' }}>{saldo.toFixed(2)} €</div>
           {saldo < 0 ? (
             <button onClick={() => setSeccion('recarga')} style={{ width: '100%', backgroundColor: '#ef4444', color: 'white', border: 'none', padding: '10px', borderRadius: '10px', fontWeight: '600', fontSize: '13px', cursor: 'pointer' }}>
               Añadir fondos con Viva.com
@@ -412,7 +412,7 @@ export default function App() {
         <Card>
           <div style={{ fontSize: '12px', color: C.gray, marginBottom: '8px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Cache guardada</div>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '14px' }}>
-            <div style={{ fontSize: '28px', fontWeight: '700', color: C.green }}>~1 US$</div>
+            <div style={{ fontSize: '28px', fontWeight: '700', color: C.green }}>~1 €</div>
             <Badge color={C.green}>6% aciertos</Badge>
           </div>
           <div style={{ fontSize: '11px', color: C.gray, borderTop: `1px solid ${C.cardBorder}`, paddingTop: '10px' }}>ahorro estimado últimos 7 días</div>
@@ -486,10 +486,10 @@ export default function App() {
               </div>
               <div style={{ fontSize: '12px', color: C.gray, marginBottom: '16px' }}>tokens</div>
               <div style={{ fontSize: '24px', fontWeight: '700', color: C.white, marginBottom: '4px' }}>
-                ${paquete.precio}
+                {paquete.precio} €
               </div>
               <div style={{ fontSize: '11px', color: C.gray, marginBottom: '16px' }}>
-                ${(paquete.precio / (paquete.tokens / 1000000)).toFixed(2)} por millón
+                {(paquete.precio / (paquete.tokens / 1000000)).toFixed(2)} € por millón
               </div>
             </div>
             <Btn variant="primary" onClick={() => comprarTokens(paquete.id)} style={{ width: '100%' }}>
@@ -652,7 +652,7 @@ export default function App() {
       <Card>
         <div style={{ fontSize: '13px', color: C.gray, marginBottom: '20px' }}>Recarga el saldo de tu cuenta Maris AI mediante Viva.com.</div>
         <div style={{ marginBottom: '20px' }}>
-          <label style={{ fontSize: '12px', color: C.gray, display: 'block', marginBottom: '8px', textTransform: 'uppercase' as const, letterSpacing: '0.5px' }}>Importe (US$)</label>
+          <label style={{ fontSize: '12px', color: C.gray, display: 'block', marginBottom: '8px', textTransform: 'uppercase' as const, letterSpacing: '0.5px' }}>Importe (€)</label>
           <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
             {['10', '25', '50', '100'].map(v => (
               <button key={v} onClick={() => setVivaAmount(v)} style={{
@@ -660,7 +660,7 @@ export default function App() {
                 backgroundColor: vivaAmount === v ? C.accent : '#0d1117',
                 color: vivaAmount === v ? '#0b0f19' : C.grayLight,
                 border: `1px solid ${vivaAmount === v ? C.accent : C.cardBorder}`,
-              }}>{v} US$</button>
+              }}>{v} €</button>
             ))}
           </div>
           <input type="number" value={vivaAmount} onChange={e => setVivaAmount(e.target.value)}
@@ -669,11 +669,11 @@ export default function App() {
         </div>
         <div style={{ backgroundColor: '#0d1117', borderRadius: '10px', padding: '14px', marginBottom: '20px', fontSize: '12px', color: C.gray, lineHeight: '1.6' }}>
           <div style={{ color: C.white, fontWeight: '600', marginBottom: '6px' }}>Resumen del pago</div>
-          <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>Saldo actual</span><span style={{ color: C.red }}>{saldo.toFixed(2)} US$</span></div>
-          <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>Recarga</span><span style={{ color: C.green }}>+{parseFloat(vivaAmount || '0').toFixed(2)} US$</span></div>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>Saldo actual</span><span style={{ color: C.red }}>{saldo.toFixed(2)} €</span></div>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>Recarga</span><span style={{ color: C.green }}>+{parseFloat(vivaAmount || '0').toFixed(2)} €</span></div>
           <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: `1px solid ${C.cardBorder}`, paddingTop: '8px', marginTop: '8px', fontWeight: '600', color: C.white }}>
             <span>Saldo resultante</span>
-            <span style={{ color: (saldo + parseFloat(vivaAmount || '0')) >= 0 ? C.green : C.red }}>{(saldo + parseFloat(vivaAmount || '0')).toFixed(2)} US$</span>
+            <span style={{ color: (saldo + parseFloat(vivaAmount || '0')) >= 0 ? C.green : C.red }}>{(saldo + parseFloat(vivaAmount || '0')).toFixed(2)} €</span>
           </div>
         </div>
         <button onClick={procesarPago} style={{ width: '100%', backgroundColor: '#ef4444', color: 'white', border: 'none', padding: '14px', borderRadius: '12px', fontWeight: '700', fontSize: '15px', cursor: 'pointer' }}>
@@ -699,7 +699,7 @@ export default function App() {
         </Card>
         <Card style={{ textAlign: 'center' as const }}>
           <div style={{ fontSize: '11px', color: C.gray, textTransform: 'uppercase' as const, letterSpacing: '0.5px', marginBottom: '8px' }}>Ingresos (mes)</div>
-          <div style={{ fontSize: '32px', fontWeight: '700', color: C.yellow }}>$12,450</div>
+          <div style={{ fontSize: '32px', fontWeight: '700', color: C.yellow }}>12.450 €</div>
         </Card>
         <Card style={{ textAlign: 'center' as const }}>
           <div style={{ fontSize: '11px', color: C.gray, textTransform: 'uppercase' as const, letterSpacing: '0.5px', marginBottom: '8px' }}>Modelos online</div>
@@ -725,7 +725,7 @@ export default function App() {
                   <td style={{ padding: '12px 14px', color: C.text }}>{u.nombre}</td>
                   <td style={{ padding: '12px 14px' }}><Badge color={u.rol === 'admin' ? C.red : C.green}>{u.rol}</Badge></td>
                   <td style={{ padding: '12px 14px', color: C.text }}>{(u.tokensComprados / 1000000).toFixed(1)}M</td>
-                  <td style={{ padding: '12px 14px', color: u.saldo >= 0 ? C.green : C.red }}>${u.saldo.toFixed(2)}</td>
+                  <td style={{ padding: '12px 14px', color: u.saldo >= 0 ? C.green : C.red }}>{u.saldo.toFixed(2)} €</td>
                   <td style={{ padding: '12px 14px', color: C.gray }}>{u.fechaCreacion}</td>
                 </tr>
               ))}
@@ -774,7 +774,7 @@ export default function App() {
             style={{ width: '100%', backgroundColor: '#0d1117', border: `1px solid ${C.cardBorder}`, borderRadius: '8px', padding: '10px 12px', color: C.white, fontSize: '13px', boxSizing: 'border-box' as const }} />
         </div>
         <div style={{ marginBottom: '24px' }}>
-          <label style={{ fontSize: '12px', color: C.gray, display: 'block', marginBottom: '6px' }}>Límite mensual (US$) — dejar vacío para ilimitado</label>
+          <label style={{ fontSize: '12px', color: C.gray, display: 'block', marginBottom: '6px' }}>Límite mensual (€) — dejar vacío para ilimitado</label>
           <input type="number" value={nuevoKeyLimite} onChange={e => setNuevoKeyLimite(e.target.value)} placeholder="50"
             style={{ width: '100%', backgroundColor: '#0d1117', border: `1px solid ${C.cardBorder}`, borderRadius: '8px', padding: '10px 12px', color: C.white, fontSize: '13px', boxSizing: 'border-box' as const }} />
         </div>
