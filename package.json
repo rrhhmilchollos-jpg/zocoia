@@ -1,24 +1,29 @@
 {
-  "name": "maris-ai-console",
+  "name": "zocoia-app",
   "version": "2.0.0",
-  "description": "Maris AI — Consola de infraestructura propia de inferencia con gestion de API keys y agentes",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "preview": "vite preview",
-    "start": "vite"
+    "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.22.2",
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
-    "@types/react": "^18.2.0",
-    "@types/react-dom": "^18.2.0",
-    "@vitejs/plugin-react": "^4.0.0",
-    "typescript": "^5.0.0",
-    "vite": "^4.4.0"
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@typescript-eslint/eslint-plugin": "^7.15.0",
+    "@typescript-eslint/parser": "^7.15.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "typescript": "^5.2.2",
+    "vite": "^5.3.4"
   }
 }
