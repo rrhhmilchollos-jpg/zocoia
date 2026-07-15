@@ -16,7 +16,7 @@ En la pestaña **"Variables"** del servicio, asegúrate de tener las siguientes:
 | Variable | Valor Sugerido | Descripción |
 |----------|----------------|-------------|
 | `JWT_SECRET` | `genera_una_cadena_larga_aleatoria` | Para mantener las sesiones activas tras reiniciar. |
-| `ADMIN_EMAIL` | `tu-email@ejemplo.com` | El email para tu cuenta de administrador. |
+| `ADMIN_EMAIL` | `rrhh.milchollos@gmail.com` | El email para tu cuenta de administrador. |
 | `ADMIN_PASSWORD` | `tu_contraseña_segura` | La contraseña para tu cuenta de administrador. |
 | `DB_PATH` | `/data/app.db` | Ruta al archivo de base de datos en el volumen. |
 | `RAILWAY_VOLUME_MOUNT_PATH` | `/data` | Punto de montaje del volumen. |
