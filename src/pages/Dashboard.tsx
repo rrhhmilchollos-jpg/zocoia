@@ -35,6 +35,13 @@ interface BillingSummary {
   clavesActivas: number;
 }
 
+interface MemoriaMensaje {
+  id: string;
+  role: string;
+  content: string;
+  created_at: string;
+}
+
 const RESOURCE_TABS: { key: string; label: string; icon: string }[] = [
   { key: 'archivo', label: 'Archivos', icon: 'fa-folder' },
   { key: 'habilidad', label: 'Habilidades', icon: 'fa-bolt' },
@@ -63,6 +70,10 @@ export default function Dashboard() {
   const [serverStatus, setServerStatus] = useState<'checking' | 'online' | 'offline'>('checking');
   const [ollamaOnline, setOllamaOnline] = useState<boolean | null>(null);
   const [activeTab, setActiveTab] = useState('panel');
+  const [selectedModel, setSelectedModel] = useState<string>('maris-core-7b');
+  const [expandedAgentId, setExpandedAgentId] = useState<string | null>(null);
+  const [agentMemory, setAgentMemory] = useState<Record<string, { mensajes: MemoriaMensaje[]; cacheActiva: boolean }>>({});
+  const [memoryLoading, setMemoryLoading] = useState(false);
 
   const authHeaders = useCallback(() => ({
     'Content-Type': 'application/json',
@@ -116,6 +127,10 @@ export default function Dashboard() {
       console.error('Error cargando usuarios:', err);
     }
   }, [authHeaders]);
+
+  useEffect(() => {
+    if (user?.modeloActivo) setSelectedModel(user.modeloActivo);
+  }, [user?.modeloActivo]);
 
   useEffect(() => {
     async function fetchServerStatus() {
@@ -254,6 +269,72 @@ export default function Dashboard() {
       if (res.ok) await loadBilling();
     } catch (err) {
       console.error('Error añadiendo créditos:', err);
+    }
+  };
+
+  const handleSelectModel = async (modelo: string) => {
+    setSelectedModel(modelo);
+    try {
+      const res = await fetch(`${API_BASE}/api/user/modelo`, {
+        method: 'PUT',
+        headers: authHeaders(),
+        body: JSON.stringify({ modelo }),
+      });
+      if (!res.ok) {
+        const errData = await res.json();
+        alert(`Error: ${errData.error || 'No se pudo seleccionar el modelo'}`);
+      }
+    } catch (err) {
+      console.error('Error seleccionando modelo:', err);
+    }
+  };
+
+  const loadAgentMemory = useCallback(async (agentId: string) => {
+    setMemoryLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/agentes/${agentId}/memoria`, { headers: authHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        setAgentMemory((prev) => ({ ...prev, [agentId]: data }));
+      }
+    } catch (err) {
+      console.error('Error cargando memoria del agente:', err);
+    } finally {
+      setMemoryLoading(false);
+    }
+  }, [authHeaders]);
+
+  const handleToggleMemoria = async (agentId: string) => {
+    if (expandedAgentId === agentId) {
+      setExpandedAgentId(null);
+      return;
+    }
+    setExpandedAgentId(agentId);
+    await loadAgentMemory(agentId);
+  };
+
+  const handleAddMemoria = async (agentId: string) => {
+    const content = prompt('Añade un mensaje a la memoria persistente de este agente:');
+    if (!content) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/agentes/${agentId}/memoria`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ role: 'user', content }),
+      });
+      if (res.ok) await loadAgentMemory(agentId);
+    } catch (err) {
+      console.error('Error añadiendo memoria:', err);
+    }
+  };
+
+  const handleClearMemoria = async (agentId: string) => {
+    if (!confirm('¿Borrar toda la memoria persistente y la caché de este agente? No se puede deshacer.')) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/agentes/${agentId}/memoria`, { method: 'DELETE', headers: authHeaders() });
+      if (res.ok) await loadAgentMemory(agentId);
+    } catch (err) {
+      console.error('Error borrando memoria:', err);
     }
   };
 
@@ -497,24 +578,38 @@ export default function Dashboard() {
               <button className="text-[13px] text-gray-500 hover:underline">Comparar modelos</button>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8 text-[12px]">
-              {modelos.map((m) => (
-                <div key={m.nombre} className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden flex flex-col">
-                  <div className={`${m.bg} h-20 flex items-center justify-center`}>
-                    <i className="fa-solid fa-robot text-2xl text-gray-700"></i>
-                  </div>
-                  <div className="p-4 flex flex-col justify-between flex-1">
-                    <div className="flex justify-between items-center mb-1">
-                      <span className="font-bold text-sm text-gray-900">{m.nombre}</span>
-                      {m.badge && <span className="bg-blue-50 text-blue-600 text-[10px] px-2 py-0.5 rounded-full font-medium border border-blue-100">{m.badge}</span>}
+              {modelos.map((m) => {
+                const isSelected = selectedModel === m.backend;
+                return (
+                  <div key={m.nombre} className={`bg-white border rounded-xl shadow-sm overflow-hidden flex flex-col ${isSelected ? 'border-black ring-1 ring-black' : 'border-gray-200'}`}>
+                    <div className={`${m.bg} h-20 flex items-center justify-center relative`}>
+                      <i className="fa-solid fa-robot text-2xl text-gray-700"></i>
+                      {isSelected && (
+                        <span className="absolute top-2 right-2 bg-black text-white text-[9px] px-2 py-0.5 rounded-full font-medium">
+                          <i className="fa-solid fa-check mr-1"></i>Activo
+                        </span>
+                      )}
                     </div>
-                    <p className="text-gray-400 text-[11px] mb-3">{m.equiv}</p>
-                    <div className="flex flex-wrap gap-1.5 mb-4">
-                      {m.tags.map(t => <span key={t} className="bg-gray-50 text-gray-500 px-2 py-0.5 rounded-md border border-gray-100">{t}</span>)}
+                    <div className="p-4 flex flex-col justify-between flex-1">
+                      <div className="flex justify-between items-center mb-1">
+                        <span className="font-bold text-sm text-gray-900">{m.nombre}</span>
+                        {m.badge && <span className="bg-blue-50 text-blue-600 text-[10px] px-2 py-0.5 rounded-full font-medium border border-blue-100">{m.badge}</span>}
+                      </div>
+                      <p className="text-gray-400 text-[11px] mb-3">{m.equiv}</p>
+                      <div className="flex flex-wrap gap-1.5 mb-4">
+                        {m.tags.map(t => <span key={t} className="bg-gray-50 text-gray-500 px-2 py-0.5 rounded-md border border-gray-100">{t}</span>)}
+                      </div>
+                      <button
+                        onClick={() => handleSelectModel(m.backend)}
+                        disabled={isSelected}
+                        className={`w-full py-2 rounded-lg font-medium transition-colors ${isSelected ? 'bg-gray-900 text-white cursor-default' : 'bg-white border border-gray-200 text-gray-700 hover:bg-gray-50'}`}
+                      >
+                        {isSelected ? 'Seleccionado' : 'Seleccionar'}
+                      </button>
                     </div>
-                    <button className="w-full py-2 bg-white border border-gray-200 text-gray-700 rounded-lg font-medium hover:bg-gray-50 transition-colors">Seleccionar</button>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
 
             {/* RECURSOS DESTACADOS */}
@@ -578,20 +673,55 @@ export default function Dashboard() {
                 </div>
               ) : (
                 agentes.map(a => (
-                  <div key={a.id} className="bg-white border border-gray-200 p-4 rounded-xl flex items-center justify-between">
-                    <div className="flex items-center space-x-3">
-                      <div className="w-10 h-10 bg-blue-50 rounded-lg flex items-center justify-center text-blue-600">
-                        <i className="fa-solid fa-robot"></i>
+                  <div key={a.id} className="bg-white border border-gray-200 rounded-xl overflow-hidden">
+                    <div className="p-4 flex items-center justify-between">
+                      <div className="flex items-center space-x-3">
+                        <div className="w-10 h-10 bg-blue-50 rounded-lg flex items-center justify-center text-blue-600">
+                          <i className="fa-solid fa-robot"></i>
+                        </div>
+                        <div>
+                          <p className="font-bold text-gray-900">{a.name}</p>
+                          <p className="text-xs text-gray-400">ID: {a.id}</p>
+                        </div>
                       </div>
-                      <div>
-                        <p className="font-bold text-gray-900">{a.name}</p>
-                        <p className="text-xs text-gray-400">ID: {a.id}</p>
+                      <div className="flex items-center space-x-2">
+                        <span className="bg-green-50 text-green-600 text-[10px] px-2 py-0.5 rounded-full border border-green-100">Activo</span>
+                        {agentMemory[a.id]?.cacheActiva && (
+                          <span className="bg-purple-50 text-purple-600 text-[10px] px-2 py-0.5 rounded-full border border-purple-100">
+                            <i className="fa-solid fa-database mr-1"></i>Caché activa
+                          </span>
+                        )}
+                        <button onClick={() => handleToggleMemoria(a.id)} className="text-gray-400 hover:text-blue-600 text-xs font-medium px-2">
+                          <i className="fa-solid fa-brain mr-1"></i>Memoria
+                        </button>
+                        <button onClick={() => handleDeleteResource(a.id, 'agente')} className="text-gray-400 hover:text-red-500"><i className="fa-solid fa-trash"></i></button>
                       </div>
                     </div>
-                    <div className="flex items-center space-x-2">
-                      <span className="bg-green-50 text-green-600 text-[10px] px-2 py-0.5 rounded-full border border-green-100">Activo</span>
-                      <button onClick={() => handleDeleteResource(a.id, 'agente')} className="text-gray-400 hover:text-red-500"><i className="fa-solid fa-trash"></i></button>
-                    </div>
+
+                    {expandedAgentId === a.id && (
+                      <div className="border-t border-gray-100 bg-gray-50 p-4">
+                        <div className="flex items-center justify-between mb-3">
+                          <p className="text-xs font-bold text-gray-500 uppercase tracking-wide">Memoria persistente del agente</p>
+                          <div className="space-x-3">
+                            <button onClick={() => handleAddMemoria(a.id)} className="text-blue-600 hover:underline text-xs font-medium">Añadir mensaje</button>
+                            <button onClick={() => handleClearMemoria(a.id)} className="text-red-500 hover:underline text-xs font-medium">Borrar memoria y caché</button>
+                          </div>
+                        </div>
+                        {memoryLoading ? (
+                          <p className="text-xs text-gray-400">Cargando...</p>
+                        ) : (agentMemory[a.id]?.mensajes || []).length === 0 ? (
+                          <p className="text-xs text-gray-400">Este agente todavía no tiene memoria guardada. Los mensajes que envíe o reciba se persistirán aquí y se reutilizarán como contexto en cachés futuras, igual que la caché de prompts de Anthropic.</p>
+                        ) : (
+                          <div className="space-y-2 max-h-56 overflow-y-auto">
+                            {(agentMemory[a.id]?.mensajes || []).map((m) => (
+                              <div key={m.id} className={`text-xs p-2 rounded-lg ${m.role === 'assistant' ? 'bg-blue-50 text-blue-800' : 'bg-white text-gray-700 border border-gray-100'}`}>
+                                <span className="font-semibold uppercase mr-2">{m.role === 'assistant' ? 'Agente' : 'Usuario'}</span>{m.content}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 ))
               )}
