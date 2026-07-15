@@ -36,7 +36,7 @@ function App() {
             
             <div className="pt-4 pb-1 px-3 text-[11px] font-bold text-gray-400 uppercase tracking-wider">Compilar</div>
             <a href="#" className="flex items-center justify-between px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50 transition">
-              <div class="flex items-center space-x-3">
+              <div className="flex items-center space-x-3">
                 <i className="fa-solid fa-terminal w-4"></i>
                 <span>Área de trabajo</span>
               </div>
@@ -60,7 +60,7 @@ function App() {
               <i className="fa-solid fa-bolt w-4"></i>
               <span>Inicio rápido</span>
             </a>
-            <a href="#" class="flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50 transition">
+            <a href="#" className="flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50 transition">
               <i className="fa-solid fa-robot w-4"></i>
               <span>Agentes</span>
             </a>
@@ -137,7 +137,7 @@ function App() {
           </div>
           
           <div className="bg-white border border-gray-200 p-5 rounded-xl shadow-sm">
-            <div class="text-gray-400 font-medium">Gasto este mes</div>
+            <div className="text-gray-400 font-medium">Gasto este mes</div>
             <div className="text-2xl font-bold text-gray-900 mt-1">{spend.toFixed(2)} US$</div>
             <div className="text-gray-400 text-[11px] mt-2">de 1000 US$ de límite • se restablece el 1 ago.</div>
             <div className="w-full bg-gray-100 h-1.5 rounded-full mt-2 overflow-hidden"><div className="bg-gray-300 h-full w-[4%]"></div></div>
