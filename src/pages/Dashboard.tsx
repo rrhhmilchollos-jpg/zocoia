@@ -74,6 +74,7 @@ export default function Dashboard() {
   const [expandedAgentId, setExpandedAgentId] = useState<string | null>(null);
   const [agentMemory, setAgentMemory] = useState<Record<string, { mensajes: MemoriaMensaje[]; cacheActiva: boolean }>>({});
   const [memoryLoading, setMemoryLoading] = useState(false);
+  const [modeloDetalle, setModeloDetalle] = useState<{ nombre: string; modelId: string; descripcion: string; backend: string; coste: any; funciones: any } | null>(null);
 
   const authHeaders = useCallback(() => ({
     'Content-Type': 'application/json',
@@ -364,10 +365,34 @@ export default function Dashboard() {
   const totalRecursos = billing ? Object.values(billing.recursos).reduce((a, b) => a + b, 0) : 0;
 
   const modelos = [
-    { nombre: 'Fable 5', badge: 'Nuevo', backend: 'maris-beta-70b', equiv: 'Equiv. Fable 5', tags: ['Más capaz', 'Investigación', 'Tareas de varios días'], color: 'border-t-blue-400', bg: 'bg-blue-100' },
-    { nombre: 'Opus 4.8', badge: null, backend: 'maris-pro-32b', equiv: 'Equiv. Opus 4.8', tags: ['Proyectos complejos', 'Agentes', 'Programación'], color: 'border-t-orange-400', bg: 'bg-orange-100' },
-    { nombre: 'Sonnet 5', badge: 'Nuevo', backend: 'maris-core-7b', equiv: 'Equiv. Sonnet 5', tags: ['Tareas cotidianas', 'Escritura', 'Rentable'], color: 'border-t-gray-400', bg: 'bg-gray-100' },
-    { nombre: 'Haiku 4.5', badge: null, backend: 'maris-velox-1b', equiv: 'Equiv. Haiku 4.5', tags: ['Más rápido', 'Menor coste', 'Alto volumen'], color: 'border-t-green-400', bg: 'bg-green-100' },
+    {
+      nombre: 'Zoco Fable', badge: 'Nuevo', backend: 'maris-beta-70b', modelId: 'zoco-fable-5',
+      descripcion: 'Modelo insignia para los problemas más complejos.',
+      equiv: 'Equiv. Fable 5', tags: ['Más capaz', 'Investigación', 'Tareas de varios días'], bg: 'bg-blue-100',
+      coste: { entrada: 10, salida: 50, cacheEscribir: 12.5, cacheLeer: 1, modoRapidoEntrada: null, modoRapidoSalida: null },
+      funciones: { contexto: '1 M tok', salidaMaxima: '128 mil tok', velocidad: 1, modoRapido: false, pensamientoAdaptativo: true, corteConocimiento: 'ene 2026' },
+    },
+    {
+      nombre: 'Zoco Opus', badge: null, backend: 'maris-pro-32b', modelId: 'zoco-opus-4-8',
+      descripcion: 'Modelo potente para trabajos complejos.',
+      equiv: 'Equiv. Opus 4.8', tags: ['Proyectos complejos', 'Agentes', 'Programación'], bg: 'bg-orange-100',
+      coste: { entrada: 5, salida: 25, cacheEscribir: 6.25, cacheLeer: 0.5, modoRapidoEntrada: 10, modoRapidoSalida: 50 },
+      funciones: { contexto: '1 M tok', salidaMaxima: '128 mil tok', velocidad: 1, modoRapido: true, pensamientoAdaptativo: true, corteConocimiento: 'ene 2026' },
+    },
+    {
+      nombre: 'Zoco Sonnet', badge: 'Nuevo', backend: 'maris-core-7b', modelId: 'zoco-sonnet-5',
+      descripcion: 'Velocidad, coste e inteligencia equilibrados.',
+      equiv: 'Equiv. Sonnet 5', tags: ['Tareas cotidianas', 'Escritura', 'Rentable'], bg: 'bg-gray-100',
+      coste: { entrada: 2, salida: 10, cacheEscribir: 2.5, cacheLeer: 0.2, modoRapidoEntrada: null, modoRapidoSalida: null },
+      funciones: { contexto: '1 M tok', salidaMaxima: '128 mil tok', velocidad: 2, modoRapido: false, pensamientoAdaptativo: true, corteConocimiento: 'ene 2026' },
+    },
+    {
+      nombre: 'Zoco Haiku', badge: null, backend: 'maris-velox-1b', modelId: 'zoco-haiku-4-5',
+      descripcion: 'Inteligencia rápida y casi de vanguardia al menor coste.',
+      equiv: 'Equiv. Haiku 4.5', tags: ['Más rápido', 'Menor coste', 'Alto volumen'], bg: 'bg-green-100',
+      coste: { entrada: 1, salida: 5, cacheEscribir: 1.25, cacheLeer: 0.1, modoRapidoEntrada: null, modoRapidoSalida: null },
+      funciones: { contexto: '200 mil tok', salidaMaxima: '64 mil tok', velocidad: 3, modoRapido: false, pensamientoAdaptativo: false, corteConocimiento: 'feb 2025' },
+    },
   ];
 
   const recursosDestacados = [
@@ -581,7 +606,11 @@ export default function Dashboard() {
               {modelos.map((m) => {
                 const isSelected = selectedModel === m.backend;
                 return (
-                  <div key={m.nombre} className={`bg-white border rounded-xl shadow-sm overflow-hidden flex flex-col ${isSelected ? 'border-black ring-1 ring-black' : 'border-gray-200'}`}>
+                  <div
+                    key={m.nombre}
+                    onClick={() => setModeloDetalle(m)}
+                    className={`bg-white border rounded-xl shadow-sm overflow-hidden flex flex-col cursor-pointer hover:shadow-md transition-shadow ${isSelected ? 'border-black ring-1 ring-black' : 'border-gray-200'}`}
+                  >
                     <div className={`${m.bg} h-20 flex items-center justify-center relative`}>
                       <i className="fa-solid fa-robot text-2xl text-gray-700"></i>
                       {isSelected && (
@@ -600,7 +629,7 @@ export default function Dashboard() {
                         {m.tags.map(t => <span key={t} className="bg-gray-50 text-gray-500 px-2 py-0.5 rounded-md border border-gray-100">{t}</span>)}
                       </div>
                       <button
-                        onClick={() => handleSelectModel(m.backend)}
+                        onClick={(e) => { e.stopPropagation(); handleSelectModel(m.backend); }}
                         disabled={isSelected}
                         className={`w-full py-2 rounded-lg font-medium transition-colors ${isSelected ? 'bg-gray-900 text-white cursor-default' : 'bg-white border border-gray-200 text-gray-700 hover:bg-gray-50'}`}
                       >
