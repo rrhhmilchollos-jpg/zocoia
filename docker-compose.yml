@@ -1,18 +1,17 @@
 version: "3.9"
-
 # ─── Maris AI — Infraestructura completa de inferencia ───────────────────────
 # Servicios:
 #   vllm       -> Servidor de inferencia (GPU requerida para modelos grandes)
-#   ollama     -> Alternativa ligera para modelos pequenos (CPU/GPU)
 #   gateway    -> Capa de autenticacion, medicion y facturacion
 #   nginx      -> Proxy inverso con TLS y rate limiting
 #   agent      -> Agente autonomo con sandbox Docker
 #
-# Para desarrollo local sin GPU: usa solo ollama + gateway + nginx
+# NOTA: Ollama corre de forma NATIVA en el host (Windows), no como contenedor.
+# El gateway se conecta a el mediante host.docker.internal:11434
+#
+# Para desarrollo local sin GPU: usa solo gateway + nginx (con Ollama nativo corriendo)
 # Para produccion con GPU:       despliega en RunPod/Vast.ai con vllm
-
 services:
-
   # Servidor de inferencia vLLM (requiere GPU NVIDIA)
   vllm:
     image: vllm/vllm-openai:latest
@@ -41,30 +40,18 @@ services:
     profiles:
       - gpu
 
-  # Ollama (alternativa ligera, funciona en CPU)
-  ollama:
-    image: ollama/ollama:latest
-    container_name: marisai-ollama
-    restart: unless-stopped
-    volumes:
-      - ollama_data:/root/.ollama
-    ports:
-      - "127.0.0.1:11434:11434"
-    environment:
-      - OLLAMA_HOST=0.0.0.0
-
   # Gateway Maris AI (autenticacion + medicion + facturacion)
   gateway:
     build: ./gateway
     container_name: marisai-gateway
     restart: unless-stopped
-    depends_on:
-      - ollama
     environment:
-      - VLLM_URL=http://ollama:11434/v1
+      - VLLM_URL=http://host.docker.internal:11434/v1
       - PORT=4000
       - DB_PATH=/data/gateway.db
       - ADMIN_KEY=${ADMIN_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./gateway/data:/data
     ports:
@@ -98,6 +85,3 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./agent/workspace:/workspace
-
-volumes:
-  ollama_data:
