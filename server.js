@@ -1,463 +1,384 @@
-// ============================================================
-// ZOCO IA — Servidor unificado de producción
-// Backend completo: autenticación, API keys, agentes, modelos,
-// créditos, analíticas y administración.
-// Sirve también el frontend (carpeta /public).
-// ============================================================
+// Maris AI — Gateway de autenticacion y medicion de uso delante de vLLM/Ollama
+// Capa propia en Express: sin esto no puedes controlar ni cobrar a nadie.
+// Compatible con OpenAI API: cualquier cliente que use openai-python, curl, etc.
+
 const express = require('express');
+const Database = require('better-sqlite3');
 const crypto = require('crypto');
+const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
 
+const PORT = process.env.PORT || 4000;
+const VLLM_URL = process.env.VLLM_URL || 'http://localhost:8000/v1';
+const DB_PATH = process.env.DB_PATH || './data/gateway.db';
+const ADMIN_KEY = process.env.ADMIN_KEY || null;
+
+// Crear directorio de base de datos si no existe
+const dbDir = path.dirname(DB_PATH);
+if (dbDir && dbDir !== '.' && !fs.existsSync(dbDir)) {
+  fs.mkdirSync(dbDir, { recursive: true });
+}
+
+// ─── Base de datos ────────────────────────────────────────────────────────────
+const db = new Database(DB_PATH);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    nombre TEXT NOT NULL,
+    rol TEXT DEFAULT 'cliente',
+    saldo REAL DEFAULT 0,
+    tokens_comprados INTEGER DEFAULT 0,
+    tokens_usados INTEGER DEFAULT 0,
+    activo INTEGER DEFAULT 1,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS api_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_hash TEXT UNIQUE NOT NULL,
+    owner_name TEXT NOT NULL,
+    owner_email TEXT DEFAULT NULL,
+    owner_id INTEGER,
+    active INTEGER DEFAULT 1,
+    monthly_token_limit INTEGER DEFAULT NULL,
+    monthly_usd_limit REAL DEFAULT NULL,
+    price_per_1k_tokens REAL DEFAULT 0.001,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    notes TEXT DEFAULT NULL,
+    FOREIGN KEY (owner_id) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS usage_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_id INTEGER NOT NULL,
+    prompt_tokens INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    model TEXT,
+    endpoint TEXT DEFAULT '/v1/chat/completions',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (key_id) REFERENCES api_keys(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS models_registry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_id TEXT UNIQUE NOT NULL,
+    display_name TEXT NOT NULL,
+    equivalencia TEXT DEFAULT NULL,
+    backend_url TEXT NOT NULL,
+    active INTEGER DEFAULT 1,
+    price_per_1k_tokens REAL DEFAULT 0.001,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS agents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    nombre TEXT NOT NULL,
+    modelo TEXT NOT NULL,
+    estado TEXT DEFAULT 'inactivo',
+    sesiones INTEGER DEFAULT 0,
+    ultima_actividad TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    tipo TEXT,
+    monto REAL,
+    tokens INTEGER,
+    descripcion TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+`);
+
+// Registrar modelos por defecto si no existen
+const modelosDefecto = [
+  { model_id: 'maris-velox-1b', display_name: 'Maris Velox 1B', equivalencia: 'Equiv. Haiku 4.5', active: 1, price: 0.0005 },
+  { model_id: 'maris-core-7b', display_name: 'Maris Core 7B', equivalencia: 'Equiv. Sonnet 5', active: 0, price: 0.002 },
+  { model_id: 'maris-pro-32b', display_name: 'Maris Pro 32B', equivalencia: 'Equiv. Opus 4.8', active: 0, price: 0.01 },
+];
+for (const m of modelosDefecto) {
+  const exists = db.prepare('SELECT id FROM models_registry WHERE model_id = ?').get(m.model_id);
+  if (!exists) {
+    db.prepare('INSERT INTO models_registry (model_id, display_name, equivalencia, backend_url, active, price_per_1k_tokens) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(m.model_id, m.display_name, m.equivalencia, VLLM_URL, m.active, m.price);
+  }
+}
+
+// Crear usuario admin si no existe
+const adminExists = db.prepare('SELECT id FROM users WHERE email = ?').get('rrhh.milchollos@gmail.com');
+if (!adminExists) {
+  const adminPasswordHash = crypto.createHash('sha256').update('19862210Des').digest('hex');
+  db.prepare('INSERT INTO users (email, password_hash, nombre, rol, saldo, tokens_comprados) VALUES (?, ?, ?, ?, ?, ?)')
+    .run('rrhh.milchollos@gmail.com', adminPasswordHash, 'Administrador', 'admin', 0, 0);
+}
+
+// ─── Utilidades ───────────────────────────────────────────────────────────────
+function hashKey(rawKey) {
+  return crypto.createHash('sha256').update(rawKey).digest('hex');
+}
+
+function hashPassword(password) {
+  return crypto.createHash('sha256').update(password).digest('hex');
+}
+
+function generateApiKey(ownerName, ownerEmail, ownerUserId, monthlyTokenLimit, monthlyUsdLimit, notes) {
+  const rawKey = 'sk-marisai-' + crypto.randomBytes(24).toString('hex');
+  const keyHash = hashKey(rawKey);
+  db.prepare(
+    'INSERT INTO api_keys (key_hash, owner_name, owner_email, owner_id, monthly_token_limit, monthly_usd_limit, notes) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(keyHash, ownerName, ownerEmail || null, ownerUserId || null, monthlyTokenLimit || null, monthlyUsdLimit || null, notes || null);
+  return rawKey;
+}
+
+function getUsageThisMonth(keyId) {
+  const row = db.prepare(`
+    SELECT
+      COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS total_tokens,
+      COUNT(*) AS total_requests
+    FROM usage_log
+    WHERE key_id = ?
+      AND strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
+  `).get(keyId);
+  return row;
+}
+
+// ─── Aplicacion Express ───────────────────────────────────────────────────────
 const app = express();
-const PORT = process.env.PORT || 8080;
+app.use(express.json({ limit: '10mb' }));
 
-// ---------- Persistencia (JSON en disco, sin dependencias nativas) ----------
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-const DB_FILE = path.join(DATA_DIR, 'zocoia-db.json');
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-
-const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
-const uid = () => crypto.randomBytes(8).toString('hex');
-const newApiKey = () => 'sk-zocoia-' + crypto.randomBytes(24).toString('hex');
-const newToken = () => 'tok-' + crypto.randomBytes(24).toString('hex');
-
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
-const ADMIN_PASS = process.env.ADMIN_PASS;
-const MASTER_KEY = process.env.ADMIN_KEY;
-
-if (!ADMIN_EMAIL || !ADMIN_PASS || !MASTER_KEY) {
-  console.error('❌ Faltan variables de entorno obligatorias: ADMIN_EMAIL, ADMIN_PASS, ADMIN_KEY.');
-  console.error('   Configuralas en Railway (Variables) antes de desplegar. El servidor no arrancará sin ellas.');
-  process.exit(1);
-}
-
-// Modelos propios de la infraestructura
-const MODELS = [
-  { id: 'maris-fable-70b',  name: 'Fable 5',   equiv: 'Fable 5',  badge: 'Nuevo', color: 'blue',   tags: ['Más capaz', 'Investigación', 'Tareas de varios días'], input: 5.0,  output: 25.0, ctx: 500000 },
-  { id: 'maris-pro-32b',    name: 'Opus 4.8',  equiv: 'Opus 4.8', badge: null,    color: 'orange', tags: ['Proyectos complejos', 'Agentes', 'Programación'],     input: 15.0, output: 75.0, ctx: 200000 },
-  { id: 'maris-core-7b',    name: 'Sonnet 5',  equiv: 'Sonnet 5', badge: 'Nuevo', color: 'beige',  tags: ['Tareas cotidianas', 'Escritura', 'Rentable'],          input: 3.0,  output: 15.0, ctx: 200000 },
-  { id: 'maris-velox-1b',   name: 'Haiku 4.5', equiv: 'Haiku 4.5',badge: null,    color: 'green',  tags: ['Más rápido', 'Menor coste', 'Alto volumen'],           input: 0.8,  output: 4.0,  ctx: 200000 }
-];
-
-// Los 11 agentes del pipeline de Maria
-const DEFAULT_AGENTS = [
-  { n: 1,  name: 'Analista de Requisitos',  icon: 'clipboard-list', model: 'maris-core-7b',  desc: 'Analiza la idea del cliente y extrae requisitos funcionales.' },
-  { n: 2,  name: 'Investigador de Mercado', icon: 'magnifying-glass-chart', model: 'maris-fable-70b', desc: 'Investiga tendencias y competencia para orientar el producto.' },
-  { n: 3,  name: 'Arquitecto de Software',  icon: 'sitemap', model: 'maris-pro-32b',  desc: 'Diseña la arquitectura técnica y la estructura del proyecto.' },
-  { n: 4,  name: 'Maquetador HTML',         icon: 'code', model: 'maris-velox-1b', desc: 'Construye la estructura HTML semántica de la aplicación.' },
-  { n: 5,  name: 'Estilista CSS Custom',    icon: 'palette', model: 'maris-velox-1b', desc: 'Aplica estilos y diseño visual personalizado.' },
-  { n: 6,  name: 'Desarrollador JS',        icon: 'js', model: 'maris-core-7b',  desc: 'Programa la lógica e interactividad del frontend.' },
-  { n: 7,  name: 'Ingeniero Backend',       icon: 'server', model: 'maris-pro-32b',  desc: 'Desarrolla la API, base de datos y lógica de servidor.' },
-  { n: 8,  name: 'Especialista en Seguridad', icon: 'shield-halved', model: 'maris-pro-32b', desc: 'Audita vulnerabilidades y protege la aplicación.' },
-  { n: 9,  name: 'Tester QA',               icon: 'vial-circle-check', model: 'maris-core-7b', desc: 'Prueba la aplicación y reporta errores.' },
-  { n: 10, name: 'Depurador de Código',     icon: 'bug-slash', model: 'maris-pro-32b',  desc: 'Corrige los errores detectados por el tester.' },
-  { n: 11, name: 'Desplegador DevOps',      icon: 'rocket', model: 'maris-velox-1b', desc: 'Prepara y publica la aplicación en producción.' }
-];
-
-function defaultDB() {
-  const adminId = uid();
-  const now = new Date().toISOString();
-  return {
-    users: [{
-      id: adminId, name: 'Maria', email: ADMIN_EMAIL, passHash: sha256(ADMIN_PASS),
-      role: 'admin', credits: 1000.0, spentMonth: 43.73, cacheSaved: 1.02, limitMonth: 1000,
-      createdAt: now, org: 'Maris AI'
-    }],
-    apiKeys: [{
-      id: uid(), userId: adminId, name: 'Clave maestra Maria Admin', key: MASTER_KEY,
-      createdAt: now, lastUsed: now, active: true, spend: 0, budget: null
-    }],
-    agents: DEFAULT_AGENTS.map(a => ({
-      id: uid(), userId: adminId, ...a, status: 'active', createdAt: now, sessions: 0, tokensUsed: 0
-    })),
-    sessions: [],
-    transactions: [],
-    usage: seedUsage(adminId),
-    files: [], skills: [], batches: [], deployments: [], environments: [],
-    credentialStores: [], memoryStores: []
-  };
-}
-function seedUsage(userId) {
-  // 7 días de uso semilla para el gráfico (total ≈ 6M tokens)
-  const out = [];
-  const vals = [420000, 510000, 680000, 750000, 890000, 1160000, 1590000];
-  for (let i = 6; i >= 0; i--) {
-    const d = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10);
-    out.push({ date: d, userId, tokens: vals[6 - i], requests: Math.round(vals[6 - i] / 2100), cost: +(vals[6 - i] / 1e6 * 6.2).toFixed(2) });
-  }
-  return out;
-}
-
-let db;
-function loadDB() {
-  try {
-    db = JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
-    // asegurar admin
-    if (!db.users.find(u => u.email === ADMIN_EMAIL)) {
-      const d = defaultDB();
-      db.users.push(d.users[0]);
-    }
-  } catch {
-    db = defaultDB();
-    saveDB();
-  }
-}
-let saveTimer = null;
-function saveDB() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    try { fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 1)); } catch (e) { console.error('DB save error', e); }
-  }, 150);
-}
-loadDB();
-
-// ---------- Sesiones de login (tokens en memoria + persistidos) ----------
-db.authTokens = db.authTokens || {};
-function authUser(req) {
-  const t = (req.headers.authorization || '').replace('Bearer ', '').trim() || req.headers['x-auth-token'];
-  if (!t) return null;
-  const userId = db.authTokens[t];
-  if (!userId) return null;
-  return db.users.find(u => u.id === userId) || null;
-}
-function requireAuth(req, res, next) {
-  const u = authUser(req);
-  if (!u) return res.status(401).json({ error: { message: 'No autenticado. Inicia sesión.' } });
-  req.user = u; next();
-}
-function requireAdmin(req, res, next) {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: { message: 'Solo administradores.' } });
-  next();
-}
-
-app.use(express.json({ limit: '5mb' }));
+// CORS
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-auth-token, x-api-key');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
 
-// ============ SALUD ============
-app.get('/health', (_, res) => res.json({ status: 'ok', service: 'Zoco IA Console', time: new Date().toISOString() }));
+// Middleware de autenticacion
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers['authorization'] || '';
+  const rawKey = authHeader.replace('Bearer ', '').trim();
 
-// ============ AUTENTICACIÓN ============
+  if (!rawKey) {
+    return res.status(401).json({ error: 'Falta cabecera Authorization: Bearer <api_key>' });
+  }
+
+  if (ADMIN_KEY && rawKey === ADMIN_KEY) {
+    req.isAdmin = true;
+    req.apiKeyRow = { id: 0, owner_name: 'admin', active: 1 };
+    return next();
+  }
+
+  const keyHash = hashKey(rawKey);
+  const keyRow = db.prepare('SELECT * FROM api_keys WHERE key_hash = ? AND active = 1').get(keyHash);
+
+  if (!keyRow) {
+    return res.status(401).json({ error: 'API key invalida o desactivada' });
+  }
+
+  if (keyRow.monthly_token_limit) {
+    const usage = getUsageThisMonth(keyRow.id);
+    if (usage.total_tokens >= keyRow.monthly_token_limit) {
+      return res.status(429).json({ error: 'Limite mensual de tokens alcanzado para esta key' });
+    }
+  }
+
+  req.apiKeyRow = keyRow;
+  next();
+}
+
+// ─── Endpoints de autenticacion ───────────────────────────────────────────────
+
 app.post('/auth/register', (req, res) => {
-  const { name, email, password } = req.body || {};
-  if (!name || !email || !password) return res.status(400).json({ error: { message: 'Faltan datos: nombre, email y contraseña.' } });
-  if (db.users.find(u => u.email.toLowerCase() === String(email).toLowerCase()))
-    return res.status(409).json({ error: { message: 'Ese email ya está registrado. Inicia sesión.' } });
-  const now = new Date().toISOString();
-  const user = { id: uid(), name, email, passHash: sha256(password), role: 'client', credits: 5.0, spentMonth: 0, cacheSaved: 0, limitMonth: 100, createdAt: now, org: name };
-  db.users.push(user);
-  // clave API automática de bienvenida
-  const key = { id: uid(), userId: user.id, name: 'Clave por defecto', key: newApiKey(), createdAt: now, lastUsed: null, active: true, spend: 0, budget: 5 };
-  db.apiKeys.push(key);
-  db.transactions.push({ id: uid(), userId: user.id, type: 'bonus', amount: 5.0, desc: 'Créditos de bienvenida', date: now });
-  const token = newToken();
-  db.authTokens[token] = user.id;
-  saveDB();
-  res.json({ token, user: publicUser(user), apiKey: key.key });
+  const { email, password, nombre } = req.body;
+  
+  if (!email || !password || !nombre) {
+    return res.status(400).json({ error: 'Email, contraseña y nombre son requeridos' });
+  }
+
+  const exists = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+  if (exists) {
+    return res.status(400).json({ error: 'El email ya está registrado' });
+  }
+
+  const passwordHash = hashPassword(password);
+  try {
+    db.prepare('INSERT INTO users (email, password_hash, nombre, rol) VALUES (?, ?, ?, ?)')
+      .run(email, passwordHash, nombre, 'cliente');
+    res.json({ message: 'Usuario registrado correctamente' });
+  } catch (err) {
+    res.status(500).json({ error: 'Error al registrar usuario' });
+  }
 });
 
 app.post('/auth/login', (req, res) => {
-  const { email, password } = req.body || {};
-  const user = db.users.find(u => u.email.toLowerCase() === String(email || '').toLowerCase());
-  if (!user || user.passHash !== sha256(password)) return res.status(401).json({ error: { message: 'Email o contraseña incorrectos.' } });
-  const token = newToken();
-  db.authTokens[token] = user.id;
-  saveDB();
-  res.json({ token, user: publicUser(user) });
-});
-
-app.post('/auth/logout', requireAuth, (req, res) => {
-  const t = (req.headers.authorization || '').replace('Bearer ', '').trim();
-  delete db.authTokens[t]; saveDB();
-  res.json({ ok: true });
-});
-
-app.get('/auth/me', requireAuth, (req, res) => res.json({ user: publicUser(req.user) }));
-
-function publicUser(u) {
-  return { id: u.id, name: u.name, email: u.email, role: u.role, credits: u.credits, spentMonth: u.spentMonth, cacheSaved: u.cacheSaved, limitMonth: u.limitMonth, org: u.org, createdAt: u.createdAt };
-}
-
-// ============ DASHBOARD (métricas del usuario) ============
-app.get('/api/dashboard', requireAuth, (req, res) => {
-  const u = req.user;
-  const myUsage = db.usage.filter(x => x.userId === u.id).slice(-7);
-  const tokens7d = myUsage.reduce((s, x) => s + x.tokens, 0);
-  res.json({
-    user: publicUser(u),
-    credits: u.credits,
-    spentMonth: u.spentMonth,
-    limitMonth: u.limitMonth,
-    cacheSaved: u.cacheSaved,
-    cacheHitRate: 6,
-    tokens7d,
-    usage: myUsage,
-    models: MODELS,
-    agentCount: db.agents.filter(a => a.userId === u.id).length,
-    keyCount: db.apiKeys.filter(k => k.userId === u.id && k.active).length
-  });
-});
-
-// ============ MODELOS ============
-app.get('/api/models', (_, res) => res.json({ data: MODELS }));
-
-// ============ CLAVES API ============
-app.get('/api/keys', requireAuth, (req, res) => {
-  const keys = db.apiKeys.filter(k => k.userId === req.user.id).map(k => ({ ...k, key: maskKey(k.key) }));
-  res.json({ data: keys });
-});
-app.post('/api/keys', requireAuth, (req, res) => {
-  const now = new Date().toISOString();
-  const k = { id: uid(), userId: req.user.id, name: (req.body && req.body.name) || 'Nueva clave', key: newApiKey(), createdAt: now, lastUsed: null, active: true, spend: 0, budget: (req.body && req.body.budget) || null };
-  db.apiKeys.push(k); saveDB();
-  res.json({ ...k }); // se muestra completa SOLO al crearla
-});
-app.delete('/api/keys/:id', requireAuth, (req, res) => {
-  const k = db.apiKeys.find(x => x.id === req.params.id && x.userId === req.user.id);
-  if (!k) return res.status(404).json({ error: { message: 'Clave no encontrada' } });
-  k.active = false; saveDB();
-  res.json({ ok: true });
-});
-function maskKey(k) { return k.slice(0, 14) + '...' + k.slice(-4); }
-
-// ============ AGENTES ============
-app.get('/api/agents', requireAuth, (req, res) => {
-  const list = req.user.role === 'admin' ? db.agents : db.agents.filter(a => a.userId === req.user.id);
-  res.json({ data: list });
-});
-app.post('/api/agents', requireAuth, (req, res) => {
-  const { name, desc, model, icon } = req.body || {};
-  if (!name) return res.status(400).json({ error: { message: 'El agente necesita un nombre.' } });
-  const now = new Date().toISOString();
-  const a = { id: uid(), userId: req.user.id, n: db.agents.filter(x => x.userId === req.user.id).length + 1, name, icon: icon || 'robot', model: model || 'maris-core-7b', desc: desc || '', status: 'active', createdAt: now, sessions: 0, tokensUsed: 0 };
-  db.agents.push(a); saveDB();
-  res.json(a);
-});
-app.patch('/api/agents/:id', requireAuth, (req, res) => {
-  const a = db.agents.find(x => x.id === req.params.id && (x.userId === req.user.id || req.user.role === 'admin'));
-  if (!a) return res.status(404).json({ error: { message: 'Agente no encontrado' } });
-  ['name', 'desc', 'model', 'status', 'icon'].forEach(f => { if (req.body[f] !== undefined) a[f] = req.body[f]; });
-  saveDB(); res.json(a);
-});
-app.delete('/api/agents/:id', requireAuth, (req, res) => {
-  const i = db.agents.findIndex(x => x.id === req.params.id && (x.userId === req.user.id || req.user.role === 'admin'));
-  if (i < 0) return res.status(404).json({ error: { message: 'Agente no encontrado' } });
-  db.agents.splice(i, 1); saveDB();
-  res.json({ ok: true });
-});
-
-// ============ EJECUCIÓN DE AGENTES / CHAT (v1 compatible OpenAI) ============
-// Motor de respuesta: usa OLLAMA_URL o LLM_URL si están configurados; si no, simulador local.
-const LLM_URL = process.env.OLLAMA_URL || process.env.LLM_URL || null;
-
-async function runLLM(model, messages, maxTokens) {
-  if (LLM_URL) {
-    try {
-      const r = await fetch(LLM_URL.replace(/\/$/, '') + '/api/chat', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: process.env.OLLAMA_MODEL || 'llama3.2:1b', messages, stream: false })
-      });
-      if (r.ok) { const j = await r.json(); return j.message && j.message.content; }
-    } catch (e) { console.error('LLM remoto no disponible:', e.message); }
+  const { email, password } = req.body;
+  
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email y contraseña son requeridos' });
   }
-  // Simulador local determinista (siempre responde)
-  const last = (messages[messages.length - 1] || {}).content || '';
-  return simulate(model, last);
-}
-function simulate(model, prompt) {
-  const m = MODELS.find(x => x.id === model) || MODELS[3];
-  return `[${m.name} · ${m.id}] He procesado tu solicitud: "${String(prompt).slice(0, 140)}". ` +
-    `Esta respuesta proviene de la infraestructura propia de Zoco IA. ` +
-    `Para conectar un motor LLM real, configura la variable OLLAMA_URL en Railway apuntando a tu servidor de modelos.`;
-}
 
-app.post('/v1/chat/completions', async (req, res) => {
-  // autenticación por API key
-  const key = (req.headers.authorization || '').replace('Bearer ', '').trim() || req.headers['x-api-key'];
-  const rec = db.apiKeys.find(k => k.key === key && k.active);
-  if (!rec) return res.status(401).json({ error: { message: 'API key inválida o revocada.', type: 'authentication_error' } });
-  const owner = db.users.find(u => u.id === rec.userId);
-  if (!owner) return res.status(401).json({ error: { message: 'Propietario de la clave no encontrado.' } });
-  if (owner.credits <= 0) return res.status(402).json({ error: { message: `Saldo agotado (${owner.credits.toFixed(2)} US$). Añade fondos en el panel.`, type: 'insufficient_quota' } });
-
-  const { model = 'maris-velox-1b', messages = [], max_tokens = 512 } = req.body || {};
-  const content = await runLLM(model, messages, max_tokens);
-  const promptTok = Math.max(8, Math.round(JSON.stringify(messages).length / 4));
-  const compTok = Math.max(8, Math.round(String(content).length / 4));
-  const mm = MODELS.find(x => x.id === model) || MODELS[3];
-  const cost = +(promptTok / 1e6 * mm.input + compTok / 1e6 * mm.output).toFixed(6);
-
-  owner.credits = +(owner.credits - cost).toFixed(6);
-  owner.spentMonth = +(owner.spentMonth + cost).toFixed(6);
-  rec.spend = +((rec.spend || 0) + cost).toFixed(6);
-  rec.lastUsed = new Date().toISOString();
-  addUsage(owner.id, promptTok + compTok, cost);
-  saveDB();
-
-  res.json({
-    id: 'chatcmpl-' + uid(), object: 'chat.completion', created: Math.floor(Date.now() / 1000), model,
-    choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
-    usage: { prompt_tokens: promptTok, completion_tokens: compTok, total_tokens: promptTok + compTok, cost_usd: cost }
-  });
-});
-app.get('/v1/models', (_, res) => res.json({ object: 'list', data: MODELS.map(m => ({ id: m.id, object: 'model', owned_by: 'zocoia', equiv: m.equiv })) }));
-
-function addUsage(userId, tokens, cost) {
-  const d = new Date().toISOString().slice(0, 10);
-  let row = db.usage.find(x => x.userId === userId && x.date === d);
-  if (!row) { row = { date: d, userId, tokens: 0, requests: 0, cost: 0 }; db.usage.push(row); }
-  row.tokens += tokens; row.requests += 1; row.cost = +(row.cost + cost).toFixed(6);
-}
-
-// ============ CHAT DEL ÁREA DE TRABAJO (autenticado por sesión) ============
-app.post('/api/workspace/chat', requireAuth, async (req, res) => {
-  const { model = 'maris-velox-1b', messages = [] } = req.body || {};
-  if (req.user.credits <= 0 && req.user.role !== 'admin')
-    return res.status(402).json({ error: { message: 'Saldo agotado. Añade fondos para continuar.' } });
-  const content = await runLLM(model, messages, 512);
-  const toks = Math.max(16, Math.round((JSON.stringify(messages).length + content.length) / 4));
-  const mm = MODELS.find(x => x.id === model) || MODELS[3];
-  const cost = +(toks / 1e6 * (mm.input + mm.output) / 2).toFixed(6);
-  req.user.credits = +(req.user.credits - cost).toFixed(6);
-  req.user.spentMonth = +(req.user.spentMonth + cost).toFixed(6);
-  addUsage(req.user.id, toks, cost);
-  saveDB();
-  res.json({ content, tokens: toks, cost });
-});
-
-// ============ PIPELINE: ejecutar los 11 agentes en cascada ============
-app.post('/api/pipeline/run', requireAuth, async (req, res) => {
-  const idea = (req.body && req.body.idea) || 'Aplicación de ejemplo';
-  const myAgents = db.agents.filter(a => a.userId === req.user.id && a.status === 'active').sort((a, b) => a.n - b.n);
-  if (!myAgents.length) return res.status(400).json({ error: { message: 'No tienes agentes activos.' } });
-  const steps = [];
-  let contextText = idea;
-  for (const ag of myAgents) {
-    const out = await runLLM(ag.model, [
-      { role: 'system', content: `Eres el agente "${ag.name}": ${ag.desc}` },
-      { role: 'user', content: `Tarea del proyecto: ${idea}\nContexto previo: ${String(contextText).slice(0, 400)}` }
-    ], 200);
-    const toks = Math.max(20, Math.round(out.length / 4));
-    ag.sessions += 1; ag.tokensUsed += toks;
-    addUsage(req.user.id, toks, +(toks / 1e6 * 3).toFixed(6));
-    steps.push({ agent: ag.name, n: ag.n, model: ag.model, output: out });
-    contextText = out;
+  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  
+  if (!user) {
+    return res.status(401).json({ error: 'Email o contraseña incorrectos' });
   }
-  const sess = { id: uid(), userId: req.user.id, idea, steps: steps.length, date: new Date().toISOString() };
-  db.sessions.push(sess); saveDB();
-  res.json({ session: sess, steps });
-});
 
-app.get('/api/sessions', requireAuth, (req, res) => {
-  const list = req.user.role === 'admin' ? db.sessions : db.sessions.filter(s => s.userId === req.user.id);
-  res.json({ data: list.slice(-50).reverse() });
-});
+  const passwordHash = hashPassword(password);
+  if (user.password_hash !== passwordHash) {
+    return res.status(401).json({ error: 'Email o contraseña incorrectos' });
+  }
 
-// ============ CRÉDITOS / FACTURACIÓN ============
-const PACKS = [
-  { id: 'starter', name: 'Starter', usd: 10, tokens: '2 M', bonus: 0 },
-  { id: 'professional', name: 'Professional', usd: 50, tokens: '12 M', bonus: 10 },
-  { id: 'enterprise', name: 'Enterprise', usd: 200, tokens: '55 M', bonus: 15 },
-  { id: 'unlimited', name: 'Unlimited', usd: 500, tokens: '150 M', bonus: 25 }
-];
-app.get('/api/billing/packs', (_, res) => res.json({ data: PACKS }));
-app.post('/api/billing/add-funds', requireAuth, (req, res) => {
-  const pack = PACKS.find(p => p.id === (req.body && req.body.packId));
-  const custom = req.body && Number(req.body.amount);
-  const amount = pack ? pack.usd * (1 + pack.bonus / 100) : (custom > 0 ? custom : 0);
-  if (!amount) return res.status(400).json({ error: { message: 'Paquete o importe inválido.' } });
-  req.user.credits = +(req.user.credits + amount).toFixed(2);
-  db.transactions.push({ id: uid(), userId: req.user.id, type: 'recharge', amount, desc: pack ? `Paquete ${pack.name} (Viva.com)` : 'Recarga manual (Viva.com)', date: new Date().toISOString() });
-  saveDB();
-  res.json({ ok: true, credits: req.user.credits });
-});
-app.get('/api/billing/transactions', requireAuth, (req, res) => {
-  res.json({ data: db.transactions.filter(t => t.userId === req.user.id).slice(-50).reverse() });
-});
-
-// ============ ANALÍTICAS ============
-app.get('/api/usage', requireAuth, (req, res) => {
-  const mine = db.usage.filter(x => x.userId === req.user.id);
-  res.json({ data: mine.slice(-30) });
-});
-
-// ============ RECURSOS AUXILIARES (Archivos, Habilidades, Lotes, etc.) ============
-function crudList(name) {
-  app.get(`/api/${name}`, requireAuth, (req, res) => {
-    const list = (db[name] || []).filter(x => x.userId === req.user.id || req.user.role === 'admin');
-    res.json({ data: list });
+  res.json({
+    id: user.id,
+    email: user.email,
+    nombre: user.nombre,
+    rol: user.rol,
+    saldo: user.saldo,
+    tokens_comprados: user.tokens_comprados,
+    tokens_usados: user.tokens_usados,
   });
-  app.post(`/api/${name}`, requireAuth, (req, res) => {
-    const item = { id: uid(), userId: req.user.id, ...req.body, createdAt: new Date().toISOString() };
-    db[name] = db[name] || []; db[name].push(item); saveDB();
-    res.json(item);
+});
+
+// ─── Endpoints de inferencia (compatibles con OpenAI) ────────────────────────
+
+app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
+  try {
+    const modelId = req.body.model || 'maris-velox-1b';
+    const modelRow = db.prepare('SELECT * FROM models_registry WHERE model_id = ? AND active = 1').get(modelId);
+    const backendUrl = modelRow ? modelRow.backend_url : VLLM_URL;
+
+    const upstream = await fetch(`${backendUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body),
+    });
+
+    const data = await upstream.json();
+    const promptTokens = data.usage?.prompt_tokens || 0;
+    const completionTokens = data.usage?.completion_tokens || 0;
+
+    if (req.apiKeyRow.id !== 0) {
+      db.prepare('INSERT INTO usage_log (key_id, prompt_tokens, completion_tokens, model, endpoint) VALUES (?, ?, ?, ?, ?)')
+        .run(req.apiKeyRow.id, promptTokens, completionTokens, modelId, '/v1/chat/completions');
+    }
+
+    res.status(upstream.status).json(data);
+  } catch (err) {
+    console.error('Error al reenviar a backend:', err.message);
+    res.status(502).json({ error: 'El servidor de inferencia no respondio', detail: err.message });
+  }
+});
+
+app.get('/v1/models', authMiddleware, (req, res) => {
+  const modelos = db.prepare('SELECT * FROM models_registry WHERE active = 1').all();
+  res.json({
+    object: 'list',
+    data: modelos.map(m => ({
+      id: m.model_id,
+      object: 'model',
+      created: Math.floor(new Date(m.created_at).getTime() / 1000),
+      owned_by: 'maris-ai',
+      display_name: m.display_name,
+      equivalencia: m.equivalencia,
+    }))
   });
-  app.delete(`/api/${name}/:id`, requireAuth, (req, res) => {
-    const i = (db[name] || []).findIndex(x => x.id === req.params.id && (x.userId === req.user.id || req.user.role === 'admin'));
-    if (i < 0) return res.status(404).json({ error: { message: 'No encontrado' } });
-    db[name].splice(i, 1); saveDB(); res.json({ ok: true });
+});
+
+app.get('/v1/usage', authMiddleware, (req, res) => {
+  const usage = getUsageThisMonth(req.apiKeyRow.id);
+  res.json({
+    owner: req.apiKeyRow.owner_name,
+    tokens_used_this_month: usage.total_tokens,
+    requests_this_month: usage.total_requests,
+    monthly_token_limit: req.apiKeyRow.monthly_token_limit,
+    monthly_usd_limit: req.apiKeyRow.monthly_usd_limit,
+  });
+});
+
+// ─── Endpoints de administracion ──────────────────────────────────────────────
+
+app.get('/admin/keys', authMiddleware, (req, res) => {
+  if (!req.isAdmin) return res.status(403).json({ error: 'Solo accesible con ADMIN_KEY' });
+  const keys = db.prepare('SELECT id, owner_name, owner_email, active, monthly_token_limit, monthly_usd_limit, created_at, notes FROM api_keys').all();
+  const result = keys.map(k => {
+    const usage = getUsageThisMonth(k.id);
+    return { ...k, tokens_this_month: usage.total_tokens, requests_this_month: usage.total_requests };
+  });
+  res.json(result);
+});
+
+app.post('/admin/keys', authMiddleware, (req, res) => {
+  if (!req.isAdmin) return res.status(403).json({ error: 'Solo accesible con ADMIN_KEY' });
+  const { owner_name, owner_email, monthly_token_limit, monthly_usd_limit, notes } = req.body;
+  if (!owner_name) return res.status(400).json({ error: 'owner_name es requerido' });
+  const rawKey = generateApiKey(owner_name, owner_email, null, monthly_token_limit, monthly_usd_limit, notes);
+  res.json({ api_key: rawKey, message: 'Guarda esta clave ahora, no se puede recuperar despues.' });
+});
+
+app.delete('/admin/keys/:id', authMiddleware, (req, res) => {
+  if (!req.isAdmin) return res.status(403).json({ error: 'Solo accesible con ADMIN_KEY' });
+  db.prepare('UPDATE api_keys SET active = 0 WHERE id = ?').run(req.params.id);
+  res.json({ message: 'Clave desactivada correctamente' });
+});
+
+app.get('/admin/users', authMiddleware, (req, res) => {
+  if (!req.isAdmin) return res.status(403).json({ error: 'Solo accesible con ADMIN_KEY' });
+  const users = db.prepare('SELECT id, email, nombre, rol, saldo, tokens_comprados, tokens_usados, activo, created_at FROM users').all();
+  res.json(users);
+});
+
+app.get('/admin/stats', authMiddleware, (req, res) => {
+  if (!req.isAdmin) return res.status(403).json({ error: 'Solo accesible con ADMIN_KEY' });
+  const totalTokens = db.prepare(`
+    SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS total
+    FROM usage_log WHERE strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
+  `).get();
+  const totalRequests = db.prepare(`
+    SELECT COUNT(*) AS total FROM usage_log
+    WHERE strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
+  `).get();
+  const activeKeys = db.prepare('SELECT COUNT(*) AS total FROM api_keys WHERE active = 1').get();
+  const activeUsers = db.prepare('SELECT COUNT(*) AS total FROM users WHERE activo = 1').get();
+  res.json({
+    tokens_this_month: totalTokens.total,
+    requests_this_month: totalRequests.total,
+    active_keys: activeKeys.total,
+    active_users: activeUsers.total,
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', service: 'maris-ai-gateway', version: '2.0.0' });
+});
+
+// ─── CLI ──────────────────────────────────────────────────────────────────────
+if (require.main === module) {
+  const args = process.argv.slice(2);
+  if (args[0] === 'create-key') {
+    const owner = args[1] || 'sin-nombre';
+    const email = args[2] || null;
+    const tokenLimit = args[3] ? parseInt(args[3], 10) : null;
+    const key = generateApiKey(owner, email, null, tokenLimit, null, null);
+    console.log(`\nAPI key creada para "${owner}":`);
+    console.log(key);
+    console.log('\nGuardala ahora, no se puede recuperar despues (solo se almacena el hash).\n');
+    process.exit(0);
+  }
+
+  app.listen(PORT, () => {
+    console.log(`Maris AI Gateway v2.0 — escuchando en puerto ${PORT}`);
+    console.log(`Backend de inferencia: ${VLLM_URL}`);
+    console.log(`Base de datos: ${DB_PATH}`);
   });
 }
-['files', 'skills', 'batches', 'deployments', 'environments', 'credentialStores', 'memoryStores'].forEach(crudList);
 
-// ============ ADMINISTRACIÓN ============
-app.get('/api/admin/stats', requireAuth, requireAdmin, (req, res) => {
-  const totalTokens = db.usage.reduce((s, x) => s + x.tokens, 0);
-  const totalRevenue = db.transactions.filter(t => t.type === 'recharge').reduce((s, t) => s + t.amount, 0);
-  res.json({
-    users: db.users.length,
-    clients: db.users.filter(u => u.role === 'client').length,
-    activeKeys: db.apiKeys.filter(k => k.active).length,
-    agents: db.agents.length,
-    sessions: db.sessions.length,
-    totalTokens, totalRevenue,
-    totalSpend: db.users.reduce((s, u) => s + (u.spentMonth || 0), 0)
-  });
-});
-app.get('/api/admin/users', requireAuth, requireAdmin, (req, res) => {
-  res.json({ data: db.users.map(u => ({ ...publicUser(u), keys: db.apiKeys.filter(k => k.userId === u.id && k.active).length, agents: db.agents.filter(a => a.userId === u.id).length })) });
-});
-app.patch('/api/admin/users/:id', requireAuth, requireAdmin, (req, res) => {
-  const u = db.users.find(x => x.id === req.params.id);
-  if (!u) return res.status(404).json({ error: { message: 'Usuario no encontrado' } });
-  ['name', 'role', 'credits', 'limitMonth'].forEach(f => { if (req.body[f] !== undefined) u[f] = req.body[f]; });
-  if (req.body.password) u.passHash = sha256(req.body.password);
-  saveDB(); res.json(publicUser(u));
-});
-app.delete('/api/admin/users/:id', requireAuth, requireAdmin, (req, res) => {
-  const i = db.users.findIndex(x => x.id === req.params.id);
-  if (i < 0) return res.status(404).json({ error: { message: 'Usuario no encontrado' } });
-  if (db.users[i].email === ADMIN_EMAIL) return res.status(400).json({ error: { message: 'No puedes eliminar al administrador principal.' } });
-  const uidDel = db.users[i].id;
-  db.users.splice(i, 1);
-  db.apiKeys = db.apiKeys.filter(k => k.userId !== uidDel);
-  db.agents = db.agents.filter(a => a.userId !== uidDel);
-  saveDB(); res.json({ ok: true });
-});
-app.get('/api/admin/keys', requireAuth, requireAdmin, (req, res) => {
-  res.json({ data: db.apiKeys.map(k => ({ ...k, key: maskKey(k.key), owner: (db.users.find(u => u.id === k.userId) || {}).email })) });
-});
-app.post('/api/admin/keys/:id/toggle', requireAuth, requireAdmin, (req, res) => {
-  const k = db.apiKeys.find(x => x.id === req.params.id);
-  if (!k) return res.status(404).json({ error: { message: 'Clave no encontrada' } });
-  k.active = !k.active; saveDB(); res.json({ ok: true, active: k.active });
-});
-app.get('/api/admin/transactions', requireAuth, requireAdmin, (req, res) => {
-  res.json({ data: db.transactions.slice(-100).reverse().map(t => ({ ...t, owner: (db.users.find(u => u.id === t.userId) || {}).email })) });
-});
-
-// ============ FRONTEND ============
-app.use(express.static(path.join(__dirname, 'public')));
-app.get('*', (req, res) => {
-  if (req.path.startsWith('/api') || req.path.startsWith('/v1') || req.path.startsWith('/auth'))
-    return res.status(404).json({ error: { message: 'Endpoint no encontrado' } });
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Zoco IA Console corriendo en puerto ${PORT}`));
+module.exports = { app, generateApiKey };
