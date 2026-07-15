@@ -1,120 +1,14 @@
 <!DOCTYPE html>
 <html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Maris AI Console</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #0b0f19; color: #f3f4f6; display: flex; height: 100vh; overflow: hidden; }
-        .sidebar { width: 260px; background-color: #111827; border-right: 1px solid #1f2937; padding: 20px; display: flex; flex-direction: column; justify-content: space-between; height: 100vh; }
-        .main-content { flex: 1; display: flex; flex-direction: column; background-color: #0f172a; height: 100vh; overflow-y: auto; }
-        .banner { background-color: rgba(245, 158, 11, 0.1); border-bottom: 1px solid rgba(245, 158, 11, 0.2); padding: 10px 24px; font-size: 13px; color: #f59e0b; display: flex; justify-content: space-between; align-items: center; }
-        .dashboard { padding: 40px; max-width: 1100px; width: 100%; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }
-        .top-row { display: flex; justify-content: space-between; align-items: center; }
-        .btn-sec { background-color: #1f2937; border: 1px solid #334155; color: #f3f4f6; padding: 10px 16px; border-radius: 12px; font-size: 13px; font-weight: 500; cursor: pointer; margin-right: 8px; transition: 0.2s; }
-        .btn-sec:hover { background-color: #334155; }
-        .btn-prim { background-color: #f3f4f6; border: none; color: #0f172a; padding: 10px 16px; border-radius: 12px; font-size: 13px; font-weight: 600; cursor: pointer; transition: 0.2s; }
-        .btn-prim:hover { background-color: #e5e7eb; }
-        .metrics-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; width: 100%; }
-        .card { background-color: #1e293b; border: 1px solid #334155; border-radius: 16px; padding: 24px; display: flex; flex-direction: column; justify-content: space-between; min-height: 140px; }
-        .card-title { font-size: 13px; color: #9ca3af; margin-bottom: 8px; }
-        .card-value { font-size: 26px; font-weight: 700; color: white; }
-        .btn-card { width: 100%; background-color: #ef4444; color: white; border: none; padding: 10px; border-radius: 10px; font-weight: 600; font-size: 13px; cursor: pointer; margin-top: 15px; transition: 0.2s; }
-        .btn-card:hover { background-color: #dc2626; }
-        .graph-box { background-color: #1e293b; border: 1px solid #334155; border-radius: 16px; padding: 24px; width: 100%; }
-        .bars-container { display: flex; align-items: flex-end; gap: 8px; height: 80px; margin-top: 20px; }
-        .bar { background-color: #1e293b; border: 1px solid #334155; flex: 1; border-radius: 4px; }
-        .bar.active { background-color: #06b6d4; box-shadow: 0 0 15px rgba(6, 182, 212, 0.4); border: none; }
-        .models-section { width: 100%; margin-top: 10px; }
-        .models-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 12px; }
-        .model-card { background-color: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 16px; min-height: 110px; display: flex; flex-direction: column; justify-content: space-between; border-left: 4px solid #334155; }
-        .org-selector { display: flex; justify-content: space-between; align-items: center; padding: 10px; background-color: rgba(0,0,0,0.2); border-radius: 8px; border: 1px solid #1f2937; margin-bottom: 20px; font-size: 13px; }
-        .menu-link { display: block; color: #9ca3af; text-decoration: none; font-size: 13px; padding: 8px 12px; border-radius: 6px; margin-bottom: 4px; cursor: pointer; transition: 0.2s; }
-        .menu-link.active { background-color: #1f2937; color: #22d3ee; font-weight: 600; border-left: 3px solid #06b6d4; }
-        .menu-link:hover { background-color: rgba(255,255,255,0.03); color: white; }
-        .menu-sub { font-size: 11px; color: #4b5563; text-transform: uppercase; letter-spacing: 1px; margin: 15px 0 5px 12px; font-weight: 600; }
-        .profile-box { background-color: rgba(0,0,0,0.2); border: 1px solid #1f2937; padding: 10px; border-radius: 8px; font-size: 12px; margin-top: 15px; }
-        .hidden { display: none !important; }
-        .key-table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 13px; }
-        .key-table th { background-color: #111827; padding: 10px; color: #9ca3af; text-align: left; }
-        .key-table td { padding: 10px; border-bottom: 1px solid #334155; color: #e5e7eb; }
-    </style>
-</head>
-<body>
-
-    <!-- BARRA LATERAL IZQUIERDA -->
-    <aside class="sidebar">
-        <div>
-            <div class="org-selector">
-                <div style="display: flex; align-items: center; gap: 8px;">
-                    <div style="width: 20px; height: 20px; background-color: #06b6d4; border-radius: 4px; color: #0b0f19; font-weight: bold; display: flex; align-items: center; justify-content: center; font-size: 11px;">M</div>
-                    <span style="font-weight: 600;">Maris AI</span>
-                </div>
-                <span style="color: #4b5563; font-size: 10px;">▼</span>
-            </div>
-
-            <nav>
-                <!-- Vinculamos las acciones onclick de forma directa para romper el bloqueo del Service Worker -->
-                <div onclick="activarVistaSeccion('control', this)" class="menu-link active">🏠 Panel de control</div>
-                <div onclick="activarVistaSeccion('claves', this)" class="menu-link">🔑 Claves de API</div>
-                <div onclick="activarVistaSeccion('compilar', this)" class="menu-link">⚙️ Compilar</div>
-                
-                <div style="padding-left: 10px; margin-bottom: 15px;">
-                    <div onclick="activarVistaSeccion('area', this)" class="menu-link" style="font-size: 12px;">Área de trabajo <span style="background-color: #1e1b4b; color: #818cf8; font-size: 9px; padding: 1px 4px; border-radius: 4px; margin-left: 5px;">Nuevo</span></div>
-                    <div onclick="activarVistaSeccion('archivos', this)" class="menu-link" style="font-size: 12px;">Archivos</div>
-                </div>
-
-                <div class="menu-sub">Agentes gestionados</div>
-                <div onclick="activarVistaSeccion('inicio', this)" class="menu-link">⚡ Inicio rápido</div>
-                <div onclick="activarVistaSeccion('agentes', this)" class="menu-link">🤖 Agentes</div>
-
-                <div class="menu-sub">Analíticas</div>
-                <div onclick="activarVistaSeccion('uso', this)" class="menu-link">📊 Uso general</div>
-            </nav>
-        </div>
-
-        <div>
-            <div style="background-color: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.2); padding: 12px; border-radius: 12px; font-size: 11px; color: #f87171; line-height: 1.4;">
-                Saldo pendiente: <span id="saldo-sidebar">-1,73 US$</span>. <span onclick="activarVistaSeccion('recarga', null)" style="color: white; font-weight: 600; cursor: pointer; text-decoration: underline;">Añadir fondos</span> para reanudar el acceso.
-            </div>
-            <div class="profile-box">
-                <div style="font-weight: 600; color: white; margin-bottom: 2px;">Maria</div>
-                <div style="color: #6b7280; font-size: 11px;">rrhh.milchollos@gmail.com</div>
-            </div>
-        </div>
-    </aside>
-
-    <!-- CUERPO PRINCIPAL CONTENEDOR DE SECCIONES -->
-    <main class="main-content">
-        <div class="banner">
-            <span id="banner-text">ℹ️ El acceso a tus 11 agentes de software locales ha sido restaurado con éxito.</span>
-            <span style="cursor: pointer; color: #4b5563;">✕</span>
-        </div>
-
-        <!-- PESTAÑA 1: PANEL DE CONTROL -->
-        <div id="sec-control" class="dashboard">
-            <div class="top-row">
-                <h1 style="font-size: 24px; font-weight: 700;">Buenas noches, Maria</h1>
-                <div>
-                    <button onclick="activarVistaSeccion('claves', null)" class="btn-sec">Obtener clave de API</button>
-                    <button onclick="activarVistaSeccion('agentes', null)" class="btn-prim">Crear un agente</button>
-                </div>
-            </div>
-            <div class="metrics-grid">
-                <div class="card">
-                    <div><div class="card-title">Créditos de la organización</div><div id="saldo-box" class="card-value" style="color: #f87171;">-1,73 US$</div></div>
-                    <button onclick="activarVistaSeccion('recarga', null)" class="btn-card">Añadir fondos con Viva.com</button>
-                </div>
-                <div class="card">
-                    <div><div class="card-title">Gasto este mes <span style="float: right; color: #6b7280; font-size: 11px;">4% utilizado</span></div><div class="card-value">43,73 US$</div></div>
-                    <div style="font-size: 11px; color: #6b7280; border-top: 1px solid #334155; padding-top: 10px; margin-top: 10px;">de 1000 € de límite — se restablece el 1 ago</div>
-                </div>
-                <div class="card">
-                    <div><div class="card-title">Caché guardada <span style="float: right; color: #34d399; font-size: 11px;">6% aciertos</span></div><div class="card-value" style="color: #34d399;">~1 US$</div></div>
-                    <div style="font-size: 11px; color: #6b7280; border-top: 1px solid #334155; padding-top: 10px; margin-top: 10px;">ahorro estimado últimos 7 días</div>
-                </div>
-            </div>
-            <div class="graph-box">
-                <div class="card-title">Volumen de tokens transaccionados</div><div class="card-value" style="font-size: 32px;">6 M</div><div style="font-size: 11px; color: #6b7280;">últimos 7 días</div>
-                <div class="bars-container">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Zoco IA Console</title>
+    <script src="https://tailwindcss.com"></script>
+  </head>
+  <body class="bg-gray-50 text-gray-900">
+    <div id="root"></div>
+    <!-- Esta línea le dice a Vercel que cargue tu archivo de lógica -->
+    <script type="module" src="/index.tsx"></script>
+  </body>
+</html>
