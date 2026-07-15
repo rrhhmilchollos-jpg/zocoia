@@ -7,7 +7,7 @@ interface Agente {
 }
 
 export default function Dashboard() {
-  const { user, logout } = useAuth();
+  const { user, token, logout } = useAuth();
   const [balance, setBalance] = useState(1645.00);
   const [spend, setSpend] = useState(43.73);
   const [cache] = useState('~1,02 US$');
@@ -16,6 +16,7 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(false);
   const [notification, setNotification] = useState(true);
   const [serverStatus, setServerStatus] = useState<'checking' | 'online' | 'offline'>('checking');
+  const [activeTab, setActiveTab] = useState('panel');
 
   useEffect(() => {
     async function fetchServerStatus() {
@@ -40,14 +41,22 @@ export default function Dashboard() {
     try {
       const response = await fetch(`${API_BASE}/admin/keys`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
         body: JSON.stringify({ name, limit: 500000 }),
       });
       if (response.ok) {
         setAgents((prev) => [...prev, { id: crypto.randomUUID(), name }]);
+        alert('Agente creado con éxito');
+      } else {
+        const errData = await response.json();
+        alert(`Error: ${errData.error || 'No se pudo crear el agente'}`);
       }
     } catch (err) {
       console.error('Error creando agente:', err);
+      alert('Error de conexión al crear el agente');
     } finally {
       setLoading(false);
     }
@@ -80,55 +89,73 @@ export default function Dashboard() {
             <i className="fa-solid fa-chevron-down text-gray-400 text-[10px]"></i>
           </div>
           <nav className="space-y-1">
-            <a href="#" className="flex items-center space-x-3 px-3 py-2 rounded-lg bg-gray-100 text-black font-medium">
+            <button 
+              onClick={() => setActiveTab('panel')}
+              className={`w-full flex items-center space-x-3 px-3 py-2 rounded-lg ${activeTab === 'panel' ? 'bg-gray-100 text-black font-medium' : 'text-gray-600 hover:bg-gray-50'}`}
+            >
               <i className="fa-solid fa-house text-gray-600 w-4"></i><span>Panel de control</span>
-            </a>
-            <a href="#" className="flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50">
+            </button>
+            <button 
+              onClick={() => setActiveTab('keys')}
+              className={`w-full flex items-center space-x-3 px-3 py-2 rounded-lg ${activeTab === 'keys' ? 'bg-gray-100 text-black font-medium' : 'text-gray-600 hover:bg-gray-50'}`}
+            >
               <i className="fa-solid fa-key w-4"></i><span>Claves de API</span>
-            </a>
+            </button>
 
             <div className="pt-4 pb-1 px-3 text-[11px] font-bold text-gray-400 uppercase tracking-wider">Compilar</div>
-            <a href="#" className="flex items-center justify-between px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50">
+            <button className="w-full flex items-center justify-between px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50">
               <div className="flex items-center space-x-3"><i className="fa-solid fa-terminal w-4"></i><span>Área de trabajo</span></div>
               <span className="bg-blue-50 text-blue-600 text-[10px] px-2 py-0.5 rounded-full font-medium border border-blue-100">Actualizado</span>
-            </a>
-            <a href="#" className="flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-folder w-4"></i><span>Archivos</span></a>
-            <a href="#" className="flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-bolt w-4"></i><span>Habilidades</span></a>
-            <a href="#" className="flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-layer-group w-4"></i><span>Lotes</span></a>
+            </button>
+            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-folder w-4"></i><span>Archivos</span></button>
+            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-bolt w-4"></i><span>Habilidades</span></button>
+            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-layer-group w-4"></i><span>Lotes</span></button>
 
             <div className="pt-4 pb-1 px-3 text-[11px] font-bold text-gray-400 uppercase tracking-wider flex items-center justify-between">
               <span>Agentes gestionados</span><i className="fa-solid fa-chevron-down text-[9px]"></i>
             </div>
-            <a href="#" className="flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-forward w-4"></i><span>Inicio rápido</span></a>
-            <a href="#" className="flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-robot w-4"></i><span>Agentes</span></a>
-            <a href="#" className="flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-comments w-4"></i><span>Sesiones</span></a>
-            <a href="#" className="flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-rocket w-4"></i><span>Implementaciones</span></a>
-            <a href="#" className="flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-globe w-4"></i><span>Entornos</span></a>
-            <a href="#" className="flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-vault w-4"></i><span>Almacenes de credenciales</span></a>
-            <a href="#" className="flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-brain w-4"></i><span>Almacenes de memoria</span></a>
+            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-forward w-4"></i><span>Inicio rápido</span></button>
+            <button 
+              onClick={() => setActiveTab('agentes')}
+              className={`w-full flex items-center space-x-3 px-3 py-2 rounded-lg ${activeTab === 'agentes' ? 'bg-gray-100 text-black font-medium' : 'text-gray-600 hover:bg-gray-50'}`}
+            >
+              <i className="fa-solid fa-robot w-4"></i><span>Agentes</span>
+            </button>
+            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-comments w-4"></i><span>Sesiones</span></button>
+            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-rocket w-4"></i><span>Implementaciones</span></button>
+            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-globe w-4"></i><span>Entornos</span></button>
+            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-vault w-4"></i><span>Almacenes de credenciales</span></button>
+            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-brain w-4"></i><span>Almacenes de memoria</span></button>
 
             <div className="pt-4 pb-1 px-3 text-[11px] font-bold text-gray-400 uppercase tracking-wider flex items-center justify-between">
               <span>Analíticas</span><i className="fa-solid fa-chevron-right text-[9px]"></i>
             </div>
-            <a href="#" className="flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-chart-simple w-4"></i><span>Uso general</span></a>
+            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-chart-simple w-4"></i><span>Uso general</span></button>
 
-            <div className="pt-2">
-              <a href="#" className="flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-shield w-4"></i><span>Administración</span></a>
-            </div>
+            {user?.isAdmin && (
+              <div className="pt-2">
+                <button 
+                  onClick={() => setActiveTab('admin')}
+                  className={`w-full flex items-center space-x-3 px-3 py-2 rounded-lg ${activeTab === 'admin' ? 'bg-gray-100 text-black font-medium' : 'text-gray-600 hover:bg-gray-50'}`}
+                >
+                  <i className="fa-solid fa-shield w-4"></i><span>Administración</span>
+                </button>
+              </div>
+            )}
           </nav>
         </div>
 
         <div className="border-t border-gray-200 pt-4 space-y-3">
-          <a href="#" className="flex items-center space-x-2 px-2 text-gray-500 hover:text-gray-700">
+          <button className="flex items-center space-x-2 px-2 text-gray-500 hover:text-gray-700">
             <i className="fa-solid fa-book w-4"></i><span>Documentación</span>
-          </a>
+          </button>
           <div className="flex items-center justify-between p-2 rounded-lg border border-gray-100 bg-gray-50">
             <div>
               <p className="font-bold text-gray-900">{balance.toFixed(2)} US$</p>
-              <p className="text-[11px] text-gray-400">Añadir fondos</p>
+              <p className="text-[11px] text-gray-400">Fondos disponibles</p>
             </div>
             <button onClick={() => setBalance((p) => p + 100)} className="text-[11px] text-blue-600 hover:underline font-medium">
-              <i className="fa-solid fa-plus"></i>
+              <i className="fa-solid fa-plus"></i> Añadir
             </button>
           </div>
           <div className="flex items-center justify-between px-2">
@@ -162,107 +189,192 @@ export default function Dashboard() {
           </div>
         )}
 
-        <div className="flex justify-between items-center mb-8">
-          <h1 className="text-2xl font-bold tracking-tight text-gray-900">Buenas tardes, Maria</h1>
-          <div className="flex items-center space-x-2 text-[13px]">
-            <span
-              title={serverStatus === 'online' ? 'Backend conectado' : 'Backend no disponible'}
-              className={`w-2 h-2 rounded-full ${serverStatus === 'online' ? 'bg-green-500' : serverStatus === 'offline' ? 'bg-red-500' : 'bg-gray-300'}`}
-            ></span>
-            <button className="bg-white border border-gray-300 text-gray-700 px-4 py-1.5 rounded-lg font-medium shadow-sm hover:bg-gray-50">
-              <i className="fa-solid fa-key mr-1"></i> Obtener clave de API
-            </button>
-            <button onClick={handleCreateAgent} disabled={loading} className="bg-black text-white px-4 py-1.5 rounded-lg font-medium shadow-sm hover:bg-gray-800 disabled:opacity-60">
-              <i className="fa-solid fa-robot mr-1"></i> {loading ? 'Procesando...' : 'Crear un agente'}
-            </button>
-          </div>
-        </div>
-
-        {/* MÉTRICAS */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6 text-[13px]">
-          <div className="bg-white border border-gray-200 p-5 rounded-xl shadow-sm relative">
-            <div className="text-gray-400 font-medium">Créditos de la organización</div>
-            <div className="text-2xl font-bold text-gray-900 mt-1">{balance.toFixed(2)} US$</div>
-            <button className="text-red-500 text-[11px] font-medium hover:underline mt-2 block">Activar recarga automática</button>
-          </div>
-          <div className="bg-white border border-gray-200 p-5 rounded-xl shadow-sm">
-            <div className="flex justify-between items-start">
-              <div className="text-gray-400 font-medium">Gasto este mes</div>
-              <span className="text-[10px] bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full">4% utilizado</span>
-            </div>
-            <div className="text-2xl font-bold text-gray-900 mt-1">{spend.toFixed(2)} US$</div>
-            <div className="text-gray-400 text-[11px] mt-2">de 1000 US$ de límite · se restablece el 1 ago.</div>
-          </div>
-          <div className="bg-white border border-gray-200 p-5 rounded-xl shadow-sm flex justify-between items-start">
-            <div>
-              <div className="text-gray-400 font-medium">Caché</div>
-              <div className="text-2xl font-bold text-gray-900 mt-1">{cache}</div>
-              <div className="text-gray-400 text-[11px] mt-2">ahorro est. últimos 7 días</div>
-            </div>
-            <div className="text-green-600 font-semibold text-[11px] bg-green-50 px-2 py-1 rounded-md border border-green-100">6% de tasa de aciertos</div>
-          </div>
-        </div>
-
-        {/* TOKENS */}
-        <div className="bg-white border border-gray-200 p-5 rounded-xl shadow-sm mb-8 text-[13px]">
-          <div className="text-gray-400 font-medium mb-4">Volumen de tokens</div>
-          <div className="flex justify-between items-end h-24">
-            <div>
-              <div className="text-2xl font-bold text-gray-900">{tokens}</div>
-              <div className="text-xs text-gray-400 font-normal">últimos 7 días</div>
-            </div>
-            <div className="flex items-end space-x-2 h-full">
-              <div className="w-8 bg-green-200 h-8 rounded-t"></div>
-              <div className="w-8 bg-green-200 h-10 rounded-t"></div>
-              <div className="w-8 bg-green-300 h-14 rounded-t"></div>
-              <div className="w-8 bg-green-400 h-16 rounded-t"></div>
-              <div className="w-8 bg-green-400 h-20 rounded-t"></div>
-              <div className="w-8 bg-green-500 h-24 rounded-t"></div>
-            </div>
-          </div>
-        </div>
-
-        {/* MODELOS */}
-        <div className="flex justify-between items-center mb-4">
-          <h2 className="text-lg font-bold text-gray-900">Modelos</h2>
-          <a href="#" className="text-[13px] text-gray-500 hover:underline">Comparar modelos</a>
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8 text-[12px]">
-          {modelos.map((m) => (
-            <div key={m.nombre} className={`bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden flex flex-col`}>
-              <div className={`${m.bg} h-20 flex items-center justify-center`}>
-                <i className="fa-solid fa-robot text-2xl text-gray-700"></i>
+        {activeTab === 'panel' && (
+          <>
+            <div className="flex justify-between items-center mb-8">
+              <h1 className="text-2xl font-bold tracking-tight text-gray-900">Buenas tardes, {user?.nombre.split(' ')[0] || 'Maria'}</h1>
+              <div className="flex items-center space-x-2 text-[13px]">
+                <span
+                  title={serverStatus === 'online' ? 'Backend conectado' : 'Backend no disponible'}
+                  className={`w-2 h-2 rounded-full ${serverStatus === 'online' ? 'bg-green-500' : serverStatus === 'offline' ? 'bg-red-500' : 'bg-gray-300'}`}
+                ></span>
+                <button className="bg-white border border-gray-300 text-gray-700 px-4 py-1.5 rounded-lg font-medium shadow-sm hover:bg-gray-50">
+                  <i className="fa-solid fa-key mr-1"></i> Obtener clave de API
+                </button>
+                <button onClick={handleCreateAgent} disabled={loading} className="bg-black text-white px-4 py-1.5 rounded-lg font-medium shadow-sm hover:bg-gray-800 disabled:opacity-60">
+                  <i className="fa-solid fa-robot mr-1"></i> {loading ? 'Procesando...' : 'Crear un agente'}
+                </button>
               </div>
-              <div className="p-4 flex flex-col justify-between flex-1">
-                <div className="flex justify-between items-center mb-1">
-                  <span className="font-bold text-sm text-gray-900">{m.nombre}</span>
-                  {m.badge && <span className="bg-blue-50 text-blue-600 text-[10px] px-1.5 py-0.5 rounded font-medium border border-blue-100">{m.badge}</span>}
+            </div>
+
+            {/* MÉTRICAS */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6 text-[13px]">
+              <div className="bg-white border border-gray-200 p-5 rounded-xl shadow-sm relative">
+                <div className="text-gray-400 font-medium">Créditos de la organización</div>
+                <div className="text-2xl font-bold text-gray-900 mt-1">{balance.toFixed(2)} US$</div>
+                <button className="text-red-500 text-[11px] font-medium hover:underline mt-2 block">Activar recarga automática</button>
+              </div>
+              <div className="bg-white border border-gray-200 p-5 rounded-xl shadow-sm">
+                <div className="flex justify-between items-start">
+                  <div className="text-gray-400 font-medium">Gasto este mes</div>
+                  <span className="text-[10px] bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full">4% utilizado</span>
                 </div>
-                <p className="text-gray-400 text-[11px] font-mono leading-tight mb-3">{m.backend} · {m.equiv}</p>
-                <div className="flex flex-wrap gap-1">
-                  {m.tags.map((t) => (
-                    <span key={t} className="bg-gray-100 text-gray-600 text-[10px] px-2 py-0.5 rounded-full">{t}</span>
-                  ))}
+                <div className="text-2xl font-bold text-gray-900 mt-1">{spend.toFixed(2)} US$</div>
+                <div className="text-gray-400 text-[11px] mt-2">de 1000 US$ de límite · se restablece el 1 ago.</div>
+              </div>
+              <div className="bg-white border border-gray-200 p-5 rounded-xl shadow-sm flex justify-between items-start">
+                <div>
+                  <div className="text-gray-400 font-medium">Caché</div>
+                  <div className="text-2xl font-bold text-gray-900 mt-1">{cache}</div>
+                  <div className="text-gray-400 text-[11px] mt-2">ahorro est. últimos 7 días</div>
+                </div>
+                <div className="text-green-600 font-semibold text-[11px] bg-green-50 px-2 py-1 rounded-md border border-green-100">6% de tasa de aciertos</div>
+              </div>
+            </div>
+
+            {/* TOKENS */}
+            <div className="bg-white border border-gray-200 p-5 rounded-xl shadow-sm mb-8 text-[13px]">
+              <div className="text-gray-400 font-medium mb-4">Volumen de tokens</div>
+              <div className="flex justify-between items-end h-24">
+                <div>
+                  <div className="text-2xl font-bold text-gray-900">{tokens}</div>
+                  <div className="text-xs text-gray-400 font-normal">últimos 7 días</div>
+                </div>
+                <div className="flex items-end space-x-2 h-full">
+                  <div className="w-8 bg-green-200 h-8 rounded-t"></div>
+                  <div className="w-8 bg-green-200 h-10 rounded-t"></div>
+                  <div className="w-8 bg-green-300 h-14 rounded-t"></div>
+                  <div className="w-8 bg-green-400 h-16 rounded-t"></div>
+                  <div className="w-8 bg-green-400 h-20 rounded-t"></div>
+                  <div className="w-8 bg-green-500 h-24 rounded-t"></div>
                 </div>
               </div>
             </div>
-          ))}
-        </div>
 
-        {/* RECURSOS */}
-        <h2 className="text-lg font-bold text-gray-900 mb-4">Recursos</h2>
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 text-[12px] pb-8">
-          {recursos.map((r) => (
-            <div key={r.titulo} className="bg-white border border-gray-200 p-4 rounded-xl shadow-sm">
-              <div className="flex items-center space-x-2 mb-2">
-                <i className={`fa-solid ${r.icono} text-gray-500`}></i>
-                <span className="font-bold text-sm text-gray-900">{r.titulo}</span>
-                {r.badge && <span className="bg-purple-50 text-purple-600 text-[10px] px-1.5 py-0.5 rounded font-medium border border-purple-100">{r.badge}</span>}
-              </div>
-              <p className="text-gray-500 text-[11px] leading-relaxed">{r.texto}</p>
+            {/* MODELOS */}
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-lg font-bold text-gray-900">Modelos</h2>
+              <button className="text-[13px] text-gray-500 hover:underline">Comparar modelos</button>
             </div>
-          ))}
-        </div>
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8 text-[12px]">
+              {modelos.map((m) => (
+                <div key={m.nombre} className={`bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden flex flex-col`}>
+                  <div className={`${m.bg} h-20 flex items-center justify-center`}>
+                    <i className="fa-solid fa-robot text-2xl text-gray-700"></i>
+                  </div>
+                  <div className="p-4 flex flex-col justify-between flex-1">
+                    <div className="flex justify-between items-center mb-1">
+                      <span className="font-bold text-sm text-gray-900">{m.nombre}</span>
+                      {m.badge && <span className="bg-blue-50 text-blue-600 text-[10px] px-2 py-0.5 rounded-full font-medium border border-blue-100">{m.badge}</span>}
+                    </div>
+                    <p className="text-gray-400 text-[11px] mb-3">{m.equiv}</p>
+                    <div className="flex flex-wrap gap-1.5 mb-4">
+                      {m.tags.map(t => <span key={t} className="bg-gray-50 text-gray-500 px-2 py-0.5 rounded-md border border-gray-100">{t}</span>)}
+                    </div>
+                    <button className="w-full py-2 bg-white border border-gray-200 text-gray-700 rounded-lg font-medium hover:bg-gray-50 transition-colors">Seleccionar</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* RECURSOS */}
+            <h2 className="text-lg font-bold text-gray-900 mb-4">Recursos</h2>
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4 text-[12px]">
+              {recursos.map((r) => (
+                <div key={r.titulo} className="bg-white border border-gray-200 p-4 rounded-xl shadow-sm flex flex-col">
+                  <div className="flex items-center space-x-2 mb-2">
+                    <i className={`fa-solid ${r.icono} text-gray-700`}></i>
+                    <span className="font-bold text-gray-900">{r.titulo}</span>
+                    {r.badge && <span className="bg-blue-50 text-blue-600 text-[9px] px-1.5 py-0.5 rounded-full font-medium border border-blue-100">{r.badge}</span>}
+                  </div>
+                  <p className="text-gray-500 leading-relaxed flex-1">{r.texto}</p>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
+        {activeTab === 'keys' && (
+          <div className="max-w-4xl">
+            <h1 className="text-2xl font-bold text-gray-900 mb-6">Claves de API</h1>
+            <div className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm">
+              <p className="text-gray-600 mb-4">Tus claves de API secretas te permiten autenticarte en las solicitudes a Zoco IA.</p>
+              <div className="space-y-4">
+                <div className="flex items-center justify-between p-3 border border-gray-100 rounded-lg bg-gray-50">
+                  <div>
+                    <p className="font-medium text-gray-900">Default Key</p>
+                    <p className="text-xs text-gray-400">Creada hace 2 días</p>
+                  </div>
+                  <code className="bg-white px-2 py-1 rounded border border-gray-200 text-xs">sk-zoco-••••••••••••••••</code>
+                </div>
+                <button className="bg-black text-white px-4 py-2 rounded-lg font-medium text-sm">Crear nueva clave secreta</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'agentes' && (
+          <div className="max-w-4xl">
+            <h1 className="text-2xl font-bold text-gray-900 mb-6">Agentes Gestionados</h1>
+            <div className="grid grid-cols-1 gap-4">
+              {agents.length === 0 ? (
+                <div className="bg-white border border-dashed border-gray-300 rounded-xl p-12 text-center">
+                  <i className="fa-solid fa-robot text-4xl text-gray-200 mb-4"></i>
+                  <p className="text-gray-500">No tienes agentes personalizados todavía.</p>
+                  <button onClick={handleCreateAgent} className="mt-4 text-blue-600 font-medium hover:underline">Crear tu primer agente</button>
+                </div>
+              ) : (
+                agents.map(a => (
+                  <div key={a.id} className="bg-white border border-gray-200 p-4 rounded-xl flex items-center justify-between">
+                    <div className="flex items-center space-x-3">
+                      <div className="w-10 h-10 bg-blue-50 rounded-lg flex items-center justify-center text-blue-600">
+                        <i className="fa-solid fa-robot"></i>
+                      </div>
+                      <div>
+                        <p className="font-bold text-gray-900">{a.name}</p>
+                        <p className="text-xs text-gray-400">ID: {a.id}</p>
+                      </div>
+                    </div>
+                    <div className="flex items-center space-x-2">
+                      <span className="bg-green-50 text-green-600 text-[10px] px-2 py-0.5 rounded-full border border-green-100">Activo</span>
+                      <button className="text-gray-400 hover:text-gray-600"><i className="fa-solid fa-ellipsis-vertical"></i></button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'admin' && (
+          <div className="max-w-6xl">
+            <h1 className="text-2xl font-bold text-gray-900 mb-6">Panel de Administración</h1>
+            <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-gray-50 border-b border-gray-200 text-gray-500 font-medium">
+                  <tr>
+                    <th className="px-6 py-3">Usuario</th>
+                    <th className="px-6 py-3">Email</th>
+                    <th className="px-6 py-3">Rol</th>
+                    <th className="px-6 py-3">Créditos</th>
+                    <th className="px-6 py-3">Estado</th>
+                    <th className="px-6 py-3">Acciones</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  <tr>
+                    <td className="px-6 py-4 font-medium text-gray-900">{user?.nombre}</td>
+                    <td className="px-6 py-4 text-gray-500">{user?.email}</td>
+                    <td className="px-6 py-4"><span className="bg-amber-50 text-amber-600 px-2 py-0.5 rounded-full text-[10px] border border-amber-100">Admin</span></td>
+                    <td className="px-6 py-4 font-bold">{balance.toFixed(2)} US$</td>
+                    <td className="px-6 py-4"><span className="text-green-500 flex items-center space-x-1"><span className="w-1.5 h-1.5 bg-green-500 rounded-full"></span><span>Activo</span></span></td>
+                    <td className="px-6 py-4"><button className="text-blue-600 hover:underline">Editar</button></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   );

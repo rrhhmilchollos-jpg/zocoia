@@ -30,10 +30,15 @@ const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString('he
 const JWT_EXPIRES_IN = '7d';
 const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hora
 
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'app.db');
+// En Railway con volumen persistente, el volumen se monta en /data
+const DB_PATH = process.env.DB_PATH || (process.env.RAILWAY_VOLUME_MOUNT_PATH ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'app.db') : path.join(__dirname, 'data', 'app.db'));
 const dbDir = path.dirname(DB_PATH);
-if (dbDir && !fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
+if (dbDir && !fs.existsSync(dbDir)) {
+  console.log(`📁 Creando directorio de base de datos en: ${dbDir}`);
+  fs.mkdirSync(dbDir, { recursive: true });
+}
 
+console.log(`🗄️ Usando base de datos en: ${DB_PATH}`);
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 

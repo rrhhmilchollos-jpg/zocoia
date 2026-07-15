@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useEffect, useState, ReactNode } from 'react';
 
-export const API_BASE = import.meta.env.VITE_API_URL || 'https://mis-modelos-ia-propios-production.up.railway.app';
+// En producción, VITE_API_URL debe ser la URL de tu servicio en Railway
+export const API_BASE = import.meta.env.VITE_API_URL || window.location.origin;
 
 export interface AuthUser {
   id: string;
