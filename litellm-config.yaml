@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Maris AI — Panel de Control Avanzado</title>
+    <script src="https://tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cloudflare.com">
+    <style>
+        body { background-color: #0b0f19; color: #f3f4f6; }
+        .sidebar { background-color: #111827; border-right: 1px solid #1f2937; }
+        .chat-container { background-color: #0f172a; }
+        .input-box { background-color: #1e293b; border: 1px solid #334155; }
+        .accent-glow { box-shadow: 0 0 15px rgba(6, 182, 212, 0.15); }
+    </style>
+</head>
+<body class="flex h-screen overflow-hidden font-sans">
+
+    <!-- BARRA LATERAL: HISTORIAL DE PROYECTOS -->
+    <aside class="sidebar w-64 flex flex-col justify-between p-4 hidden md:flex">
+        <div>
+            <div class="flex items-center gap-2 px-2 py-3 mb-6">
+                <div class="w-8 h-8 rounded-lg bg-gradient-to-tr from-cyan-500 to-violet-600 flex items-center justify-center font-bold text-white">M</div>
+                <span class="text-xl font-bold bg-gradient-to-r from-cyan-400 to-violet-400 bg-clip-text text-transparent">Maris AI</span>
+            </div>
+            
+            <button class="w-full bg-gradient-to-r from-cyan-600 to-violet-600 hover:from-cyan-500 hover:to-violet-500 text-white font-medium py-2.5 px-4 rounded-xl transition duration-200 flex items-center justify-center gap-2 accent-glow mb-6">
+                <i class="fa-solid fa-plus text-sm"></i> Nuevo Proyecto
+            </button>
+
+            <nav class="space-y-1">
+                <p class="text-xs font-semibold text-gray-500 px-2 uppercase tracking-wider mb-2">Tus Aplicaciones</p>
+                <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-gray-800 text-cyan-400 font-medium transition"><i class="fa-solid fa-cubes text-sm"></i> CRM Ventas Local</a>
+                <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg text-gray-400 hover:bg-gray-800 hover:text-white transition"><i class="fa-solid fa-store text-sm"></i> Tienda Online Stripe</a>
+            </nav>
+        </div>
+
+        <!-- PERFIL DE USUARIO Y CRÉDITOS -->
+        <div class="border-t border-gray-800 pt-4">
+            <div class="flex items-center justify-between mb-2 px-2">
+                <span class="text-xs text-gray-400">Saldo de Cuenta:</span>
+                <span class="text-xs font-bold text-emerald-400 bg-emerald-950/50 px-2 py-0.5 rounded border border-emerald-800">ILIMITADO</span>
+            </div>
+            <div class="flex items-center gap-3 px-2 py-1.5 rounded-lg bg-gray-900/50 border border-gray-800">
+                <div class="w-8 h-8 rounded-full bg-violet-600 flex items-center justify-center font-bold text-xs text-white">RR</div>
+                <div class="overflow-hidden">
+                    <p class="text-xs font-medium text-gray-200 truncate">rrhh.milchollos@gmail.com</p>
+                    <p class="text-[10px] text-gray-500">Administrador</p>
+                </div>
+            </div>
+        </div>
+    </aside>
+
+    <!-- ÁREA PRINCIPAL: PIPELINE DE GENERACIÓN -->
+    <main class="flex-1 flex flex-col chat-container">
+        
+        <!-- CABECERA SUPERIOR -->
+        <header class="h-14 border-b border-gray-800 flex items-center justify-between px-6 bg-gray-900/30">
+            <div class="flex items-center gap-4">
+                <h1 class="font-semibold text-gray-200">Consola de Vibe Coding</h1>
+                <span class="text-xs bg-cyan-950 text-cyan-400 border border-cyan-800 font-medium px-2 py-0.5 rounded-full flex items-center gap-1.5">
+                    <span class="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse"></span> 11 Agentes Activos
+                </span>
+            </div>
+        </header>
+
+        <!-- PANTALLA CENTRAL DE CHAT -->
+        <section class="flex-1 overflow-y-auto p-6 space-y-6 max-w-4xl w-full mx-auto flex flex-col justify-start pt-12 items-center">
+            
+            <div class="text-center max-w-xl mb-4">
+                <h2 class="text-3xl font-bold tracking-tight text-white mb-3">¿Qué aplicación quieres crear hoy?</h2>
+                <p class="text-gray-400 text-sm">Describe tu idea en español. El pipeline de 11 agentes de Maris AI se activará en cascada.</p>
+            </div>
+
+            <!-- ENTRADA DE TEXTO ESTILO CLAUDE -->
+            <div class="w-full input-box rounded-2xl p-4 flex flex-col gap-3 shadow-2xl relative accent-glow mb-6">
+                <textarea id="prompt-idea" class="w-full bg-transparent resize-none focus:outline-none text-gray-200 placeholder-gray-500 h-24 text-sm" placeholder="Ejemplo: Necesito un SaaS para gestionar el inventario de una zapatería..."></textarea>
+                
+                <div class="flex items-center justify-between border-t border-gray-800 pt-3">
+                    <span id="status-general" class="text-xs text-gray-500">Listo para codificar</span>
+                    <button id="btn-enviar" class="bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold w-10 h-10 rounded-xl flex items-center justify-center transition duration-200">
+                        <i class="fa-solid fa-arrow-up text-lg"></i>
+                    </button>
+                </div>
+            </div>
+
+            <!-- MONITOR REAL DE LOS 11 AGENTES EN PARALELO -->
+            <div class="w-full border border-gray-800 bg-gray-900/20 rounded-2xl p-5">
+                <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4"><i class="fa-solid fa-network-wired text-cyan-400 mr-2"></i> Estado de los 11 Agentes del Sistema</h3>
+                <div id="pipeline-agentes" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+                    
+                    <!-- Los 11 Agentes Oficiales -->
+                    <div class="bg-gray-900/60 border border-gray-800/80 p-3 rounded-xl flex items-center justify-between">
+                        <div class="flex items-center gap-2.5">
+                            <div class="w-6 h-6 rounded bg-cyan-950 text-cyan-400 flex items-center justify-center text-xs"><i class="fa-solid fa-magnifying-glass"></i></div>
+                            <span class="text-xs font-medium text-gray-300">1. Analista Funcional</span>
+                        </div>
+                        <span class="text-[10px] text-gray-600 bg-gray-950 px-2 py-0.5 rounded border border-gray-800/50">Inactivo</span>
+                    </div>
+
+                    <div class="bg-gray-900/60 border border-gray-800/80 p-3 rounded-xl flex items-center justify-between">
+                        <div class="flex items-center gap-2.5">
+                            <div class="w-6 h-6 rounded bg-cyan-950 text-cyan-400 flex items-center justify-center text-xs"><i class="fa-solid fa-sitemap"></i></div>
+                            <span class="text-xs font-medium text-gray-300">2. Arquitecto Técnico</span>
+                        </div>
+                        <span class="text-[10px] text-gray-600 bg-gray-950 px-2 py-0.5 rounded border border-gray-800/50">Inactivo</span>
+                    </div>
+
+                    <div class="bg-gray-900/60 border border-gray-800/80 p-3 rounded-xl flex items-center justify-between">
+                        <div class="flex items-center gap-2.5">
+                            <div class="w-6 h-6 rounded bg-cyan-950 text-cyan-400 flex items-center justify-center text-xs"><i class="fa-solid fa-compass-drafting"></i></div>
+                            <span class="text-xs font-medium text-gray-300">3. Diseñador UX/UI</span>
+                        </div>
+                        <span class="text-[10px] text-gray-600 bg-gray-950 px-2 py-0.5 rounded border border-gray-800/50">Inactivo</span>
+                    </div>
+
+                    <div class="bg-gray-900/60 border border-gray-800/80 p-3 rounded-xl flex items-center justify-between">
+                        <div class="flex items-center gap-2.5">
+                            <div class="w-6 h-6 rounded bg-violet-950 text-violet-400 flex items-center justify-center text-xs"><i class="fa-solid fa-file-code"></i></div>
+                            <span class="text-xs font-medium text-gray-300">4. Maquetador HTML</span>
+                        </div>
+                        <span class="text-[10px] text-gray-600 bg-gray-950 px-2 py-0.5 rounded border border-gray-800/50">Inactivo</span>
+                    </div>
+
+                    <div class="bg-gray-900/60 border border-gray-800/80 p-3 rounded-xl flex items-center justify-between">
+                        <div class="flex items-center gap-2.5">
+                            <div class="w-6 h-6 rounded bg-violet-950 text-violet-400 flex items-center justify-center text-xs"><i class="fa-solid fa-palette"></i></div>
+                            <span class="text-xs font-medium text-gray-300">5. Estilista CSS Custom</span>
+                        </div>
+                        <span class="text-[10px] text-gray-600 bg-gray-950 px-2 py-0.5 rounded border border-gray-800/50">Inactivo</span>
+                    </div>
+
+                    <div class="bg-gray-900/60 border border-gray-800/80 p-3 rounded-xl flex items-center justify-between">
+                        <div class="flex items-center gap-2.5">
+                            <div class="w-6 h-6 rounded bg-violet-950 text-violet-400 flex items-center justify-center text-xs"><i class="fa-brands fa-js"></i></div>
+                            <span class="text-xs font-medium text-gray-300">6. Desarrollador JS</span>
+                        </div>
+                        <span class="text-[10px] text-gray-600 bg-gray-950 px-2 py-0.5 rounded border border-gray-800/50">Inactivo</span>
+                    </div>
+

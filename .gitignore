@@ -1,5 +1,4 @@
 node_modules/
-gateway/data/
-nginx/certs/*.pem
+data/
 *.log
-.env
+GUIA_ZOCO_IA.md
