@@ -12,8 +12,16 @@
       "destination": "https://mis-modelos-ia-propios-production.up.railway.app/admin/:path*"
     },
     {
+      "source": "/auth/:path*",
+      "destination": "https://mis-modelos-ia-propios-production.up.railway.app/auth/:path*"
+    },
+    {
       "source": "/health",
       "destination": "https://mis-modelos-ia-propios-production.up.railway.app/health"
+    },
+    {
+      "source": "/((?!v1|admin|auth|health|assets).*)",
+      "destination": "/index.html"
     }
   ]
 }

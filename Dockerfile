@@ -1,6 +1,7 @@
 # Build stage for the frontend
 FROM node:20-slim AS frontend-builder
 WORKDIR /app
+RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
 COPY package*.json ./
 RUN npm install
 COPY . .
@@ -9,6 +10,7 @@ RUN npm run build
 # Production stage
 FROM node:20-slim
 WORKDIR /app
+RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies for the server
 COPY package*.json ./
