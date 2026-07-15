@@ -1,12 +1,16 @@
 {
   "rewrites": [
     {
-      "source": "/api/pipeline/chat",
-      "destination": "https://railway.app"
+      "source": "/v1/:path*",
+      "destination": "https://railway.app*"
     },
     {
-      "source": "/api/:path*",
+      "source": "/admin/:path*",
       "destination": "https://railway.app*"
+    },
+    {
+      "source": "/health",
+      "destination": "https://railway.app"
     }
   ]
 }
