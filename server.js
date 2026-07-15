@@ -22,9 +22,15 @@ const uid = () => crypto.randomBytes(8).toString('hex');
 const newApiKey = () => 'sk-zocoia-' + crypto.randomBytes(24).toString('hex');
 const newToken = () => 'tok-' + crypto.randomBytes(24).toString('hex');
 
-const ADMIN_EMAIL = 'rrhh.milchollos@gmail.com';
-const ADMIN_PASS = '19862210Des';
-const MASTER_KEY = process.env.ADMIN_KEY || 'sk-marisai-00721f5f89c10d78b286ad7f3bda6d457068b4ea10d53a5d';
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
+const ADMIN_PASS = process.env.ADMIN_PASS;
+const MASTER_KEY = process.env.ADMIN_KEY;
+
+if (!ADMIN_EMAIL || !ADMIN_PASS || !MASTER_KEY) {
+  console.error('❌ Faltan variables de entorno obligatorias: ADMIN_EMAIL, ADMIN_PASS, ADMIN_KEY.');
+  console.error('   Configuralas en Railway (Variables) antes de desplegar. El servidor no arrancará sin ellas.');
+  process.exit(1);
+}
 
 // Modelos propios de la infraestructura
 const MODELS = [
