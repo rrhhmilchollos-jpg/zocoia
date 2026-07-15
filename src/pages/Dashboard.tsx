@@ -1,54 +1,161 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useAuth, API_BASE } from '../context/AuthContext';
 
-interface Agente {
+interface Recurso {
+  id: string;
+  type: string;
+  name: string;
+  data: Record<string, any>;
+  createdAt: string;
+}
+
+interface ApiKey {
   id: string;
   name: string;
+  display: string;
+  revoked: boolean;
+  createdAt: string;
+}
+
+interface AdminUsuario {
+  id: string;
+  email: string;
+  nombre: string;
+  isAdmin: boolean;
+  isSupport: boolean;
+  creditos: number;
+  activo: boolean;
+  createdAt: string;
+}
+
+interface BillingSummary {
+  creditos: number;
+  gastoEsteMes: number;
+  recursos: Record<string, number>;
+  clavesActivas: number;
+}
+
+const RESOURCE_TABS: { key: string; label: string; icon: string }[] = [
+  { key: 'archivo', label: 'Archivos', icon: 'fa-folder' },
+  { key: 'habilidad', label: 'Habilidades', icon: 'fa-bolt' },
+  { key: 'lote', label: 'Lotes', icon: 'fa-layer-group' },
+  { key: 'sesion', label: 'Sesiones', icon: 'fa-comments' },
+  { key: 'implementacion', label: 'Implementaciones', icon: 'fa-rocket' },
+  { key: 'entorno', label: 'Entornos', icon: 'fa-globe' },
+  { key: 'credencial', label: 'Almacenes de credenciales', icon: 'fa-vault' },
+  { key: 'memoria', label: 'Almacenes de memoria', icon: 'fa-brain' },
+];
+
+function fmtEUR(n: number) {
+  return `${(n || 0).toFixed(2)} €`;
 }
 
 export default function Dashboard() {
   const { user, token, logout } = useAuth();
-  const [balance, setBalance] = useState(1645.00);
-  const [spend, setSpend] = useState(43.73);
-  const [cache] = useState('~1,02 US$');
-  const [tokens] = useState('6 M');
-  const [agents, setAgents] = useState<Agente[]>([]);
+
+  const [billing, setBilling] = useState<BillingSummary | null>(null);
+  const [agentes, setAgentes] = useState<Recurso[]>([]);
+  const [keys, setKeys] = useState<ApiKey[]>([]);
+  const [resourcesByType, setResourcesByType] = useState<Record<string, Recurso[]>>({});
+  const [adminUsuarios, setAdminUsuarios] = useState<AdminUsuario[]>([]);
   const [loading, setLoading] = useState(false);
   const [notification, setNotification] = useState(true);
   const [serverStatus, setServerStatus] = useState<'checking' | 'online' | 'offline'>('checking');
+  const [ollamaOnline, setOllamaOnline] = useState<boolean | null>(null);
   const [activeTab, setActiveTab] = useState('panel');
+
+  const authHeaders = useCallback(() => ({
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${token}`,
+  }), [token]);
+
+  const loadBilling = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/billing/summary`, { headers: authHeaders() });
+      if (res.ok) setBilling(await res.json());
+    } catch (err) {
+      console.error('Error cargando facturación:', err);
+    }
+  }, [authHeaders]);
+
+  const loadAgentes = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/resources?type=agente`, { headers: authHeaders() });
+      if (res.ok) setAgentes(await res.json());
+    } catch (err) {
+      console.error('Error cargando agentes:', err);
+    }
+  }, [authHeaders]);
+
+  const loadKeys = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/keys`, { headers: authHeaders() });
+      if (res.ok) setKeys(await res.json());
+    } catch (err) {
+      console.error('Error cargando claves:', err);
+    }
+  }, [authHeaders]);
+
+  const loadResourceType = useCallback(async (type: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/resources?type=${type}`, { headers: authHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        setResourcesByType((prev) => ({ ...prev, [type]: data }));
+      }
+    } catch (err) {
+      console.error(`Error cargando ${type}:`, err);
+    }
+  }, [authHeaders]);
+
+  const loadAdminUsuarios = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/admin/clientes`, { headers: authHeaders() });
+      if (res.ok) setAdminUsuarios(await res.json());
+    } catch (err) {
+      console.error('Error cargando usuarios:', err);
+    }
+  }, [authHeaders]);
 
   useEffect(() => {
     async function fetchServerStatus() {
       try {
         const res = await fetch(`${API_BASE}/health`);
-        if (res.ok) {
-          setServerStatus('online');
-        } else {
-          setServerStatus('offline');
-        }
+        setServerStatus(res.ok ? 'online' : 'offline');
       } catch (err) {
         setServerStatus('offline');
       }
     }
     fetchServerStatus();
-  }, []);
+    loadBilling();
+    loadAgentes();
+
+    fetch(`${API_BASE}/api/system/ollama`, { headers: authHeaders() })
+      .then((r) => (r.ok ? r.json() : { online: false }))
+      .then((d) => setOllamaOnline(!!d.online))
+      .catch(() => setOllamaOnline(false));
+  }, [loadBilling, loadAgentes, authHeaders]);
+
+  useEffect(() => {
+    if (activeTab === 'keys') loadKeys();
+    if (activeTab === 'admin') loadAdminUsuarios();
+    const resourceTab = RESOURCE_TABS.find((t) => t.key === activeTab);
+    if (resourceTab) loadResourceType(resourceTab.key);
+  }, [activeTab, loadKeys, loadAdminUsuarios, loadResourceType]);
 
   const handleCreateAgent = async () => {
     const name = prompt('Introduce el nombre de tu nuevo agente de software:');
     if (!name) return;
     setLoading(true);
     try {
-      const response = await fetch(`${API_BASE}/admin/keys`, {
+      const response = await fetch(`${API_BASE}/api/resources`, {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify({ name, limit: 500000 }),
+        headers: authHeaders(),
+        body: JSON.stringify({ type: 'agente', name }),
       });
       if (response.ok) {
-        setAgents((prev) => [...prev, { id: crypto.randomUUID(), name }]);
+        await loadAgentes();
+        await loadBilling();
         alert('Agente creado con éxito');
       } else {
         const errData = await response.json();
@@ -62,6 +169,119 @@ export default function Dashboard() {
     }
   };
 
+  const handleDeleteResource = async (id: string, type: string) => {
+    if (!confirm('¿Seguro que quieres eliminar este elemento?')) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/resources/${id}`, { method: 'DELETE', headers: authHeaders() });
+      if (res.ok) {
+        if (type === 'agente') await loadAgentes();
+        else await loadResourceType(type);
+        await loadBilling();
+      }
+    } catch (err) {
+      console.error('Error eliminando recurso:', err);
+    }
+  };
+
+  const handleCreateResource = async (type: string, label: string) => {
+    const name = prompt(`Nombre para el nuevo elemento en "${label}":`);
+    if (!name) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/resources`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ type, name }),
+      });
+      if (res.ok) {
+        await loadResourceType(type);
+        await loadBilling();
+      } else {
+        const errData = await res.json();
+        alert(`Error: ${errData.error || 'No se pudo crear'}`);
+      }
+    } catch (err) {
+      console.error('Error creando recurso:', err);
+    }
+  };
+
+  const handleCreateKey = async () => {
+    const name = prompt('Nombre para la nueva clave de API:');
+    if (!name) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/keys`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ name }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        alert(`Clave creada. Cópiala ahora, no se volverá a mostrar:\n\n${data.key}`);
+        await loadKeys();
+        await loadBilling();
+      } else {
+        const errData = await res.json();
+        alert(`Error: ${errData.error || 'No se pudo crear la clave'}`);
+      }
+    } catch (err) {
+      console.error('Error creando clave:', err);
+    }
+  };
+
+  const handleDeleteKey = async (id: string) => {
+    if (!confirm('¿Revocar esta clave de API? No se podrá deshacer.')) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/keys/${id}`, { method: 'DELETE', headers: authHeaders() });
+      if (res.ok) {
+        await loadKeys();
+        await loadBilling();
+      }
+    } catch (err) {
+      console.error('Error eliminando clave:', err);
+    }
+  };
+
+  const handleTopup = async () => {
+    const amountStr = prompt('¿Cuántos créditos (€) quieres añadir?', '100');
+    if (!amountStr) return;
+    const amount = Number(amountStr);
+    if (!amount || amount <= 0) return alert('Introduce un importe válido');
+    try {
+      const res = await fetch(`${API_BASE}/api/billing/topup`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ amount }),
+      });
+      if (res.ok) await loadBilling();
+    } catch (err) {
+      console.error('Error añadiendo créditos:', err);
+    }
+  };
+
+  const handleEditUsuario = async (u: AdminUsuario) => {
+    const nuevosCreditos = prompt(`Créditos para ${u.email}:`, String(u.creditos));
+    if (nuevosCreditos === null) return;
+    const nuevoActivo = confirm(`¿Debe estar ACTIVA la cuenta de ${u.email}? Aceptar = Sí, Cancelar = No (desactivar)`);
+    try {
+      const res = await fetch(`${API_BASE}/admin/clientes/${u.id}`, {
+        method: 'PUT',
+        headers: authHeaders(),
+        body: JSON.stringify({ creditos: Number(nuevosCreditos), activo: nuevoActivo }),
+      });
+      if (res.ok) {
+        await loadAdminUsuarios();
+      } else {
+        const errData = await res.json();
+        alert(`Error: ${errData.error || 'No se pudo actualizar'}`);
+      }
+    } catch (err) {
+      console.error('Error editando usuario:', err);
+    }
+  };
+
+  const balance = billing?.creditos ?? 0;
+  const spend = billing?.gastoEsteMes ?? 0;
+  const totalRecursos = billing ? Object.values(billing.recursos).reduce((a, b) => a + b, 0) : 0;
+
   const modelos = [
     { nombre: 'Fable 5', badge: 'Nuevo', backend: 'maris-beta-70b', equiv: 'Equiv. Fable 5', tags: ['Más capaz', 'Investigación', 'Tareas de varios días'], color: 'border-t-blue-400', bg: 'bg-blue-100' },
     { nombre: 'Opus 4.8', badge: null, backend: 'maris-pro-32b', equiv: 'Equiv. Opus 4.8', tags: ['Proyectos complejos', 'Agentes', 'Programación'], color: 'border-t-orange-400', bg: 'bg-orange-100' },
@@ -69,7 +289,7 @@ export default function Dashboard() {
     { nombre: 'Haiku 4.5', badge: null, backend: 'maris-velox-1b', equiv: 'Equiv. Haiku 4.5', tags: ['Más rápido', 'Menor coste', 'Alto volumen'], color: 'border-t-green-400', bg: 'bg-green-100' },
   ];
 
-  const recursos = [
+  const recursosDestacados = [
     { icono: 'fa-wand-magic-sparkles', titulo: 'Herramienta de habilidades', badge: 'Beta', texto: 'Aumenta la inteligencia minimizando el coste y el uso de tokens. Un modelo más económico.' },
     { icono: 'fa-bolt', titulo: 'Modo rápido', badge: null, texto: 'Hasta 2,5 veces más rápido en los modelos compatibles, con precios premium. El mismo modelo, la misma inteligencia.' },
     { icono: 'fa-layer-group', titulo: 'Batch API', badge: null, texto: 'Mueve las cargas de trabajo asíncronas a la Batch API y ahorra un 50% en los precios estándar de la API.' },
@@ -89,13 +309,13 @@ export default function Dashboard() {
             <i className="fa-solid fa-chevron-down text-gray-400 text-[10px]"></i>
           </div>
           <nav className="space-y-1">
-            <button 
+            <button
               onClick={() => setActiveTab('panel')}
               className={`w-full flex items-center space-x-3 px-3 py-2 rounded-lg ${activeTab === 'panel' ? 'bg-gray-100 text-black font-medium' : 'text-gray-600 hover:bg-gray-50'}`}
             >
               <i className="fa-solid fa-house text-gray-600 w-4"></i><span>Panel de control</span>
             </button>
-            <button 
+            <button
               onClick={() => setActiveTab('keys')}
               className={`w-full flex items-center space-x-3 px-3 py-2 rounded-lg ${activeTab === 'keys' ? 'bg-gray-100 text-black font-medium' : 'text-gray-600 hover:bg-gray-50'}`}
             >
@@ -103,38 +323,78 @@ export default function Dashboard() {
             </button>
 
             <div className="pt-4 pb-1 px-3 text-[11px] font-bold text-gray-400 uppercase tracking-wider">Compilar</div>
-            <button className="w-full flex items-center justify-between px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50">
-              <div className="flex items-center space-x-3"><i className="fa-solid fa-terminal w-4"></i><span>Área de trabajo</span></div>
-              <span className="bg-blue-50 text-blue-600 text-[10px] px-2 py-0.5 rounded-full font-medium border border-blue-100">Actualizado</span>
+            <button
+              onClick={() => setActiveTab('archivo')}
+              className={`w-full flex items-center justify-between px-3 py-2 rounded-lg ${activeTab === 'archivo' ? 'bg-gray-100 text-black font-medium' : 'text-gray-600 hover:bg-gray-50'}`}
+            >
+              <div className="flex items-center space-x-3"><i className="fa-solid fa-folder w-4"></i><span>Archivos</span></div>
             </button>
-            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-folder w-4"></i><span>Archivos</span></button>
-            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-bolt w-4"></i><span>Habilidades</span></button>
-            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-layer-group w-4"></i><span>Lotes</span></button>
+            <button
+              onClick={() => setActiveTab('habilidad')}
+              className={`w-full flex items-center space-x-3 px-3 py-2 rounded-lg ${activeTab === 'habilidad' ? 'bg-gray-100 text-black font-medium' : 'text-gray-600 hover:bg-gray-50'}`}
+            >
+              <i className="fa-solid fa-bolt w-4"></i><span>Habilidades</span>
+            </button>
+            <button
+              onClick={() => setActiveTab('lote')}
+              className={`w-full flex items-center space-x-3 px-3 py-2 rounded-lg ${activeTab === 'lote' ? 'bg-gray-100 text-black font-medium' : 'text-gray-600 hover:bg-gray-50'}`}
+            >
+              <i className="fa-solid fa-layer-group w-4"></i><span>Lotes</span>
+            </button>
 
             <div className="pt-4 pb-1 px-3 text-[11px] font-bold text-gray-400 uppercase tracking-wider flex items-center justify-between">
               <span>Agentes gestionados</span><i className="fa-solid fa-chevron-down text-[9px]"></i>
             </div>
-            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-forward w-4"></i><span>Inicio rápido</span></button>
-            <button 
+            <button
               onClick={() => setActiveTab('agentes')}
               className={`w-full flex items-center space-x-3 px-3 py-2 rounded-lg ${activeTab === 'agentes' ? 'bg-gray-100 text-black font-medium' : 'text-gray-600 hover:bg-gray-50'}`}
             >
               <i className="fa-solid fa-robot w-4"></i><span>Agentes</span>
             </button>
-            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-comments w-4"></i><span>Sesiones</span></button>
-            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-rocket w-4"></i><span>Implementaciones</span></button>
-            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-globe w-4"></i><span>Entornos</span></button>
-            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-vault w-4"></i><span>Almacenes de credenciales</span></button>
-            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-brain w-4"></i><span>Almacenes de memoria</span></button>
+            <button
+              onClick={() => setActiveTab('sesion')}
+              className={`w-full flex items-center space-x-3 px-3 py-2 rounded-lg ${activeTab === 'sesion' ? 'bg-gray-100 text-black font-medium' : 'text-gray-600 hover:bg-gray-50'}`}
+            >
+              <i className="fa-solid fa-comments w-4"></i><span>Sesiones</span>
+            </button>
+            <button
+              onClick={() => setActiveTab('implementacion')}
+              className={`w-full flex items-center space-x-3 px-3 py-2 rounded-lg ${activeTab === 'implementacion' ? 'bg-gray-100 text-black font-medium' : 'text-gray-600 hover:bg-gray-50'}`}
+            >
+              <i className="fa-solid fa-rocket w-4"></i><span>Implementaciones</span>
+            </button>
+            <button
+              onClick={() => setActiveTab('entorno')}
+              className={`w-full flex items-center space-x-3 px-3 py-2 rounded-lg ${activeTab === 'entorno' ? 'bg-gray-100 text-black font-medium' : 'text-gray-600 hover:bg-gray-50'}`}
+            >
+              <i className="fa-solid fa-globe w-4"></i><span>Entornos</span>
+            </button>
+            <button
+              onClick={() => setActiveTab('credencial')}
+              className={`w-full flex items-center space-x-3 px-3 py-2 rounded-lg ${activeTab === 'credencial' ? 'bg-gray-100 text-black font-medium' : 'text-gray-600 hover:bg-gray-50'}`}
+            >
+              <i className="fa-solid fa-vault w-4"></i><span>Almacenes de credenciales</span>
+            </button>
+            <button
+              onClick={() => setActiveTab('memoria')}
+              className={`w-full flex items-center space-x-3 px-3 py-2 rounded-lg ${activeTab === 'memoria' ? 'bg-gray-100 text-black font-medium' : 'text-gray-600 hover:bg-gray-50'}`}
+            >
+              <i className="fa-solid fa-brain w-4"></i><span>Almacenes de memoria</span>
+            </button>
 
             <div className="pt-4 pb-1 px-3 text-[11px] font-bold text-gray-400 uppercase tracking-wider flex items-center justify-between">
               <span>Analíticas</span><i className="fa-solid fa-chevron-right text-[9px]"></i>
             </div>
-            <button className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-gray-600 hover:bg-gray-50"><i className="fa-solid fa-chart-simple w-4"></i><span>Uso general</span></button>
+            <button
+              onClick={() => setActiveTab('uso')}
+              className={`w-full flex items-center space-x-3 px-3 py-2 rounded-lg ${activeTab === 'uso' ? 'bg-gray-100 text-black font-medium' : 'text-gray-600 hover:bg-gray-50'}`}
+            >
+              <i className="fa-solid fa-chart-simple w-4"></i><span>Uso general</span>
+            </button>
 
             {user?.isAdmin && (
               <div className="pt-2">
-                <button 
+                <button
                   onClick={() => setActiveTab('admin')}
                   className={`w-full flex items-center space-x-3 px-3 py-2 rounded-lg ${activeTab === 'admin' ? 'bg-gray-100 text-black font-medium' : 'text-gray-600 hover:bg-gray-50'}`}
                 >
@@ -151,10 +411,10 @@ export default function Dashboard() {
           </button>
           <div className="flex items-center justify-between p-2 rounded-lg border border-gray-100 bg-gray-50">
             <div>
-              <p className="font-bold text-gray-900">{balance.toFixed(2)} US$</p>
+              <p className="font-bold text-gray-900">{fmtEUR(balance)}</p>
               <p className="text-[11px] text-gray-400">Fondos disponibles</p>
             </div>
-            <button onClick={() => setBalance((p) => p + 100)} className="text-[11px] text-blue-600 hover:underline font-medium">
+            <button onClick={handleTopup} className="text-[11px] text-blue-600 hover:underline font-medium">
               <i className="fa-solid fa-plus"></i> Añadir
             </button>
           </div>
@@ -183,7 +443,7 @@ export default function Dashboard() {
           <div className="bg-[#edf5fd] border border-[#d4e8fc] text-[#1d6cd3] text-[13px] px-4 py-2.5 rounded-lg flex items-center justify-between mb-8 shadow-sm">
             <div className="flex items-center space-x-2">
               <i className="fa-solid fa-circle-info"></i>
-              <span>El acceso a tus <strong>{agents.length + 11} agentes de software</strong> ha sido restaurado con éxito.</span>
+              <span>El acceso a tus <strong>{agentes.length} agentes de software</strong> está activo. Estado de Ollama: <strong>{ollamaOnline === null ? 'comprobando…' : ollamaOnline ? 'en línea' : 'sin conexión'}</strong>.</span>
             </div>
             <button onClick={() => setNotification(false)} className="text-gray-400 hover:text-gray-600 text-lg font-bold leading-none">&times;</button>
           </div>
@@ -192,13 +452,13 @@ export default function Dashboard() {
         {activeTab === 'panel' && (
           <>
             <div className="flex justify-between items-center mb-8">
-              <h1 className="text-2xl font-bold tracking-tight text-gray-900">Buenas tardes, {user?.nombre.split(' ')[0] || 'Maria'}</h1>
+              <h1 className="text-2xl font-bold tracking-tight text-gray-900">Buenas tardes, {user?.nombre?.split(' ')[0] || 'Maria'}</h1>
               <div className="flex items-center space-x-2 text-[13px]">
                 <span
                   title={serverStatus === 'online' ? 'Backend conectado' : 'Backend no disponible'}
                   className={`w-2 h-2 rounded-full ${serverStatus === 'online' ? 'bg-green-500' : serverStatus === 'offline' ? 'bg-red-500' : 'bg-gray-300'}`}
                 ></span>
-                <button className="bg-white border border-gray-300 text-gray-700 px-4 py-1.5 rounded-lg font-medium shadow-sm hover:bg-gray-50">
+                <button onClick={() => setActiveTab('keys')} className="bg-white border border-gray-300 text-gray-700 px-4 py-1.5 rounded-lg font-medium shadow-sm hover:bg-gray-50">
                   <i className="fa-solid fa-key mr-1"></i> Obtener clave de API
                 </button>
                 <button onClick={handleCreateAgent} disabled={loading} className="bg-black text-white px-4 py-1.5 rounded-lg font-medium shadow-sm hover:bg-gray-800 disabled:opacity-60">
@@ -211,43 +471,23 @@ export default function Dashboard() {
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6 text-[13px]">
               <div className="bg-white border border-gray-200 p-5 rounded-xl shadow-sm relative">
                 <div className="text-gray-400 font-medium">Créditos de la organización</div>
-                <div className="text-2xl font-bold text-gray-900 mt-1">{balance.toFixed(2)} US$</div>
-                <button className="text-red-500 text-[11px] font-medium hover:underline mt-2 block">Activar recarga automática</button>
+                <div className="text-2xl font-bold text-gray-900 mt-1">{fmtEUR(balance)}</div>
+                <button onClick={handleTopup} className="text-red-500 text-[11px] font-medium hover:underline mt-2 block">Añadir créditos</button>
               </div>
               <div className="bg-white border border-gray-200 p-5 rounded-xl shadow-sm">
                 <div className="flex justify-between items-start">
                   <div className="text-gray-400 font-medium">Gasto este mes</div>
-                  <span className="text-[10px] bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full">4% utilizado</span>
                 </div>
-                <div className="text-2xl font-bold text-gray-900 mt-1">{spend.toFixed(2)} US$</div>
-                <div className="text-gray-400 text-[11px] mt-2">de 1000 US$ de límite · se restablece el 1 ago.</div>
+                <div className="text-2xl font-bold text-gray-900 mt-1">{fmtEUR(spend)}</div>
+                <div className="text-gray-400 text-[11px] mt-2">calculado a partir de tu actividad real</div>
               </div>
               <div className="bg-white border border-gray-200 p-5 rounded-xl shadow-sm flex justify-between items-start">
                 <div>
-                  <div className="text-gray-400 font-medium">Caché</div>
-                  <div className="text-2xl font-bold text-gray-900 mt-1">{cache}</div>
-                  <div className="text-gray-400 text-[11px] mt-2">ahorro est. últimos 7 días</div>
+                  <div className="text-gray-400 font-medium">Recursos totales</div>
+                  <div className="text-2xl font-bold text-gray-900 mt-1">{totalRecursos}</div>
+                  <div className="text-gray-400 text-[11px] mt-2">agentes, archivos, habilidades, etc.</div>
                 </div>
-                <div className="text-green-600 font-semibold text-[11px] bg-green-50 px-2 py-1 rounded-md border border-green-100">6% de tasa de aciertos</div>
-              </div>
-            </div>
-
-            {/* TOKENS */}
-            <div className="bg-white border border-gray-200 p-5 rounded-xl shadow-sm mb-8 text-[13px]">
-              <div className="text-gray-400 font-medium mb-4">Volumen de tokens</div>
-              <div className="flex justify-between items-end h-24">
-                <div>
-                  <div className="text-2xl font-bold text-gray-900">{tokens}</div>
-                  <div className="text-xs text-gray-400 font-normal">últimos 7 días</div>
-                </div>
-                <div className="flex items-end space-x-2 h-full">
-                  <div className="w-8 bg-green-200 h-8 rounded-t"></div>
-                  <div className="w-8 bg-green-200 h-10 rounded-t"></div>
-                  <div className="w-8 bg-green-300 h-14 rounded-t"></div>
-                  <div className="w-8 bg-green-400 h-16 rounded-t"></div>
-                  <div className="w-8 bg-green-400 h-20 rounded-t"></div>
-                  <div className="w-8 bg-green-500 h-24 rounded-t"></div>
-                </div>
+                <div className="text-green-600 font-semibold text-[11px] bg-green-50 px-2 py-1 rounded-md border border-green-100">{billing?.clavesActivas ?? 0} claves activas</div>
               </div>
             </div>
 
@@ -258,7 +498,7 @@ export default function Dashboard() {
             </div>
             <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8 text-[12px]">
               {modelos.map((m) => (
-                <div key={m.nombre} className={`bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden flex flex-col`}>
+                <div key={m.nombre} className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden flex flex-col">
                   <div className={`${m.bg} h-20 flex items-center justify-center`}>
                     <i className="fa-solid fa-robot text-2xl text-gray-700"></i>
                   </div>
@@ -277,10 +517,10 @@ export default function Dashboard() {
               ))}
             </div>
 
-            {/* RECURSOS */}
+            {/* RECURSOS DESTACADOS */}
             <h2 className="text-lg font-bold text-gray-900 mb-4">Recursos</h2>
             <div className="grid grid-cols-1 md:grid-cols-4 gap-4 text-[12px]">
-              {recursos.map((r) => (
+              {recursosDestacados.map((r) => (
                 <div key={r.titulo} className="bg-white border border-gray-200 p-4 rounded-xl shadow-sm flex flex-col">
                   <div className="flex items-center space-x-2 mb-2">
                     <i className={`fa-solid ${r.icono} text-gray-700`}></i>
@@ -300,14 +540,22 @@ export default function Dashboard() {
             <div className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm">
               <p className="text-gray-600 mb-4">Tus claves de API secretas te permiten autenticarte en las solicitudes a Zoco IA.</p>
               <div className="space-y-4">
-                <div className="flex items-center justify-between p-3 border border-gray-100 rounded-lg bg-gray-50">
-                  <div>
-                    <p className="font-medium text-gray-900">Default Key</p>
-                    <p className="text-xs text-gray-400">Creada hace 2 días</p>
+                {keys.length === 0 && (
+                  <p className="text-gray-400 text-sm">Aún no tienes claves de API.</p>
+                )}
+                {keys.map((k) => (
+                  <div key={k.id} className="flex items-center justify-between p-3 border border-gray-100 rounded-lg bg-gray-50">
+                    <div>
+                      <p className="font-medium text-gray-900">{k.name}</p>
+                      <p className="text-xs text-gray-400">Creada el {new Date(k.createdAt).toLocaleDateString('es-ES')}</p>
+                    </div>
+                    <div className="flex items-center space-x-3">
+                      <code className="bg-white px-2 py-1 rounded border border-gray-200 text-xs">{k.display}</code>
+                      <button onClick={() => handleDeleteKey(k.id)} className="text-red-500 hover:underline text-xs font-medium">Revocar</button>
+                    </div>
                   </div>
-                  <code className="bg-white px-2 py-1 rounded border border-gray-200 text-xs">sk-zoco-••••••••••••••••</code>
-                </div>
-                <button className="bg-black text-white px-4 py-2 rounded-lg font-medium text-sm">Crear nueva clave secreta</button>
+                ))}
+                <button onClick={handleCreateKey} className="bg-black text-white px-4 py-2 rounded-lg font-medium text-sm">Crear nueva clave secreta</button>
               </div>
             </div>
           </div>
@@ -315,16 +563,21 @@ export default function Dashboard() {
 
         {activeTab === 'agentes' && (
           <div className="max-w-4xl">
-            <h1 className="text-2xl font-bold text-gray-900 mb-6">Agentes Gestionados</h1>
+            <div className="flex justify-between items-center mb-6">
+              <h1 className="text-2xl font-bold text-gray-900">Agentes Gestionados</h1>
+              <button onClick={handleCreateAgent} className="bg-black text-white px-4 py-2 rounded-lg font-medium text-sm">
+                <i className="fa-solid fa-plus mr-1"></i> Nuevo agente
+              </button>
+            </div>
             <div className="grid grid-cols-1 gap-4">
-              {agents.length === 0 ? (
+              {agentes.length === 0 ? (
                 <div className="bg-white border border-dashed border-gray-300 rounded-xl p-12 text-center">
                   <i className="fa-solid fa-robot text-4xl text-gray-200 mb-4"></i>
                   <p className="text-gray-500">No tienes agentes personalizados todavía.</p>
                   <button onClick={handleCreateAgent} className="mt-4 text-blue-600 font-medium hover:underline">Crear tu primer agente</button>
                 </div>
               ) : (
-                agents.map(a => (
+                agentes.map(a => (
                   <div key={a.id} className="bg-white border border-gray-200 p-4 rounded-xl flex items-center justify-between">
                     <div className="flex items-center space-x-3">
                       <div className="w-10 h-10 bg-blue-50 rounded-lg flex items-center justify-center text-blue-600">
@@ -337,11 +590,73 @@ export default function Dashboard() {
                     </div>
                     <div className="flex items-center space-x-2">
                       <span className="bg-green-50 text-green-600 text-[10px] px-2 py-0.5 rounded-full border border-green-100">Activo</span>
-                      <button className="text-gray-400 hover:text-gray-600"><i className="fa-solid fa-ellipsis-vertical"></i></button>
+                      <button onClick={() => handleDeleteResource(a.id, 'agente')} className="text-gray-400 hover:text-red-500"><i className="fa-solid fa-trash"></i></button>
                     </div>
                   </div>
                 ))
               )}
+            </div>
+          </div>
+        )}
+
+        {RESOURCE_TABS.map((tab) => activeTab === tab.key && (
+          <div className="max-w-4xl" key={tab.key}>
+            <div className="flex justify-between items-center mb-6">
+              <h1 className="text-2xl font-bold text-gray-900">{tab.label}</h1>
+              <button onClick={() => handleCreateResource(tab.key, tab.label)} className="bg-black text-white px-4 py-2 rounded-lg font-medium text-sm">
+                <i className="fa-solid fa-plus mr-1"></i> Nuevo
+              </button>
+            </div>
+            <div className="grid grid-cols-1 gap-4">
+              {(resourcesByType[tab.key] || []).length === 0 ? (
+                <div className="bg-white border border-dashed border-gray-300 rounded-xl p-12 text-center">
+                  <i className={`fa-solid ${tab.icon} text-4xl text-gray-200 mb-4`}></i>
+                  <p className="text-gray-500">Todavía no hay elementos en "{tab.label}".</p>
+                  <button onClick={() => handleCreateResource(tab.key, tab.label)} className="mt-4 text-blue-600 font-medium hover:underline">Crear el primero</button>
+                </div>
+              ) : (
+                (resourcesByType[tab.key] || []).map((r) => (
+                  <div key={r.id} className="bg-white border border-gray-200 p-4 rounded-xl flex items-center justify-between">
+                    <div className="flex items-center space-x-3">
+                      <div className="w-10 h-10 bg-gray-50 rounded-lg flex items-center justify-center text-gray-600">
+                        <i className={`fa-solid ${tab.icon}`}></i>
+                      </div>
+                      <div>
+                        <p className="font-bold text-gray-900">{r.name}</p>
+                        <p className="text-xs text-gray-400">Creado el {new Date(r.createdAt).toLocaleDateString('es-ES')}</p>
+                      </div>
+                    </div>
+                    <button onClick={() => handleDeleteResource(r.id, tab.key)} className="text-gray-400 hover:text-red-500"><i className="fa-solid fa-trash"></i></button>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        ))}
+
+        {activeTab === 'uso' && (
+          <div className="max-w-4xl">
+            <h1 className="text-2xl font-bold text-gray-900 mb-6">Uso general</h1>
+            <div className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm space-y-4">
+              <div className="flex justify-between text-sm border-b border-gray-100 pb-3">
+                <span className="text-gray-500">Créditos disponibles</span>
+                <span className="font-bold text-gray-900">{fmtEUR(balance)}</span>
+              </div>
+              <div className="flex justify-between text-sm border-b border-gray-100 pb-3">
+                <span className="text-gray-500">Gasto este mes</span>
+                <span className="font-bold text-gray-900">{fmtEUR(spend)}</span>
+              </div>
+              <div className="flex justify-between text-sm border-b border-gray-100 pb-3">
+                <span className="text-gray-500">Claves de API activas</span>
+                <span className="font-bold text-gray-900">{billing?.clavesActivas ?? 0}</span>
+              </div>
+              {billing && Object.entries(billing.recursos).map(([tipo, count]) => (
+                <div key={tipo} className="flex justify-between text-sm">
+                  <span className="text-gray-500 capitalize">{tipo}</span>
+                  <span className="font-bold text-gray-900">{count}</span>
+                </div>
+              ))}
+              <p className="text-xs text-gray-400 pt-2">Estos datos reflejan tu actividad real registrada en la base de datos, sin cifras decorativas.</p>
             </div>
           </div>
         )}
@@ -362,14 +677,25 @@ export default function Dashboard() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">
-                  <tr>
-                    <td className="px-6 py-4 font-medium text-gray-900">{user?.nombre}</td>
-                    <td className="px-6 py-4 text-gray-500">{user?.email}</td>
-                    <td className="px-6 py-4"><span className="bg-amber-50 text-amber-600 px-2 py-0.5 rounded-full text-[10px] border border-amber-100">Admin</span></td>
-                    <td className="px-6 py-4 font-bold">{balance.toFixed(2)} US$</td>
-                    <td className="px-6 py-4"><span className="text-green-500 flex items-center space-x-1"><span className="w-1.5 h-1.5 bg-green-500 rounded-full"></span><span>Activo</span></span></td>
-                    <td className="px-6 py-4"><button className="text-blue-600 hover:underline">Editar</button></td>
-                  </tr>
+                  {adminUsuarios.map((u) => (
+                    <tr key={u.id}>
+                      <td className="px-6 py-4 font-medium text-gray-900">{u.nombre}</td>
+                      <td className="px-6 py-4 text-gray-500">{u.email}</td>
+                      <td className="px-6 py-4">
+                        <span className={`px-2 py-0.5 rounded-full text-[10px] border ${u.isAdmin ? 'bg-amber-50 text-amber-600 border-amber-100' : u.isSupport ? 'bg-blue-50 text-blue-600 border-blue-100' : 'bg-gray-50 text-gray-500 border-gray-100'}`}>
+                          {u.isAdmin ? 'Admin' : u.isSupport ? 'Soporte' : 'Cliente'}
+                        </span>
+                      </td>
+                      <td className="px-6 py-4 font-bold">{fmtEUR(u.creditos)}</td>
+                      <td className="px-6 py-4">
+                        <span className={`flex items-center space-x-1 ${u.activo ? 'text-green-500' : 'text-red-500'}`}>
+                          <span className={`w-1.5 h-1.5 rounded-full ${u.activo ? 'bg-green-500' : 'bg-red-500'}`}></span>
+                          <span>{u.activo ? 'Activo' : 'Inactivo'}</span>
+                        </span>
+                      </td>
+                      <td className="px-6 py-4"><button onClick={() => handleEditUsuario(u)} className="text-blue-600 hover:underline">Editar</button></td>
+                    </tr>
+                  ))}
                 </tbody>
               </table>
             </div>
