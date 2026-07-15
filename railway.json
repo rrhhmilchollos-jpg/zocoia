@@ -5,7 +5,7 @@
     "context": "."
   },
   "deploy": {
-    "startCommand": "node gateway/server.js",
+    "startCommand": "node server.js",
     "restartPolicyMaxRetries": 5
   }
 }
