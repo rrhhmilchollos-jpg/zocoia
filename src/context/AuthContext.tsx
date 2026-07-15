@@ -10,6 +10,7 @@ export interface AuthUser {
   isAdmin: boolean;
   isSupport: boolean;
   creditos: number;
+  modeloActivo: string;
   createdAt: string;
 }
 
