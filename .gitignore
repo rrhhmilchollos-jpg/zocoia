@@ -1,4 +1,4 @@
 node_modules/
-data/
+dist/
+.env
 *.log
-GUIA_ZOCO_IA.md
