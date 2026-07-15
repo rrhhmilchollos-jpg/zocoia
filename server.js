@@ -65,9 +65,6 @@ db.exec(`
 `);
 
 // ─── Sembrado de la cuenta de administracion ──────────────────────────────────
-// Nunca hardcodeamos el email/contraseña de admin en el código: se leen de
-// variables de entorno (ADMIN_EMAIL / ADMIN_PASSWORD) que configuras en Railway,
-// NUNCA en el repositorio de GitHub.
 function seedAdminAccount() {
   const email = process.env.ADMIN_EMAIL;
   const passwordPlain = process.env.ADMIN_PASSWORD;
@@ -193,8 +190,6 @@ app.get('/auth/me', authMiddleware, (req, res) => {
 });
 
 // ─── Autenticación: olvidé mi contraseña ───────────────────────────────────────
-// Por seguridad, la respuesta es siempre la misma exista o no el email,
-// para no revelar qué correos están registrados.
 app.post('/auth/forgot-password', async (req, res) => {
   const { email } = req.body || {};
   const genericResponse = { message: 'Si el email existe en nuestro sistema, recibirás un enlace de recuperación.' };
@@ -212,8 +207,6 @@ app.post('/auth/forgot-password', async (req, res) => {
 
   const sent = await sendPasswordResetEmail(user.email, resetLink);
   if (!sent) {
-    // Sin proveedor de email configurado: lo dejamos en el log del servidor
-    // para que puedas probarlo en desarrollo.
     console.log(`🔗 Enlace de recuperación para ${user.email}: ${resetLink}`);
   }
 
@@ -238,8 +231,6 @@ app.post('/auth/reset-password', (req, res) => {
 });
 
 // ─── Envío de email (opcional, vía Resend) ─────────────────────────────────────
-// Si defines RESEND_API_KEY en Railway, los emails de recuperación se envían
-// de verdad. Si no, el enlace se imprime en los logs del servidor (modo dev).
 async function sendPasswordResetEmail(toEmail, resetLink) {
   const apiKey = process.env.RESEND_API_KEY;
   const fromEmail = process.env.RESEND_FROM_EMAIL;
@@ -271,6 +262,22 @@ app.get('/admin/clientes', authMiddleware, (req, res) => {
   const users = db.prepare('SELECT id, email, nombre, is_admin, is_support, creditos, activo, created_at FROM users ORDER BY created_at DESC').all();
   res.json(users);
 });
+
+// ─── Servir el frontend (build de Vite) ────────────────────────────────────────
+// El Dockerfile copia el resultado de "npm run build" (carpeta dist/) aquí como "public".
+const publicDir = path.join(__dirname, 'public');
+if (fs.existsSync(publicDir)) {
+  app.use(express.static(publicDir));
+
+  // Cualquier ruta que NO sea de la API debe devolver index.html,
+  // para que el router de React (react-router-dom) funcione al recargar la página
+  // (por ejemplo /login, /dashboard, /restablecer-password).
+  app.get(/^(?!\/(auth|v1|admin|health)).*/, (req, res) => {
+    res.sendFile(path.join(publicDir, 'index.html'));
+  });
+} else {
+  console.warn('⚠️  No se encontró la carpeta "public" (build del frontend). Solo la API estará disponible.');
+}
 
 app.listen(port, () => {
   console.log(`🚀 Zoco IA Console corriendo en puerto ${port}`);
