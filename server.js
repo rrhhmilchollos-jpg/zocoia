@@ -10,6 +10,7 @@ import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
+import { TOOL_DEFINITIONS, ALL_TOOL_NAMES, runToolLoop, makeWorkspacesRoot } from './tools.js';
 
 dotenv.config();
 
@@ -37,6 +38,11 @@ if (dbDir && !fs.existsSync(dbDir)) {
 console.log(`🗄️ Usando base de datos en: ${DB_PATH}`);
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
+
+// Workspaces de los agentes (para createFile/createFolder/readFile/executeCode)
+// viven en el mismo volumen persistente que la BD, así sobreviven a redeploys.
+const WORKSPACES_ROOT = makeWorkspacesRoot(dbDir);
+fs.mkdirSync(WORKSPACES_ROOT, { recursive: true });
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -330,6 +336,61 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'Zoco IA conectado con éxito' });
 });
 
+/**
+ * Llama a un endpoint /chat/completions estilo OpenAI (Groq o el compat de Ollama),
+ * con timeout de 30s y fallback automático a Groq si Ollama no responde a tiempo.
+ * Devuelve el JSON crudo de la respuesta (con choices[].message y usage).
+ */
+async function callChatModel({ usandoOllama, ollamaUrl, ollamaModel, groqModel, messages, maxTokens, temperature, tools }) {
+  async function doFetch(url, auth, model) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    try {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: auth },
+        body: JSON.stringify({
+          model,
+          messages,
+          max_tokens: maxTokens,
+          temperature,
+          ...(tools && tools.length ? { tools } : {}),
+        }),
+        signal: controller.signal,
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        const e = new Error(err.error?.message || 'Error al llamar al modelo de IA');
+        e.status = resp.status;
+        throw e;
+      }
+      return await resp.json();
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  if (usandoOllama) {
+    try {
+      return await doFetch(`${ollamaUrl.replace(/\/+$/, '')}/v1/chat/completions`, 'Bearer ollama', ollamaModel);
+    } catch (err) {
+      if (err.name === 'AbortError' && GROQ_API_KEY) {
+        console.warn('Ollama timeout — usando Groq como fallback');
+        return await doFetch(GROQ_API_URL, `Bearer ${GROQ_API_KEY}`, groqModel);
+      }
+      if (err.name === 'AbortError') {
+        const e = new Error('Timeout: el modelo tardó demasiado en responder');
+        e.status = 504;
+        throw e;
+      }
+      const e = new Error('Error de conexión con el modelo de IA');
+      e.status = 502;
+      throw e;
+    }
+  }
+  return await doFetch(GROQ_API_URL, `Bearer ${GROQ_API_KEY}`, groqModel);
+}
+
 app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
   if (!GROQ_API_KEY) {
     return res.status(503).json({ error: 'GROQ_API_KEY no configurada en el servidor' });
@@ -352,15 +413,18 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
   const modeloZocoia = model || user?.modelo_activo || 'maris-core';
   const groqModel = GROQ_MODEL_MAP[modeloZocoia] || GROQ_MODEL_MAP['maris-core'];
 
+  let agente = null;
+  let agenteData = {};
+
   try {
     let mensajesParaGroq = [];
 
     if (agentId) {
       // Con agente: usar memoria persistente
-      const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(agentId, req.auth.sub, 'agente');
+      agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(agentId, req.auth.sub, 'agente');
       if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
 
-      const agenteData = agente.data ? JSON.parse(agente.data) : {};
+      agenteData = agente.data ? JSON.parse(agente.data) : {};
       const historial = db.prepare('SELECT role, content FROM agent_memory WHERE agente_id = ? ORDER BY created_at ASC LIMIT 50').all(agentId);
 
       if (agenteData.systemPrompt) {
@@ -404,57 +468,46 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
       : groqModel;
     console.log(`[IA] ${modeloZocoia} → ${modeloFinal} via ${usandoOllama ? 'Ollama' : 'Groq'}`);
 
-    // Timeout de 30s para evitar que el frontend se quede colgado
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    const maxTokens = req.body.max_tokens || 2048;
+    const temperature = req.body.temperature ?? 0.7;
 
-    let groqRes;
-    try {
-      groqRes = await fetch(inferUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': inferAuth,
-        },
-        body: JSON.stringify({
-          model: modeloFinal,
-          messages: mensajesParaGroq,
-          max_tokens: req.body.max_tokens || 2048,
-          temperature: req.body.temperature ?? 0.7,
-        }),
-        signal: controller.signal,
+    // Tools solo se activan si hay un agente detrás y tiene tools permitidas
+    const allowedTools = agentId
+      ? (Array.isArray(agenteData.allowedTools) ? agenteData.allowedTools : ALL_TOOL_NAMES)
+      : [];
+
+    const callModel = (msgs, tools) =>
+      callChatModel({
+        usandoOllama,
+        ollamaUrl: OLLAMA_URL,
+        ollamaModel: modeloFinal,
+        groqModel,
+        messages: msgs,
+        maxTokens,
+        temperature,
+        tools,
       });
-    } catch (fetchErr) {
-      clearTimeout(timeoutId);
-      if (fetchErr.name === 'AbortError') {
-        // Timeout — si usábamos Ollama, intentar con Groq como fallback
-        if (usandoOllama && GROQ_API_KEY) {
-          console.warn('Ollama timeout — usando Groq como fallback');
-          groqRes = await fetch(GROQ_API_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_API_KEY}` },
-            body: JSON.stringify({ model: groqModel, messages: mensajesParaGroq, max_tokens: 2048, temperature: 0.7 }),
-          });
-        } else {
-          return res.status(504).json({ error: 'Timeout: el modelo tardó demasiado en responder' });
-        }
-      } else {
-        console.error('Error de red al llamar al modelo:', fetchErr.message);
-        return res.status(502).json({ error: 'Error de conexión con el modelo de IA' });
-      }
-    } finally {
-      clearTimeout(timeoutId);
-    }
 
-    if (!groqRes.ok) {
-      const err = await groqRes.json().catch(() => ({}));
-      console.error('Error modelo IA:', err);
-      return res.status(groqRes.status).json({ error: err.error?.message || 'Error al llamar al modelo de IA' });
-    }
+    let respuesta;
+    let usage;
 
-    const groqData = await groqRes.json();
-    const respuesta = groqData.choices?.[0]?.message?.content || '';
-    const usage = groqData.usage || {};
+    if (allowedTools.length > 0) {
+      // Con agente y tools habilitadas: loop de function-calling
+      const result = await runToolLoop({
+        messages: mensajesParaGroq,
+        callModel,
+        allowedTools,
+        workspacesRoot: WORKSPACES_ROOT,
+        workspaceId: agentId,
+      });
+      respuesta = result.finalMessage;
+      usage = result.usage;
+    } else {
+      // Sin agente, o agente sin tools: llamada simple, igual que antes
+      const data = await callModel(mensajesParaGroq, undefined);
+      respuesta = data.choices?.[0]?.message?.content || '';
+      usage = data.usage || {};
+    }
 
     // Persistir en memoria del agente si aplica
     if (agentId && userMessage?.content) {
@@ -474,7 +527,7 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
     }
 
     res.json({
-      choices: groqData.choices,
+      choices: [{ message: { role: 'assistant', content: respuesta } }],
       usage: {
         input_tokens: usage.prompt_tokens || 0,
         output_tokens: usage.completion_tokens || 0,
@@ -485,7 +538,8 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
 
   } catch (err) {
     console.error('Error inferencia:', err);
-    res.status(500).json({ error: 'Error interno al procesar la solicitud' });
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message || 'Error interno al procesar la solicitud' });
   }
 });
 
