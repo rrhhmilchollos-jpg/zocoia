@@ -51,15 +51,15 @@ export default function Dashboard() {
   }), [token]);
 
   const loadBilling = useCallback(async () => {
-    try { const r = await fetch(`${API_BASE}/api/billing/summary`, { headers: authHeaders() }); if (r.ok) setBilling(await r.json()); } catch {}
+    try { const r = await fetch(`${API_BASE}/api/billing/summary`, { headers: authHeaders() }); if (r.ok) { const data = await r.json(); setBilling(data); } } catch {}
   }, [authHeaders]);
 
   const loadAgentes = useCallback(async () => {
-    try { const r = await fetch(`${API_BASE}/api/resources?type=agente`, { headers: authHeaders() }); if (r.ok) setAgentes(await r.json()); } catch {}
+    try { const r = await fetch(`${API_BASE}/api/resources?type=agente`, { headers: authHeaders() }); if (r.ok) { const data = await r.json(); setAgentes(data); } } catch {}
   }, [authHeaders]);
 
   const loadKeys = useCallback(async () => {
-    try { const r = await fetch(`${API_BASE}/api/keys`, { headers: authHeaders() }); if (r.ok) setKeys(await r.json()); } catch {}
+    try { const r = await fetch(`${API_BASE}/api/keys`, { headers: authHeaders() }); if (r.ok) { const data = await r.json(); setKeys(data); } } catch {}
   }, [authHeaders]);
 
   const loadResourceType = useCallback(async (type: string) => {
@@ -67,23 +67,23 @@ export default function Dashboard() {
   }, [authHeaders]);
 
   const loadAdminUsuarios = useCallback(async () => {
-    try { const r = await fetch(`${API_BASE}/admin/clientes`, { headers: authHeaders() }); if (r.ok) setAdminUsuarios(await r.json()); } catch {}
+    try { const r = await fetch(`${API_BASE}/admin/clientes`, { headers: authHeaders() }); if (r.ok) { const data = await r.json(); setAdminUsuarios(data); } } catch {}
   }, [authHeaders]);
 
   const loadPaymentHistory = useCallback(async () => {
-    try { const r = await fetch(`${API_BASE}/api/payments/history`, { headers: authHeaders() }); if (r.ok) setPayments(await r.json()); } catch {}
+    try { const r = await fetch(`${API_BASE}/api/payments/history`, { headers: authHeaders() }); if (r.ok) { const data = await r.json(); setPayments(data); } } catch {}
   }, [authHeaders]);
 
   const loadCreditPacks = useCallback(async () => {
-    try { const r = await fetch(`${API_BASE}/api/payments/packs`, { headers: authHeaders() }); if (r.ok) setCreditPacks(await r.json()); } catch {}
+    try { const r = await fetch(`${API_BASE}/api/payments/packs`, { headers: authHeaders() }); if (r.ok) { const data = await r.json(); setCreditPacks(data); } } catch {}
   }, [authHeaders]);
 
   const loadAdminStats = useCallback(async () => {
-    try { const r = await fetch(`${API_BASE}/admin/stats`, { headers: authHeaders() }); if (r.ok) setAdminStats(await r.json()); } catch {}
+    try { const r = await fetch(`${API_BASE}/admin/stats`, { headers: authHeaders() }); if (r.ok) { const data = await r.json(); setAdminStats(data); } } catch {}
   }, [authHeaders]);
 
   const loadAdminLogs = useCallback(async () => {
-    try { const r = await fetch(`${API_BASE}/admin/logs`, { headers: authHeaders() }); if (r.ok) setAdminLogs(await r.json()); } catch {}
+    try { const r = await fetch(`${API_BASE}/admin/logs`, { headers: authHeaders() }); if (r.ok) { const data = await r.json(); setAdminLogs(data); } } catch {}
   }, [authHeaders]);
 
   useEffect(() => {
@@ -182,7 +182,7 @@ export default function Dashboard() {
 
   const loadAgentMemory = useCallback(async (agentId: string) => {
     setMemoryLoading(true);
-    try { const r = await fetch(`${API_BASE}/api/agentes/${agentId}/memoria`, { headers: authHeaders() }); if (r.ok) setAgentMemory(p => ({ ...p, [agentId]: await r.json() })); } 
+    try { const r = await fetch(`${API_BASE}/api/agentes/${agentId}/memoria`, { headers: authHeaders() }); if (r.ok) { const data = await r.json(); setAgentMemory(p => ({ ...p, [agentId]: data })); } } 
     finally { setMemoryLoading(false); }
   }, [authHeaders]);
 
