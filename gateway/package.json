@@ -1,0 +1,15 @@
+{
+  "name": "maris-ai-gateway",
+  "version": "2.0.0",
+  "description": "Maris AI Gateway: autenticacion, medicion de uso y facturacion delante de vLLM/Ollama",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "create-key": "node server.js create-key"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "better-sqlite3": "^11.3.0",
+    "node-fetch": "^2.7.0"
+  }
+}
