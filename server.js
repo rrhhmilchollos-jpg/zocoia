@@ -121,8 +121,19 @@ if (!userColumns.includes('modelo_activo')) {
 }
 
 const RESOURCE_TYPES = ['agente', 'archivo', 'habilidad', 'lote', 'sesion', 'implementacion', 'entorno', 'credencial', 'memoria'];
-const MODELOS_VALIDOS = ['maris-beta-70b', 'maris-pro-32b', 'maris-core-7b', 'maris-velox-1b'];
-const PROMPT_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutos, igual que la caché efímera de Anthropic
+
+// Modelos Groq disponibles con sus IDs reales
+const MODELOS_VALIDOS = ['maris-velox', 'maris-core', 'maris-pro', 'maris-beta'];
+const GROQ_MODEL_MAP = {
+  'maris-velox': 'llama-3.3-70b-versatile',   // Rápido, equiv. Haiku
+  'maris-core':  'llama-3.3-70b-versatile',   // Equilibrado, equiv. Sonnet
+  'maris-pro':   'moonshotai/kimi-k2-instruct', // Potente, equiv. Sonnet 4.7
+  'maris-beta':  'moonshotai/kimi-k2-instruct', // Máxima potencia, equiv. Opus
+};
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+
+const PROMPT_CACHE_TTL_MS = 5 * 60 * 1000;
 
 function seedAdminAccount() {
   const email = process.env.ADMIN_EMAIL;
@@ -216,62 +227,95 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'Zoco IA conectado con éxito' });
 });
 
-app.post('/v1/chat/completions', authMiddleware, (req, res) => {
-  const { agentId, messages } = req.body || {};
+app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
+  if (!GROQ_API_KEY) {
+    return res.status(503).json({ error: 'GROQ_API_KEY no configurada en el servidor' });
+  }
+
+  const { agentId, messages, model } = req.body || {};
   const userMessage = Array.isArray(messages) && messages.length ? messages[messages.length - 1] : null;
 
-  // Sin agentId: comportamiento simple sin memoria (compatibilidad hacia atrás).
-  if (!agentId) {
-    return res.json({
-      choices: [{ message: { role: 'assistant', content: 'Conexión en vivo completada desde el servidor de Zoco IA.' } }],
-      usage: { input_tokens: estimateTokens(userMessage?.content), output_tokens: 12, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+  // Determinar modelo Groq a usar
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.auth.sub);
+  const modeloZocoia = model || user?.modelo_activo || 'maris-core';
+  const groqModel = GROQ_MODEL_MAP[modeloZocoia] || GROQ_MODEL_MAP['maris-core'];
+
+  try {
+    let mensajesParaGroq = [];
+
+    if (agentId) {
+      // Con agente: usar memoria persistente
+      const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(agentId, req.auth.sub, 'agente');
+      if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
+
+      const agenteData = agente.data ? JSON.parse(agente.data) : {};
+      const historial = db.prepare('SELECT role, content FROM agent_memory WHERE agente_id = ? ORDER BY created_at ASC LIMIT 50').all(agentId);
+
+      if (agenteData.systemPrompt) {
+        mensajesParaGroq.push({ role: 'system', content: agenteData.systemPrompt });
+      } else {
+        mensajesParaGroq.push({ role: 'system', content: `Eres ${agente.name}, un asistente de IA útil y preciso.` });
+      }
+      mensajesParaGroq = mensajesParaGroq.concat(historial);
+      if (userMessage) mensajesParaGroq.push({ role: 'user', content: String(userMessage.content) });
+    } else {
+      // Sin agente: pasar mensajes directamente
+      mensajesParaGroq = Array.isArray(messages) ? messages : [{ role: 'user', content: 'Hola' }];
+    }
+
+    // Llamada real a Groq
+    const groqRes = await fetch(GROQ_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: groqModel,
+        messages: mensajesParaGroq,
+        max_tokens: req.body.max_tokens || 2048,
+        temperature: req.body.temperature ?? 0.7,
+      }),
     });
+
+    if (!groqRes.ok) {
+      const err = await groqRes.json().catch(() => ({}));
+      console.error('Error Groq:', err);
+      return res.status(groqRes.status).json({ error: err.error?.message || 'Error al llamar a Groq' });
+    }
+
+    const groqData = await groqRes.json();
+    const respuesta = groqData.choices?.[0]?.message?.content || '';
+    const usage = groqData.usage || {};
+
+    // Persistir en memoria del agente si aplica
+    if (agentId && userMessage?.content) {
+      db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)')
+        .run(uuidv4(), agentId, req.auth.sub, 'user', String(userMessage.content));
+      db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)')
+        .run(uuidv4(), agentId, req.auth.sub, 'assistant', respuesta);
+    }
+
+    // Registrar uso
+    if (usage.total_tokens) {
+      db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)')
+        .run(uuidv4(), req.auth.sub, usage.total_tokens * 0.000001, 'gasto', `Groq ${groqModel}`);
+    }
+
+    res.json({
+      choices: groqData.choices,
+      usage: {
+        input_tokens: usage.prompt_tokens || 0,
+        output_tokens: usage.completion_tokens || 0,
+        total_tokens: usage.total_tokens || 0,
+      },
+      model: groqModel,
+    });
+
+  } catch (err) {
+    console.error('Error inferencia:', err);
+    res.status(500).json({ error: 'Error interno al procesar la solicitud' });
   }
-
-  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(agentId, req.auth.sub, 'agente');
-  if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
-
-  // Recupera el historial persistente (memoria) del agente.
-  const historial = db.prepare('SELECT role, content FROM agent_memory WHERE agente_id = ? ORDER BY created_at ASC').all(agentId);
-
-  // La clave de caché representa el "prefijo" estable (system prompt + historial previo).
-  const cachePrefix = JSON.stringify(historial);
-  const cacheKey = crypto.createHash('sha256').update(`${agentId}:${cachePrefix}`).digest('hex');
-  const now = Date.now();
-
-  const existingCache = db.prepare('SELECT * FROM prompt_cache WHERE cache_key = ?').get(cacheKey);
-  let cacheReadTokens = 0;
-  let cacheCreationTokens = 0;
-
-  if (existingCache && existingCache.expires_at > now) {
-    cacheReadTokens = existingCache.token_estimate;
-    db.prepare('UPDATE prompt_cache SET hits = hits + 1, expires_at = ? WHERE cache_key = ?').run(now + PROMPT_CACHE_TTL_MS, cacheKey);
-  } else {
-    cacheCreationTokens = estimateTokens(cachePrefix);
-    db.prepare(
-      'INSERT OR REPLACE INTO prompt_cache (cache_key, agente_id, user_id, token_estimate, hits, expires_at) VALUES (?, ?, ?, ?, 0, ?)'
-    ).run(cacheKey, agentId, req.auth.sub, cacheCreationTokens, now + PROMPT_CACHE_TTL_MS);
-  }
-
-  const respuesta = `[${agente.name}] Conexión en vivo completada. Memoria persistente: ${historial.length} mensajes previos considerados.`;
-
-  // Persiste el mensaje del usuario y la respuesta como parte de la memoria del agente.
-  if (userMessage?.content) {
-    db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)')
-      .run(uuidv4(), agentId, req.auth.sub, 'user', String(userMessage.content));
-  }
-  db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)')
-    .run(uuidv4(), agentId, req.auth.sub, 'assistant', respuesta);
-
-  res.json({
-    choices: [{ message: { role: 'assistant', content: respuesta } }],
-    usage: {
-      input_tokens: estimateTokens(userMessage?.content),
-      output_tokens: estimateTokens(respuesta),
-      cache_creation_input_tokens: cacheCreationTokens,
-      cache_read_input_tokens: cacheReadTokens,
-    },
-  });
 });
 
 // ─── Selección de modelo activo ────────────────────────────────────────────────
