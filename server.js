@@ -933,10 +933,11 @@ app.post('/api/payments/webhook', async (req, res) => {
   }
 });
 
-// Verificación GET del webhook (Viva lo requiere)
+// Verificación GET del webhook (Viva lo requiere — debe devolver {"Key":"..."})
 app.get('/api/payments/webhook', (req, res) => {
-  const key = process.env.VIVA_WEBHOOK_KEY || '';
-  res.json({ Key: key });
+  const key = String(process.env.VIVA_WEBHOOK_KEY || '');
+  res.setHeader('Content-Type', 'application/json');
+  res.end(JSON.stringify({ Key: key }));
 });
 
 // Página de éxito tras pago
