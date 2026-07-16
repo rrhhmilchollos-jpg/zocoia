@@ -168,6 +168,64 @@ const OLLAMA_URL = process.env.OLLAMA_URL; // ej: https://xxxx.ngrok-free.app
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
+// ─── Web Search con DuckDuckGo (sin API key, sin dependencias extra) ──────────
+async function webSearch(query) {
+  try {
+    // DuckDuckGo Instant Answer API — pública y sin clave
+    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+    const res = await fetch(url, { headers: { 'User-Agent': 'ZocoIA/1.0' }, signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return null;
+    const data = await res.json();
+
+    const results = [];
+
+    // Respuesta directa
+    if (data.AbstractText) results.push(`Resumen: ${data.AbstractText}`);
+
+    // Resultados relacionados
+    if (data.RelatedTopics) {
+      data.RelatedTopics.slice(0, 5).forEach(t => {
+        if (t.Text) results.push(t.Text);
+      });
+    }
+
+    // Resultados de búsqueda adicionales via HTML scraping ligero
+    try {
+      const htmlRes = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ZocoIA/1.0)' },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (htmlRes.ok) {
+        const html = await htmlRes.text();
+        const snippets = [...html.matchAll(/<a class="result__snippet"[^>]*>(.*?)<\/a>/gs)]
+          .slice(0, 4)
+          .map(m => m[1].replace(/<[^>]+>/g, '').trim())
+          .filter(Boolean);
+        results.push(...snippets);
+      }
+    } catch {}
+
+    return results.length > 0 ? results.slice(0, 6).join('\n') : null;
+  } catch (err) {
+    console.warn('Web search falló:', err.message);
+    return null;
+  }
+}
+
+// Detectar si el mensaje necesita búsqueda web
+function needsWebSearch(text) {
+  if (!text) return false;
+  const keywords = [
+    'hoy', 'ahora', 'actual', 'última hora', 'noticia', 'noticias',
+    'precio', 'cotización', 'tiempo', 'temperatura', 'clima',
+    '2024', '2025', '2026', 'mundial', 'elección', 'ganó', 'gano',
+    'quien es el presidente', 'quién ganó', 'últimas noticias',
+    'what happened', 'latest', 'current', 'today', 'news',
+  ];
+  const lower = text.toLowerCase();
+  return keywords.some(k => lower.includes(k));
+}
+
 const PROMPT_CACHE_TTL_MS = 5 * 60 * 1000;
 
 function seedAdminAccount() {
@@ -305,6 +363,23 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
     } else {
       // Sin agente: pasar mensajes directamente
       mensajesParaGroq = Array.isArray(messages) ? messages : [{ role: 'user', content: 'Hola' }];
+    }
+
+    // Web Search automático si el mensaje parece necesitar info actual
+    const lastUserMsg = mensajesParaGroq.filter(m => m.role === 'user').slice(-1)[0]?.content || '';
+    if (needsWebSearch(lastUserMsg)) {
+      const searchResults = await webSearch(lastUserMsg);
+      if (searchResults) {
+        // Inyectar contexto web en el system prompt
+        const webCtx = `\n\n[CONTEXTO WEB - ${new Date().toLocaleDateString('es-ES')}]\n${searchResults}\n[FIN CONTEXTO WEB]\nUsa este contexto para responder con información actualizada.`;
+        const sysIdx = mensajesParaGroq.findIndex(m => m.role === 'system');
+        if (sysIdx >= 0) {
+          mensajesParaGroq[sysIdx] = { ...mensajesParaGroq[sysIdx], content: mensajesParaGroq[sysIdx].content + webCtx };
+        } else {
+          mensajesParaGroq.unshift({ role: 'system', content: `Eres Zoco IA, un asistente útil y preciso.${webCtx}` });
+        }
+        console.log('🌐 Web search inyectado para:', lastUserMsg.slice(0, 60));
+      }
     }
 
     // Llamada a Ollama local (si OLLAMA_URL está activa) o Groq cloud
