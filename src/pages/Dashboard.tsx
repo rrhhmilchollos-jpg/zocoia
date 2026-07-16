@@ -44,6 +44,9 @@ export default function Dashboard() {
   const [adminLogs, setAdminLogs] = useState<any[]>([]);
   const [adminStats, setAdminStats] = useState<any>(null);
   const [payingPack, setPayingPack] = useState<string|null>(null);
+  const [chatMessages, setChatMessages] = useState<{role:string;content:string}[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatLoading, setChatLoading] = useState(false);
 
   const authHeaders = useCallback(() => ({
     'Content-Type': 'application/json',
@@ -208,6 +211,33 @@ export default function Dashboard() {
     { nombre: 'Zoco Haiku', backend: 'zoco-haiku-4-5', equiv: 'Más rápido', tags: ['Alta velocidad','Bajo coste'], bg: 'bg-green-100', icon: 'fa-feather' },
   ];
 
+  const sendChat = async () => {
+    const msg = chatInput.trim();
+    if (!msg || chatLoading) return;
+    setChatInput('');
+    const newMessages = [...chatMessages, { role: 'user', content: msg }];
+    setChatMessages(newMessages);
+    setChatLoading(true);
+    try {
+      const r = await fetch(`${API_BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ messages: newMessages, model: selectedModel }),
+      });
+      const d = await r.json();
+      if (r.ok) {
+        const reply = d.choices?.[0]?.message?.content || '';
+        setChatMessages(prev => [...prev, { role: 'assistant', content: reply }]);
+      } else {
+        setChatMessages(prev => [...prev, { role: 'assistant', content: `Error: ${d.error || 'Sin respuesta'}` }]);
+      }
+    } catch (err) {
+      setChatMessages(prev => [...prev, { role: 'assistant', content: 'Error de conexión con el servidor' }]);
+    } finally {
+      setChatLoading(false);
+    }
+  };
+
   const navBtn = (tab: string, icon: string, label: string) => (
     <button key={tab} onClick={() => setActiveTab(tab)}
       className={`w-full flex items-center space-x-3 px-3 py-2 rounded-lg text-left ${activeTab === tab ? 'bg-gray-100 text-black font-medium' : 'text-gray-600 hover:bg-gray-50'}`}>
@@ -228,6 +258,7 @@ export default function Dashboard() {
           <nav className="space-y-1">
             {navBtn('panel', 'fa-house', 'Panel de control')}
             {navBtn('keys', 'fa-key', 'Claves de API')}
+            {navBtn('chat', 'fa-message', 'Chat IA')}
             {navBtn('billing', 'fa-credit-card', 'Facturación')}
             <div className="pt-4 pb-1 px-3 text-[11px] font-bold text-gray-400 uppercase tracking-wider">Compilar</div>
             {navBtn('archivo', 'fa-folder', 'Archivos')}
@@ -353,6 +384,71 @@ export default function Dashboard() {
               })}
             </div>
           </>
+        )}
+
+        {/* CHAT */}
+        {activeTab === 'chat' && (
+          <div className="max-w-3xl flex flex-col h-[calc(100vh-140px)]">
+            <div className="flex items-center justify-between mb-4">
+              <h1 className="text-2xl font-bold">Chat con Zoco IA</h1>
+              <div className="flex items-center space-x-2">
+                <span className="text-xs text-gray-400">Modelo activo:</span>
+                <span className="bg-black text-white text-xs px-2 py-1 rounded-full">{selectedModel}</span>
+                <button onClick={() => setChatMessages([])} className="text-xs text-gray-400 hover:text-red-500 ml-2">
+                  <i className="fa-solid fa-trash"></i> Limpiar
+                </button>
+              </div>
+            </div>
+
+            {/* Mensajes */}
+            <div className="flex-1 overflow-y-auto bg-white border border-gray-200 rounded-xl p-4 mb-4 space-y-4">
+              {chatMessages.length === 0 && (
+                <div className="flex flex-col items-center justify-center h-full text-center text-gray-400">
+                  <i className="fa-solid fa-robot text-4xl mb-3 text-gray-200"></i>
+                  <p className="font-medium text-gray-500">Hola, soy Zoco IA</p>
+                  <p className="text-sm mt-1">Selecciona un modelo en el Panel y empieza a chatear</p>
+                </div>
+              )}
+              {chatMessages.map((m, i) => (
+                <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`max-w-[80%] px-4 py-2.5 rounded-2xl text-sm leading-relaxed ${
+                    m.role === 'user'
+                      ? 'bg-black text-white rounded-br-sm'
+                      : 'bg-gray-100 text-gray-800 rounded-bl-sm'
+                  }`}>
+                    {m.content}
+                  </div>
+                </div>
+              ))}
+              {chatLoading && (
+                <div className="flex justify-start">
+                  <div className="bg-gray-100 px-4 py-2.5 rounded-2xl rounded-bl-sm text-sm text-gray-500">
+                    <i className="fa-solid fa-circle-notch fa-spin mr-2"></i>Pensando...
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Input */}
+            <div className="flex space-x-2">
+              <input
+                type="text"
+                value={chatInput}
+                onChange={e => setChatInput(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && !e.shiftKey && sendChat()}
+                placeholder="Escribe un mensaje..."
+                disabled={chatLoading}
+                className="flex-1 border border-gray-300 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-black disabled:opacity-50"
+              />
+              <button
+                onClick={sendChat}
+                disabled={chatLoading || !chatInput.trim()}
+                className="bg-black text-white px-5 py-3 rounded-xl font-medium text-sm hover:bg-gray-800 disabled:opacity-50"
+              >
+                <i className="fa-solid fa-paper-plane"></i>
+              </button>
+            </div>
+          </div>
         )}
 
         {/* FACTURACIÓN */}
