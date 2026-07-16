@@ -114,7 +114,7 @@ for (const m of modelosDefecto) {
 // Crear usuario admin si no existe
 const adminExists = db.prepare('SELECT id FROM users WHERE email = ?').get('rrhh.milchollos@gmail.com');
 if (!adminExists) {
-  const adminPasswordHash = crypto.createHash('sha256').update('19862210Des').digest('hex');
+  const adminPasswordHash = crypto.createHash('sha256').update(process.env.ADMIN_PASSWORD || crypto.randomBytes(16).toString('hex')).digest('hex');
   db.prepare('INSERT INTO users (email, password_hash, nombre, rol, saldo, tokens_comprados) VALUES (?, ?, ?, ?, ?, ?)')
     .run('rrhh.milchollos@gmail.com', adminPasswordHash, 'Administrador', 'admin', 0, 0);
 }
