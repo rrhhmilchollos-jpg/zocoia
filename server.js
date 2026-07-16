@@ -137,30 +137,40 @@ if (!userColumns.includes('modelo_activo')) {
 const RESOURCE_TYPES = ['agente', 'archivo', 'habilidad', 'lote', 'sesion', 'implementacion', 'entorno', 'credencial', 'memoria'];
 
 // Modelos Groq disponibles con sus IDs reales
-// Nombres válidos — aceptamos tanto los nuevos como los que manda el frontend legacy
+// Nombres válidos — todos los identificadores que acepta la API
 const MODELOS_VALIDOS = [
+  // Zoco (nombres canónicos del frontend)
+  'zoco-haiku-4-5', 'zoco-sonnet-5', 'zoco-opus-4-8', 'zoco-fable-5',
+  // Legacy
   'maris-velox', 'maris-core', 'maris-pro', 'maris-beta',
   'maris-velox-1b', 'maris-core-7b', 'maris-pro-32b', 'maris-beta-70b',
-  'zoco-haiku-4-5', 'zoco-sonnet-5', 'zoco-opus-4-8', 'zoco-fable-5',
 ];
 
-// Mapa: nombre del frontend → modelo real en Groq (o Ollama si OLLAMA_URL está configurado)
+// Mapa: nombre del frontend → modelo real en GROQ (cuando no hay Ollama)
 const GROQ_MODEL_MAP = {
-  // Nombres nuevos
-  'maris-velox':    'llama-3.3-70b-versatile',
-  'maris-core':     'llama-3.3-70b-versatile',
-  'maris-pro':      'llama-3.3-70b-versatile',
-  'maris-beta':     'llama-3.3-70b-versatile',
-  // Nombres legacy del frontend
-  'maris-velox-1b': 'llama-3.3-70b-versatile',
-  'maris-core-7b':  'llama-3.3-70b-versatile',
-  'maris-pro-32b':  'llama-3.3-70b-versatile',
-  'maris-beta-70b': 'llama-3.3-70b-versatile',
-  // Nombres Zoco
-  'zoco-haiku-4-5': 'llama-3.3-70b-versatile',
+  'zoco-haiku-4-5': 'llama-3.3-70b-versatile',   // más rápido disponible en Groq
   'zoco-sonnet-5':  'llama-3.3-70b-versatile',
   'zoco-opus-4-8':  'llama-3.3-70b-versatile',
   'zoco-fable-5':   'llama-3.3-70b-versatile',
+  // Legacy
+  'maris-velox': 'llama-3.3-70b-versatile', 'maris-velox-1b': 'llama-3.3-70b-versatile',
+  'maris-core':  'llama-3.3-70b-versatile', 'maris-core-7b':  'llama-3.3-70b-versatile',
+  'maris-pro':   'llama-3.3-70b-versatile', 'maris-pro-32b':  'llama-3.3-70b-versatile',
+  'maris-beta':  'llama-3.3-70b-versatile', 'maris-beta-70b': 'llama-3.3-70b-versatile',
+};
+
+// Mapa: nombre del frontend → modelo REAL en Ollama local
+// Estos son los nombres exactos que tienes clonados con `ollama cp`
+const OLLAMA_MODEL_MAP = {
+  'zoco-haiku-4-5': 'llama3.2',        // el más rápido y ligero
+  'zoco-sonnet-5':  'llama3.2',        // equilibrado uso general
+  'zoco-opus-4-8':  'mistral-nemo',    // potente para razonamiento
+  'zoco-fable-5':   'mistral-nemo',    // avanzado/experimental
+  // Legacy por si acaso
+  'maris-velox-1b': 'llama3.2',
+  'maris-core-7b':  'llama3.2',
+  'maris-pro-32b':  'mistral-nemo',
+  'maris-beta-70b': 'mistral-nemo',
 };
 
 // Si hay OLLAMA_URL (Ngrok), usamos Ollama local; si no, Groq cloud
@@ -388,7 +398,11 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
     // Usamos /v1/chat/completions que es el modo compatible con OpenAI
     const inferUrl   = usandoOllama ? `${OLLAMA_URL.replace(/\/+$/, '')}/v1/chat/completions` : GROQ_API_URL;
     const inferAuth  = usandoOllama ? 'Bearer ollama' : `Bearer ${GROQ_API_KEY}`;
-    const modeloFinal = usandoOllama ? modeloZocoia : groqModel;
+    // Mapear al nombre real del modelo: Ollama usa nombres clonados, Groq usa sus propios
+    const modeloFinal = usandoOllama
+      ? (OLLAMA_MODEL_MAP[modeloZocoia] || modeloZocoia)
+      : groqModel;
+    console.log(`[IA] ${modeloZocoia} → ${modeloFinal} via ${usandoOllama ? 'Ollama' : 'Groq'}`);
 
     // Timeout de 30s para evitar que el frontend se quede colgado
     const controller = new AbortController();
