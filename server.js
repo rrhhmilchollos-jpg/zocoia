@@ -307,31 +307,60 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
       mensajesParaGroq = Array.isArray(messages) ? messages : [{ role: 'user', content: 'Hola' }];
     }
 
-    // Llamada a Ollama local (si hay OLLAMA_URL) o Groq cloud
+    // Llamada a Ollama local (si OLLAMA_URL está activa) o Groq cloud
     const usandoOllama = !!OLLAMA_URL;
-    const inferUrl  = usandoOllama ? `${OLLAMA_URL}/v1/chat/completions` : GROQ_API_URL;
-    const inferAuth = usandoOllama ? `Bearer ollama` : `Bearer ${GROQ_API_KEY}`;
-    // En Ollama usamos el nombre tal cual viene del cliente; en Groq usamos el mapa
-    const modeloFinal = usandoOllama ? (modeloZocoia) : groqModel;
+    // Ollama expone /api/chat (nativo) o /v1/chat/completions (modo OpenAI-compat)
+    // Usamos /v1/chat/completions que es el modo compatible con OpenAI
+    const inferUrl   = usandoOllama ? `${OLLAMA_URL.replace(/\/+$/, '')}/v1/chat/completions` : GROQ_API_URL;
+    const inferAuth  = usandoOllama ? 'Bearer ollama' : `Bearer ${GROQ_API_KEY}`;
+    const modeloFinal = usandoOllama ? modeloZocoia : groqModel;
 
-    const groqRes = await fetch(inferUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': inferAuth,
-      },
-      body: JSON.stringify({
-        model: modeloFinal,
-        messages: mensajesParaGroq,
-        max_tokens: req.body.max_tokens || 2048,
-        temperature: req.body.temperature ?? 0.7,
-      }),
-    });
+    // Timeout de 30s para evitar que el frontend se quede colgado
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+    let groqRes;
+    try {
+      groqRes = await fetch(inferUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': inferAuth,
+        },
+        body: JSON.stringify({
+          model: modeloFinal,
+          messages: mensajesParaGroq,
+          max_tokens: req.body.max_tokens || 2048,
+          temperature: req.body.temperature ?? 0.7,
+        }),
+        signal: controller.signal,
+      });
+    } catch (fetchErr) {
+      clearTimeout(timeoutId);
+      if (fetchErr.name === 'AbortError') {
+        // Timeout — si usábamos Ollama, intentar con Groq como fallback
+        if (usandoOllama && GROQ_API_KEY) {
+          console.warn('Ollama timeout — usando Groq como fallback');
+          groqRes = await fetch(GROQ_API_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_API_KEY}` },
+            body: JSON.stringify({ model: groqModel, messages: mensajesParaGroq, max_tokens: 2048, temperature: 0.7 }),
+          });
+        } else {
+          return res.status(504).json({ error: 'Timeout: el modelo tardó demasiado en responder' });
+        }
+      } else {
+        console.error('Error de red al llamar al modelo:', fetchErr.message);
+        return res.status(502).json({ error: 'Error de conexión con el modelo de IA' });
+      }
+    } finally {
+      clearTimeout(timeoutId);
+    }
 
     if (!groqRes.ok) {
       const err = await groqRes.json().catch(() => ({}));
-      console.error('Error Groq:', err);
-      return res.status(groqRes.status).json({ error: err.error?.message || 'Error al llamar a Groq' });
+      console.error('Error modelo IA:', err);
+      return res.status(groqRes.status).json({ error: err.error?.message || 'Error al llamar al modelo de IA' });
     }
 
     const groqData = await groqRes.json();
@@ -742,6 +771,14 @@ app.post('/api/payments/create', authMiddleware, async (req, res) => {
         merchantTrns: `zocoia-${req.auth.sub}-${pack.id}`,
         sourceCode: VIVA_SOURCE_CODE,
         tags: [`user:${req.auth.sub}`, `pack:${pack.id}`],
+        // Solo Visa/Mastercard débito o crédito — sin prepago ni regalo
+        paymentMethodFees: [],
+        disabledPaymentMethods: [
+          'paypal', 'mbway', 'mbreference', 'mobilepay',
+          'cash', 'wallet', 'prepaid',
+        ],
+        // Forzar solo tarjetas (TypeId 0 = card)
+        allowedPaymentMethods: [0],
       }),
     });
 
@@ -761,7 +798,8 @@ app.post('/api/payments/create', authMiddleware, async (req, res) => {
     ).run(paymentId, req.auth.sub, pack.euros, pack.credits, 'pending', 'viva', String(orderCode));
 
     // URL de pago de Viva
-    const checkoutUrl = `${VIVA_BASE}/web/checkout?ref=${orderCode}&color=000000&langs=es`;
+    // color negro Zoco IA, solo tarjeta, idioma español
+        const checkoutUrl = `${VIVA_BASE}/web/checkout?ref=${orderCode}&color=1a1a2e&langs=es&paymentMethod=0`;
     res.json({ checkoutUrl, orderCode, paymentId });
 
   } catch (err) {
