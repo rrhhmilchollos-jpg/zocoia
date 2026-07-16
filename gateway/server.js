@@ -68,6 +68,7 @@ db.exec(`
     display_name TEXT NOT NULL,
     equivalencia TEXT DEFAULT NULL,
     backend_url TEXT NOT NULL,
+    backend_model_id TEXT NOT NULL,
     active INTEGER DEFAULT 1,
     price_per_1k_tokens REAL DEFAULT 0.001,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -97,26 +98,34 @@ db.exec(`
   );
 `);
 
-// Registrar modelos por defecto si no existen
+// Registrar modelos por defecto si no existen.
+// OLLAMA_URL debe ser la URL pública de tu ngrok (o tu servidor Ollama), sin barra final,
+// ej: OLLAMA_URL=https://concave-charred-lived.ngrok-free.dev/v1
+const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434/v1';
+
 const modelosDefecto = [
-  { model_id: 'maris-velox-1b', display_name: 'Maris Velox 1B', equivalencia: 'Equiv. Haiku 4.5', active: 1, price: 0.0005 },
-  { model_id: 'maris-core-7b', display_name: 'Maris Core 7B', equivalencia: 'Equiv. Sonnet 5', active: 0, price: 0.002 },
-  { model_id: 'maris-pro-32b', display_name: 'Maris Pro 32B', equivalencia: 'Equiv. Opus 4.8', active: 0, price: 0.01 },
+  { model_id: 'maris-velox-1b', display_name: 'Maris Velox 1B', equivalencia: 'Modelo ligero (Llama 3.2 1B)', backend_url: OLLAMA_URL, backend_model_id: 'llama3.2:1b', active: 1, price: 0.0005 },
+  { model_id: 'maris-core-7b', display_name: 'Maris Core 3B', equivalencia: 'Modelo intermedio (Qwen2.5 3B)', backend_url: OLLAMA_URL, backend_model_id: 'qwen2.5:3b', active: 1, price: 0.002 },
 ];
 for (const m of modelosDefecto) {
   const exists = db.prepare('SELECT id FROM models_registry WHERE model_id = ?').get(m.model_id);
   if (!exists) {
-    db.prepare('INSERT INTO models_registry (model_id, display_name, equivalencia, backend_url, active, price_per_1k_tokens) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(m.model_id, m.display_name, m.equivalencia, VLLM_URL, m.active, m.price);
+    db.prepare('INSERT INTO models_registry (model_id, display_name, equivalencia, backend_url, backend_model_id, active, price_per_1k_tokens) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(m.model_id, m.display_name, m.equivalencia, m.backend_url, m.backend_model_id, m.active, m.price);
   }
 }
 
-// Crear usuario admin si no existe
-const adminExists = db.prepare('SELECT id FROM users WHERE email = ?').get('rrhh.milchollos@gmail.com');
+// Crear usuario admin si no existe (la contraseña SOLO sale de la variable de entorno ADMIN_PASSWORD, nunca del código)
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'rrhh.milchollos@gmail.com';
+const adminExists = db.prepare('SELECT id FROM users WHERE email = ?').get(ADMIN_EMAIL);
 if (!adminExists) {
-  const adminPasswordHash = crypto.createHash('sha256').update(process.env.ADMIN_PASSWORD || crypto.randomBytes(16).toString('hex')).digest('hex');
-  db.prepare('INSERT INTO users (email, password_hash, nombre, rol, saldo, tokens_comprados) VALUES (?, ?, ?, ?, ?, ?)')
-    .run('rrhh.milchollos@gmail.com', adminPasswordHash, 'Administrador', 'admin', 0, 0);
+  if (!process.env.ADMIN_PASSWORD) {
+    console.warn('⚠️  ADMIN_PASSWORD no está definida en las variables de entorno. No se creó el usuario admin.');
+  } else {
+    const adminPasswordHash = crypto.createHash('sha256').update(process.env.ADMIN_PASSWORD).digest('hex');
+    db.prepare('INSERT INTO users (email, password_hash, nombre, rol, saldo, tokens_comprados) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(ADMIN_EMAIL, adminPasswordHash, 'Administrador', 'admin', 0, 0);
+  }
 }
 
 // ─── Utilidades ───────────────────────────────────────────────────────────────
@@ -254,12 +263,18 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
   try {
     const modelId = req.body.model || 'maris-velox-1b';
     const modelRow = db.prepare('SELECT * FROM models_registry WHERE model_id = ? AND active = 1').get(modelId);
-    const backendUrl = modelRow ? modelRow.backend_url : VLLM_URL;
 
-    const upstream = await fetch(`${backendUrl}/chat/completions`, {
+    if (!modelRow) {
+      return res.status(400).json({ error: `Modelo "${modelId}" no encontrado o inactivo en models_registry` });
+    }
+
+    // Reescribimos el "model" del body con el nombre real que Ollama entiende (ej: llama3.2:1b)
+    const upstreamBody = { ...req.body, model: modelRow.backend_model_id };
+
+    const upstream = await fetch(`${modelRow.backend_url}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body),
+      body: JSON.stringify(upstreamBody),
     });
 
     const data = await upstream.json();
