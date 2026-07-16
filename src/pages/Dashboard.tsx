@@ -63,7 +63,7 @@ export default function Dashboard() {
   }, [authHeaders]);
 
   const loadResourceType = useCallback(async (type: string) => {
-    try { const r = await fetch(`${API_BASE}/api/resources?type=${type}`, { headers: authHeaders() }); if (r.ok) setResourcesByType(p => ({ ...p, [type]: await r.json() })); } catch {}
+    try { const r = await fetch(`${API_BASE}/api/resources?type=${type}`, { headers: authHeaders() }); if (r.ok) { const data = await r.json(); setResourcesByType(p => ({ ...p, [type]: data })); } } catch {}
   }, [authHeaders]);
 
   const loadAdminUsuarios = useCallback(async () => {
