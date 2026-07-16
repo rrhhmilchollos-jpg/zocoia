@@ -281,6 +281,7 @@ app.put('/api/user/modelo', authMiddleware, (req, res) => {
 
   db.prepare('UPDATE users SET modelo_activo = ? WHERE id = ?').run(modelo, req.auth.sub);
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.auth.sub);
+  if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
   res.json({ user: publicUser(user) });
 });
 
