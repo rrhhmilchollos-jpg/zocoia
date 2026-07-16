@@ -112,6 +112,20 @@ db.exec(`
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     expires_at INTEGER NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS payments (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    amount REAL NOT NULL,
+    credits REAL NOT NULL,
+    status TEXT DEFAULT 'pending',
+    provider TEXT DEFAULT 'viva',
+    order_code TEXT,
+    transaction_id TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
 `);
 
 // Migración simple: añade la columna modelo_activo si no existe todavía.
@@ -123,13 +137,34 @@ if (!userColumns.includes('modelo_activo')) {
 const RESOURCE_TYPES = ['agente', 'archivo', 'habilidad', 'lote', 'sesion', 'implementacion', 'entorno', 'credencial', 'memoria'];
 
 // Modelos Groq disponibles con sus IDs reales
-const MODELOS_VALIDOS = ['maris-velox', 'maris-core', 'maris-pro', 'maris-beta'];
+// Nombres válidos — aceptamos tanto los nuevos como los que manda el frontend legacy
+const MODELOS_VALIDOS = [
+  'maris-velox', 'maris-core', 'maris-pro', 'maris-beta',
+  'maris-velox-1b', 'maris-core-7b', 'maris-pro-32b', 'maris-beta-70b',
+  'zoco-haiku-4-5', 'zoco-sonnet-5', 'zoco-opus-4-8', 'zoco-fable-5',
+];
+
+// Mapa: nombre del frontend → modelo real en Groq (o Ollama si OLLAMA_URL está configurado)
 const GROQ_MODEL_MAP = {
-  'maris-velox': 'llama-3.3-70b-versatile',   // Rápido, equiv. Haiku
-  'maris-core':  'llama-3.3-70b-versatile',   // Equilibrado, equiv. Sonnet
-  'maris-pro':   'moonshotai/kimi-k2-instruct', // Potente, equiv. Sonnet 4.7
-  'maris-beta':  'moonshotai/kimi-k2-instruct', // Máxima potencia, equiv. Opus
+  // Nombres nuevos
+  'maris-velox':    'llama-3.3-70b-versatile',
+  'maris-core':     'llama-3.3-70b-versatile',
+  'maris-pro':      'llama-3.3-70b-versatile',
+  'maris-beta':     'llama-3.3-70b-versatile',
+  // Nombres legacy del frontend
+  'maris-velox-1b': 'llama-3.3-70b-versatile',
+  'maris-core-7b':  'llama-3.3-70b-versatile',
+  'maris-pro-32b':  'llama-3.3-70b-versatile',
+  'maris-beta-70b': 'llama-3.3-70b-versatile',
+  // Nombres Zoco
+  'zoco-haiku-4-5': 'llama-3.3-70b-versatile',
+  'zoco-sonnet-5':  'llama-3.3-70b-versatile',
+  'zoco-opus-4-8':  'llama-3.3-70b-versatile',
+  'zoco-fable-5':   'llama-3.3-70b-versatile',
 };
+
+// Si hay OLLAMA_URL (Ngrok), usamos Ollama local; si no, Groq cloud
+const OLLAMA_URL = process.env.OLLAMA_URL; // ej: https://xxxx.ngrok-free.app
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
@@ -232,6 +267,15 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
     return res.status(503).json({ error: 'GROQ_API_KEY no configurada en el servidor' });
   }
 
+  // Bloquear si el usuario no tiene créditos
+  const userCheck = db.prepare('SELECT creditos, activo FROM users WHERE id = ?').get(req.auth.sub);
+  if (!userCheck || !userCheck.activo) {
+    return res.status(403).json({ error: 'Cuenta desactivada' });
+  }
+  if (userCheck.creditos <= 0) {
+    return res.status(402).json({ error: 'Créditos insuficientes. Recarga tu cuenta en zocoia.es/billing', code: 'insufficient_credits' });
+  }
+
   const { agentId, messages, model } = req.body || {};
   const userMessage = Array.isArray(messages) && messages.length ? messages[messages.length - 1] : null;
 
@@ -263,15 +307,21 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
       mensajesParaGroq = Array.isArray(messages) ? messages : [{ role: 'user', content: 'Hola' }];
     }
 
-    // Llamada real a Groq
-    const groqRes = await fetch(GROQ_API_URL, {
+    // Llamada a Ollama local (si hay OLLAMA_URL) o Groq cloud
+    const usandoOllama = !!OLLAMA_URL;
+    const inferUrl  = usandoOllama ? `${OLLAMA_URL}/v1/chat/completions` : GROQ_API_URL;
+    const inferAuth = usandoOllama ? `Bearer ollama` : `Bearer ${GROQ_API_KEY}`;
+    // En Ollama usamos el nombre tal cual viene del cliente; en Groq usamos el mapa
+    const modeloFinal = usandoOllama ? (modeloZocoia) : groqModel;
+
+    const groqRes = await fetch(inferUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${GROQ_API_KEY}`,
+        'Authorization': inferAuth,
       },
       body: JSON.stringify({
-        model: groqModel,
+        model: modeloFinal,
         messages: mensajesParaGroq,
         max_tokens: req.body.max_tokens || 2048,
         temperature: req.body.temperature ?? 0.7,
@@ -296,10 +346,13 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
         .run(uuidv4(), agentId, req.auth.sub, 'assistant', respuesta);
     }
 
-    // Registrar uso
-    if (usage.total_tokens) {
+    // Registrar uso y descontar créditos
+    const costeEuros = (usage.total_tokens || 0) * 0.000002; // ~0.002€ por 1000 tokens
+    if (costeEuros > 0) {
       db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)')
-        .run(uuidv4(), req.auth.sub, usage.total_tokens * 0.000001, 'gasto', `Groq ${groqModel}`);
+        .run(uuidv4(), req.auth.sub, costeEuros, 'gasto', `Groq ${groqModel}`);
+      db.prepare('UPDATE users SET creditos = MAX(0, creditos - ?) WHERE id = ?')
+        .run(costeEuros, req.auth.sub);
     }
 
     res.json({
@@ -607,6 +660,171 @@ app.post('/api/billing/topup', authMiddleware, (req, res) => {
   res.json({ creditos: user.creditos });
 });
 
+// ─── Pagos con Viva.com ─────────────────────────────────────────────────────────
+
+const VIVA_CLIENT_ID     = process.env.VIVA_CLIENT_ID;
+const VIVA_CLIENT_SECRET = process.env.VIVA_CLIENT_SECRET;
+const VIVA_SOURCE_CODE   = process.env.VIVA_SOURCE_CODE;
+const VIVA_IS_DEMO       = process.env.VIVA_IS_DEMO !== 'false'; // true por defecto hasta producción
+const VIVA_BASE          = VIVA_IS_DEMO ? 'https://demo.vivapayments.com' : 'https://www.vivapayments.com';
+const VIVA_API_BASE      = VIVA_IS_DEMO ? 'https://demo-api.vivapayments.com' : 'https://api.vivapayments.com';
+const APP_URL            = process.env.APP_URL || 'https://zocoia-production.up.railway.app';
+
+// Paquetes de créditos disponibles
+const CREDIT_PACKS = [
+  { id: 'starter',  euros: 5,   credits: 5,   label: 'Starter'     },
+  { id: 'basic',    euros: 10,  credits: 11,  label: 'Basic'       },
+  { id: 'pro',      euros: 25,  credits: 28,  label: 'Pro'         },
+  { id: 'business', euros: 50,  credits: 60,  label: 'Business'    },
+  { id: 'enterprise',euros: 100, credits: 125, label: 'Enterprise' },
+];
+
+async function getVivaToken() {
+  const res = await fetch(`${VIVA_API_BASE}/connect/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: VIVA_CLIENT_ID,
+      client_secret: VIVA_CLIENT_SECRET,
+    }),
+  });
+  if (!res.ok) throw new Error('No se pudo obtener token de Viva');
+  const data = await res.json();
+  return data.access_token;
+}
+
+// Listar paquetes disponibles
+app.get('/api/payments/packs', authMiddleware, (req, res) => {
+  res.json(CREDIT_PACKS);
+});
+
+// Historial de pagos del usuario
+app.get('/api/payments/history', authMiddleware, (req, res) => {
+  const payments = db.prepare(
+    'SELECT * FROM payments WHERE user_id = ? ORDER BY created_at DESC LIMIT 50'
+  ).all(req.auth.sub);
+  res.json(payments);
+});
+
+// Crear orden de pago en Viva.com
+app.post('/api/payments/create', authMiddleware, async (req, res) => {
+  if (!VIVA_CLIENT_ID || !VIVA_CLIENT_SECRET || !VIVA_SOURCE_CODE) {
+    return res.status(503).json({ error: 'Pasarela de pago no configurada todavía' });
+  }
+
+  const { packId } = req.body || {};
+  const pack = CREDIT_PACKS.find(p => p.id === packId);
+  if (!pack) return res.status(400).json({ error: 'Paquete no válido' });
+
+  const user = getUserOr404(req.auth.sub, res);
+  if (!user) return;
+
+  try {
+    const token = await getVivaToken();
+
+    // Crear orden de pago en Viva
+    const orderRes = await fetch(`${VIVA_API_BASE}/checkout/v2/orders`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        amount: Math.round(pack.euros * 100), // en céntimos
+        customerTrns: `Zoco IA — ${pack.label} (${pack.credits} créditos)`,
+        customer: { email: user.email, fullName: user.nombre },
+        paymentTimeout: 1800,
+        preauth: false,
+        allowRecurring: false,
+        maxInstallments: 0,
+        paymentNotification: true,
+        merchantTrns: `zocoia-${req.auth.sub}-${pack.id}`,
+        sourceCode: VIVA_SOURCE_CODE,
+        tags: [`user:${req.auth.sub}`, `pack:${pack.id}`],
+      }),
+    });
+
+    if (!orderRes.ok) {
+      const err = await orderRes.json().catch(() => ({}));
+      console.error('Error Viva crear orden:', err);
+      return res.status(502).json({ error: 'Error al crear el pedido en Viva' });
+    }
+
+    const orderData = await orderRes.json();
+    const orderCode = orderData.orderCode;
+
+    // Guardar pago pendiente en BD
+    const paymentId = uuidv4();
+    db.prepare(
+      'INSERT INTO payments (id, user_id, amount, credits, status, provider, order_code) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(paymentId, req.auth.sub, pack.euros, pack.credits, 'pending', 'viva', String(orderCode));
+
+    // URL de pago de Viva
+    const checkoutUrl = `${VIVA_BASE}/web/checkout?ref=${orderCode}&color=000000&langs=es`;
+    res.json({ checkoutUrl, orderCode, paymentId });
+
+  } catch (err) {
+    console.error('Error creando pago:', err);
+    res.status(500).json({ error: 'Error interno al crear el pago' });
+  }
+});
+
+// Webhook de Viva.com — confirmar pago completado
+app.post('/api/payments/webhook', async (req, res) => {
+  try {
+    const { EventTypeId, EventData } = req.body || {};
+
+    // EventTypeId 1796 = Transaction Payment Created (pago completado)
+    if (EventTypeId !== 1796) return res.json({ ok: true });
+
+    const { OrderCode, TransactionId, Amount } = EventData || {};
+    if (!OrderCode || !TransactionId) return res.status(400).json({ error: 'Datos incompletos' });
+
+    const payment = db.prepare('SELECT * FROM payments WHERE order_code = ? AND status = ?').get(String(OrderCode), 'pending');
+    if (!payment) {
+      console.warn('Webhook Viva: pago no encontrado o ya procesado:', OrderCode);
+      return res.json({ ok: true });
+    }
+
+    // Marcar pago como completado y añadir créditos al usuario
+    db.prepare('UPDATE payments SET status = ?, transaction_id = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?')
+      .run('completed', TransactionId, payment.id);
+
+    db.prepare('UPDATE users SET creditos = creditos + ? WHERE id = ?')
+      .run(payment.credits, payment.user_id);
+
+    db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)')
+      .run(uuidv4(), payment.user_id, payment.credits, 'recarga', `Recarga via Viva.com — ${payment.credits} créditos`);
+
+    console.log(`✅ Pago completado: usuario ${payment.user_id} recibió ${payment.credits} créditos`);
+    res.json({ ok: true });
+
+  } catch (err) {
+    console.error('Error en webhook Viva:', err);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+// Verificación GET del webhook (Viva lo requiere)
+app.get('/api/payments/webhook', (req, res) => {
+  const key = process.env.VIVA_WEBHOOK_KEY || '';
+  res.json({ Key: key });
+});
+
+// Página de éxito tras pago
+app.get('/api/payments/success', authMiddleware, (req, res) => {
+  const { s, orderCode } = req.query;
+  const payment = db.prepare('SELECT * FROM payments WHERE order_code = ?').get(String(orderCode));
+  if (payment && payment.status === 'completed') {
+    return res.json({ ok: true, credits: payment.credits, message: `¡Pago completado! Se han añadido ${payment.credits} créditos a tu cuenta.` });
+  }
+  res.json({ ok: false, message: 'Pago pendiente de confirmación' });
+});
+
+// ─── Bloqueo por créditos insuficientes en inferencia ───────────────────────────
+// (ya integrado en /v1/chat/completions — se descuentan automáticamente y se bloquea si creditos < 0)
+
 // ─── Ollama ──────────────────────────────────────────────────────────────────────
 app.get('/api/system/ollama', authMiddleware, async (req, res) => {
   const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
@@ -620,6 +838,29 @@ app.get('/api/system/ollama', authMiddleware, async (req, res) => {
   }
 });
 
+// ─── Admin: stats globales ─────────────────────────────────────────────────────
+app.get('/admin/stats', authMiddleware, requireAdmin, (req, res) => {
+  const totalUsuarios = db.prepare('SELECT COUNT(*) as n FROM users').get().n;
+  const usuariosActivos = db.prepare("SELECT COUNT(*) as n FROM users WHERE activo = 1").get().n;
+  const ingresosTotal = db.prepare("SELECT COALESCE(SUM(amount),0) as t FROM payments WHERE status='completed'").get().t;
+  const llamadasHoy = db.prepare("SELECT COUNT(*) as n FROM usage_log WHERE kind='gasto' AND created_at >= date('now')").get().n;
+  const ultimosPagos = db.prepare(`
+    SELECT p.*, u.email as user_email FROM payments p 
+    LEFT JOIN users u ON u.id = p.user_id 
+    ORDER BY p.created_at DESC LIMIT 50
+  `).all();
+  const vivaConfigurado = !!(process.env.VIVA_CLIENT_ID && process.env.VIVA_CLIENT_SECRET);
+  const ollamaOnline = !!process.env.OLLAMA_URL;
+
+  res.json({ totalUsuarios, usuariosActivos, ingresosTotal, llamadasHoy, ultimosPagos, vivaConfigurado, ollamaOnline });
+});
+
+// ─── Admin: logs de uso ─────────────────────────────────────────────────────────
+app.get('/admin/logs', authMiddleware, requireAdmin, (req, res) => {
+  const logs = db.prepare('SELECT * FROM usage_log ORDER BY created_at DESC LIMIT 100').all();
+  res.json(logs);
+});
+
 // ─── Admin: listar clientes ─────────────────────────────────────────────────────
 app.get('/admin/clientes', authMiddleware, requireAdmin, (req, res) => {
   const users = db.prepare('SELECT id, email, nombre, is_admin, is_support, creditos, activo, created_at FROM users ORDER BY created_at DESC').all();
@@ -631,8 +872,11 @@ app.put('/admin/clientes/:id', authMiddleware, requireAdmin, (req, res) => {
   const target = getUserOr404(req.params.id, res);
   if (!target) return;
 
-  const { creditos, activo, isAdmin, isSupport, nombre } = req.body || {};
-  const newCreditos = creditos !== undefined ? Number(creditos) : target.creditos;
+  const { creditos, activo, isAdmin, isSupport, nombre, _addCredits } = req.body || {};
+  // Si _addCredits=true, sumamos los créditos en lugar de reemplazar
+  const newCreditos = creditos !== undefined
+    ? (_addCredits ? target.creditos + Number(creditos) : Number(creditos))
+    : target.creditos;
   const newActivo = activo !== undefined ? (activo ? 1 : 0) : target.activo;
   const newIsAdmin = isAdmin !== undefined ? (isAdmin ? 1 : 0) : target.is_admin;
   const newIsSupport = isSupport !== undefined ? (isSupport ? 1 : 0) : target.is_support;
