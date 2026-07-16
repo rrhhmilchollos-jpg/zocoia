@@ -56,6 +56,8 @@ export default function Dashboard() {
   const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
+  // NUEVO: agente actualmente seleccionado para el chat individual
+  const [activeAgent, setActiveAgent] = useState<Recurso | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   const authHeaders = useCallback(() => ({
@@ -81,6 +83,8 @@ export default function Dashboard() {
     if (activeTab === 'keys') load('/api/keys', setKeys);
     if (activeTab === 'billing') { load('/api/payments/history', setPayments); load('/api/billing/summary', setBilling); }
     if (activeTab === 'admin') { load('/admin/clientes', setAdminUsuarios); load('/admin/stats', setAdminStats); }
+    // Si se sale de la pestaña de chat, se limpia el agente activo para no arrastrarlo por accidente
+    if (activeTab !== 'chat') setActiveAgent(null);
     const rs = RESOURCE_SECTIONS.find(s => s.key === activeTab);
     if (rs) load(`/api/resources?type=${rs.key}`, d => setResourcesByType(p => ({ ...p, [rs.key]: d })));
   }, [activeTab, load]);
@@ -100,7 +104,10 @@ export default function Dashboard() {
     if (!confirm('¿Eliminar?')) return;
     const r = await fetch(`${API_BASE}/api/resources/${id}`, { method: 'DELETE', headers: authHeaders() });
     if (r.ok) {
-      if (type === 'agente') setAgentes(p => p.filter(a => a.id !== id));
+      if (type === 'agente') {
+        setAgentes(p => p.filter(a => a.id !== id));
+        if (activeAgent?.id === id) { setActiveAgent(null); setChatMessages([]); }
+      }
       else setResourcesByType(p => ({ ...p, [type]: (p[type] || []).filter(x => x.id !== id) }));
       load('/api/billing/summary', setBilling);
     }
@@ -163,6 +170,13 @@ export default function Dashboard() {
     if (r.ok) load('/admin/clientes', setAdminUsuarios);
   };
 
+  // NUEVO: abrir el chat individual de un agente concreto desde su tarjeta
+  const handleOpenAgentChat = (agente: Recurso) => {
+    setActiveAgent(agente);
+    setChatMessages([]);
+    setActiveTab('chat');
+  };
+
   const sendChat = async () => {
     const msg = chatInput.trim(); if (!msg || chatLoading) return;
     setChatInput('');
@@ -172,7 +186,12 @@ export default function Dashboard() {
     try {
       const r = await fetch(`${API_BASE}/v1/chat/completions`, {
         method: 'POST', headers: authHeaders(),
-        body: JSON.stringify({ messages: newMessages, model: selectedModel }),
+        body: JSON.stringify({
+          messages: newMessages,
+          model: selectedModel,
+          // CLAVE: sin esto el backend nunca sabía qué agente (systemPrompt + memoria) usar
+          agentId: activeAgent?.id,
+        }),
       });
       const d = await r.json();
       if (r.ok) setChatMessages(prev => [...prev, { role: 'assistant', content: d.choices?.[0]?.message?.content || '' }]);
@@ -382,7 +401,7 @@ export default function Dashboard() {
                 {MODELOS.map(m => {
                   const active = selectedModel === m.backend;
                   return (
-                    <div key={m.backend} onClick={() => { handleSelectModel(m.backend); setActiveTab('chat'); }}
+                    <div key={m.backend} onClick={() => { handleSelectModel(m.backend); setActiveAgent(null); setActiveTab('chat'); }}
                       className={`bg-[#1a1a1a] border rounded-xl overflow-hidden cursor-pointer transition-all hover:border-[#555] ${active ? 'border-purple-500 ring-1 ring-purple-500/30' : 'border-[#2a2a2a]'}`}>
                       <div className={`h-28 bg-gradient-to-br ${m.color} flex items-center justify-center relative`}>
                         <span className="text-white text-4xl opacity-80">{m.icon}</span>
@@ -429,7 +448,19 @@ export default function Dashboard() {
           {activeTab === 'chat' && (
             <div className="max-w-3xl mx-auto flex flex-col" style={{height: 'calc(100vh - 120px)'}}>
               <div className="flex items-center justify-between mb-4">
-                <h1 className="text-xl font-bold text-white">Chat con Zoco IA</h1>
+                <div>
+                  <h1 className="text-xl font-bold text-white">
+                    {activeAgent ? `Chat con ${activeAgent.name}` : 'Chat con Zoco IA'}
+                  </h1>
+                  {activeAgent && (
+                    <button
+                      onClick={() => { setActiveAgent(null); setChatMessages([]); }}
+                      className="text-xs text-purple-400 hover:underline mt-0.5"
+                    >
+                      ← Volver al chat general
+                    </button>
+                  )}
+                </div>
                 <div className="flex items-center space-x-2">
                   <span className="text-xs text-gray-500">Modelo:</span>
                   <select value={selectedModel} onChange={e => handleSelectModel(e.target.value)}
@@ -442,17 +473,21 @@ export default function Dashboard() {
               <div className="flex-1 overflow-y-auto bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-4 mb-4 space-y-4">
                 {chatMessages.length === 0 && (
                   <div className="flex flex-col items-center justify-center h-full text-center text-gray-600">
-                    <div className="text-5xl mb-4">Z</div>
-                    <p className="text-gray-400 font-medium">Zoco IA listo</p>
+                    <div className="text-5xl mb-4">{activeAgent ? activeAgent.name.charAt(0).toUpperCase() : 'Z'}</div>
+                    <p className="text-gray-400 font-medium">{activeAgent ? `${activeAgent.name} listo` : 'Zoco IA listo'}</p>
                     <p className="text-xs mt-1 text-gray-600">Modelo: {MODELOS.find(m => m.backend === selectedModel)?.nombre || selectedModel}</p>
                     <p className="text-xs mt-0.5 text-gray-700 font-mono">Ollama: {MODELOS.find(m => m.backend === selectedModel)?.ollamaModel || 'llama3.2'} · Groq fallback: llama-3.3-70b</p>
-                    <p className="text-xs mt-1 text-gray-600">🌐 Búsqueda web automática activada</p>
+                    {activeAgent
+                      ? <p className="text-xs mt-1 text-gray-600">🧠 Memoria persistente de este agente activada</p>
+                      : <p className="text-xs mt-1 text-gray-600">🌐 Búsqueda web automática activada</p>}
                   </div>
                 )}
                 {chatMessages.map((m, i) => (
                   <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                     {m.role === 'assistant' && (
-                      <div className="w-6 h-6 bg-gradient-to-br from-purple-500 to-blue-600 rounded-full flex items-center justify-center text-white text-[10px] font-bold mr-2 mt-0.5 shrink-0">Z</div>
+                      <div className="w-6 h-6 bg-gradient-to-br from-purple-500 to-blue-600 rounded-full flex items-center justify-center text-white text-[10px] font-bold mr-2 mt-0.5 shrink-0">
+                        {activeAgent ? activeAgent.name.charAt(0).toUpperCase() : 'Z'}
+                      </div>
                     )}
                     <div className={`max-w-[80%] px-4 py-2.5 rounded-2xl text-sm leading-relaxed ${m.role === 'user' ? 'bg-purple-600 text-white rounded-br-sm' : 'bg-[#252525] text-gray-200 rounded-bl-sm border border-[#333]'}`}>
                       {m.content}
@@ -461,7 +496,9 @@ export default function Dashboard() {
                 ))}
                 {chatLoading && (
                   <div className="flex justify-start">
-                    <div className="w-6 h-6 bg-gradient-to-br from-purple-500 to-blue-600 rounded-full flex items-center justify-center text-white text-[10px] font-bold mr-2 mt-0.5 shrink-0">Z</div>
+                    <div className="w-6 h-6 bg-gradient-to-br from-purple-500 to-blue-600 rounded-full flex items-center justify-center text-white text-[10px] font-bold mr-2 mt-0.5 shrink-0">
+                      {activeAgent ? activeAgent.name.charAt(0).toUpperCase() : 'Z'}
+                    </div>
                     <div className="bg-[#252525] border border-[#333] px-4 py-2.5 rounded-2xl rounded-bl-sm text-sm text-gray-500">
                       <span className="inline-flex space-x-1"><span className="animate-bounce">●</span><span className="animate-bounce" style={{animationDelay:'0.1s'}}>●</span><span className="animate-bounce" style={{animationDelay:'0.2s'}}>●</span></span>
                     </div>
@@ -584,7 +621,7 @@ export default function Dashboard() {
               <div className="flex items-center justify-between mb-6">
                 <div>
                   <h1 className="text-2xl font-bold text-white">Agentes de IA</h1>
-                  <p className="text-gray-500 text-xs mt-1">Agentes con memoria persistente conectados a Zoco IA</p>
+                  <p className="text-gray-500 text-xs mt-1">Agentes con memoria persistente conectados a Zoco IA · haz clic en una tarjeta para chatear con ese agente</p>
                 </div>
                 <button onClick={handleCreateAgent} className="bg-white text-black px-4 py-2 rounded-lg text-xs font-medium hover:bg-gray-200">+ Nuevo agente</button>
               </div>
@@ -595,7 +632,11 @@ export default function Dashboard() {
                   <button onClick={handleCreateAgent} className="mt-4 text-purple-400 text-xs hover:underline">Crear el primero →</button>
                 </div>
               ) : agentes.map(a => (
-                <div key={a.id} className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl overflow-hidden mb-3">
+                <div
+                  key={a.id}
+                  onClick={() => handleOpenAgentChat(a)}
+                  className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl overflow-hidden mb-3 cursor-pointer hover:border-purple-600/50 transition-colors"
+                >
                   <div className="p-4 flex items-center justify-between">
                     <div className="flex items-center space-x-3">
                       <div className="w-10 h-10 bg-gradient-to-br from-purple-600 to-blue-700 rounded-xl flex items-center justify-center text-white font-bold">
@@ -608,12 +649,12 @@ export default function Dashboard() {
                     </div>
                     <div className="flex items-center space-x-2">
                       <span className="bg-green-900/30 text-green-400 text-[10px] px-2 py-0.5 rounded-full border border-green-800/30">● Activo</span>
-                      <button onClick={() => handleToggleMemoria(a.id)} className="text-gray-500 hover:text-purple-400 text-xs border border-[#333] px-2 py-1 rounded-lg">🧠 Memoria</button>
-                      <button onClick={() => handleDeleteResource(a.id, 'agente')} className="text-gray-600 hover:text-red-400 text-xs border border-[#333] px-2 py-1 rounded-lg">🗑</button>
+                      <button onClick={(e) => { e.stopPropagation(); handleToggleMemoria(a.id); }} className="text-gray-500 hover:text-purple-400 text-xs border border-[#333] px-2 py-1 rounded-lg">🧠 Memoria</button>
+                      <button onClick={(e) => { e.stopPropagation(); handleDeleteResource(a.id, 'agente'); }} className="text-gray-600 hover:text-red-400 text-xs border border-[#333] px-2 py-1 rounded-lg">🗑</button>
                     </div>
                   </div>
                   {expandedAgentId === a.id && (
-                    <div className="border-t border-[#222] bg-[#161616] p-4">
+                    <div onClick={(e) => e.stopPropagation()} className="border-t border-[#222] bg-[#161616] p-4">
                       <div className="flex justify-between mb-3">
                         <p className="text-[11px] font-bold text-gray-500 uppercase">Memoria persistente</p>
                         <button onClick={() => handleClearMemoria(a.id)} className="text-red-500/70 hover:text-red-400 text-xs">Borrar todo</button>
