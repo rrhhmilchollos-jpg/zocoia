@@ -1,56 +1,48 @@
 /**
  * init-agents.js
  * ---------------------------------------------------------
- * Script independiente para poblar la tabla de agentes de
+ * Script independiente para poblar la tabla `resources` de
  * ZocoIA (app.db - SQLite) con los 11 agentes especializados.
+ *
+ * Esquema real usado (confirmado por el usuario):
+ *   resources(id, name, type, data, userId, createdAt)
+ *   -> los agentes son las filas con type = 'agent'
+ *   -> los campos específicos del agente (rol, prompt, tools...)
+ *      viven serializados como JSON dentro de la columna `data`
  *
  * USO:
  *   node init-agents.js
  *
- * Es IDEMPOTENTE: si la tabla ya tiene filas, no hace nada
- * (a menos que uses --force, ver más abajo).
+ * Es IDEMPOTENTE: si ya existen filas con type='agent' en
+ * `resources`, no inserta nada (a menos que uses --force).
  *
- * IMPORTANTE - AJUSTA ESTO A TU PROYECTO:
- *   1) DB_PATH          -> ruta real de tu app.db
- *   2) TABLE_NAME        -> nombre real de la tabla de agentes
- *   3) COLUMN_MAP         -> mapeo de campos lógicos a tus
- *                           columnas reales (ver sección abajo)
- *
- * El script primero LEE el esquema real de la tabla con
- * PRAGMA table_info y solo inserta en las columnas que
- * existen, para no romper si tu esquema difiere del mío.
+ * IMPORTANTE: coloca este archivo en la MISMA carpeta que
+ * server.js (la raíz del proyecto, que Railway mapea a /app),
+ * y asegúrate de haber hecho commit + redeploy antes de
+ * ejecutarlo, o Railway no lo encontrará.
  * ---------------------------------------------------------
  */
 
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
-// ---------- 1. CONFIGURACIÓN (AJUSTA AQUÍ) ----------------
+// ---------- 1. CONFIGURACIÓN ----------------
 
-// Ruta a tu base de datos SQLite. En Railway normalmente vive
-// junto al proyecto o en un volumen persistente (p.ej. /data/app.db).
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'app.db');
+const TABLE_NAME = 'resources';
 
-// Nombre real de la tabla de agentes en tu esquema.
-const TABLE_NAME = process.env.AGENTS_TABLE || 'agents';
+// Si tus agentes deben pertenecer a un usuario "sistema" concreto,
+// pon aquí su id directamente, o exporta la variable de entorno
+// AGENTS_USER_ID antes de ejecutar el script. Si lo dejas en null,
+// el script intentará usar el primer usuario que encuentre en una
+// tabla `users` (si existe); si no encuentra ninguno, insertará
+// userId = NULL (fallará si esa columna es NOT NULL sin default).
+const FIXED_USER_ID = process.env.AGENTS_USER_ID || null;
 
-// Mapa "campo lógico" -> "posibles nombres de columna" en tu tabla.
-// El script probará estos nombres en orden y usará el primero
-// que exista de verdad en tu tabla.
-const COLUMN_CANDIDATES = {
-  name:        ['name', 'nombre', 'title'],
-  role:        ['role', 'rol', 'position', 'specialty'],
-  description: ['description', 'descripcion', 'short_description', 'summary'],
-  prompt:      ['system_prompt', 'systemPrompt', 'prompt', 'instructions'],
-  tools:       ['tools', 'actions', 'capabilities', 'toolset'],
-  avatar:      ['avatar', 'icon', 'emoji'],
-  model:       ['model', 'llm_model'],
-  active:      ['active', 'is_active', 'enabled'],
-  created_at:  ['created_at', 'createdAt', 'inserted_at'],
-};
-
-// Herramientas de acción que pide el usuario para TODOS los agentes.
+// Herramientas de acción para TODOS los agentes.
 const DEFAULT_TOOLS = ['createFile', 'createFolder', 'readFile', 'executeCode'];
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'llama3';
 
 // ---------- 2. LOS 11 AGENTES -------------------------------
 
@@ -167,7 +159,7 @@ Vigila también la salud general del sistema (espacio en disco, memoria, conexio
   },
 ];
 
-// ---------- 3. LÓGICA DEL SCRIPT (no debería hacer falta tocar) ----
+// ---------- 3. LÓGICA DEL SCRIPT ----------------
 
 function loadBetterSqlite3() {
   try {
@@ -175,37 +167,26 @@ function loadBetterSqlite3() {
   } catch (e) {
     console.error('\n❌ No se encontró el paquete "better-sqlite3".');
     console.error('   Instálalo con:  npm install better-sqlite3\n');
-    console.error('   (Si tu proyecto usa el paquete "sqlite3" en vez de');
-    console.error('   "better-sqlite3", dímelo y te adapto el script.)\n');
     process.exit(1);
   }
 }
 
-function resolveColumnMap(db) {
-  const cols = db.prepare(`PRAGMA table_info(${TABLE_NAME})`).all();
-  if (cols.length === 0) {
-    console.error(`\n❌ La tabla "${TABLE_NAME}" no existe en ${DB_PATH}.`);
-    console.error('   Ajusta TABLE_NAME en init-agents.js o crea la tabla primero.\n');
-    process.exit(1);
+function resolveUserId(db) {
+  if (FIXED_USER_ID) return FIXED_USER_ID;
+  try {
+    const row = db.prepare('SELECT id FROM users LIMIT 1').get();
+    if (row && row.id != null) {
+      console.log(`ℹ️  No se indicó AGENTS_USER_ID, usando el primer usuario encontrado: ${row.id}`);
+      return row.id;
+    }
+  } catch (e) {
+    // no existe tabla `users` o falló la query; seguimos con null
   }
-  const realCols = cols.map((c) => c.name);
-  const resolved = {};
-
-  for (const [logicalField, candidates] of Object.entries(COLUMN_CANDIDATES)) {
-    const found = candidates.find((c) => realCols.includes(c));
-    if (found) resolved[logicalField] = found;
-  }
-
-  console.log(`\n📋 Columnas detectadas en "${TABLE_NAME}":`, realCols.join(', '));
-  console.log('🔗 Mapeo aplicado:', resolved, '\n');
-
-  if (!resolved.name) {
-    console.error('❌ No encontré una columna que parezca "name" en tu tabla.');
-    console.error('   Añade el nombre real de tu columna a COLUMN_CANDIDATES.name\n');
-    process.exit(1);
-  }
-
-  return { resolved, realCols };
+  console.log('⚠️  No se pudo determinar un userId. Se insertará userId = NULL.');
+  console.log('   Si tu columna userId es NOT NULL, esto fallará.');
+  console.log('   Soluciónalo exportando AGENTS_USER_ID antes de ejecutar, ej:');
+  console.log('   AGENTS_USER_ID=1 node init-agents.js\n');
+  return null;
 }
 
 function main() {
@@ -213,52 +194,63 @@ function main() {
 
   if (!fs.existsSync(DB_PATH)) {
     console.error(`\n❌ No se encontró la base de datos en: ${DB_PATH}`);
-    console.error('   Ajusta DB_PATH (o la variable de entorno DB_PATH) al path real de app.db\n');
+    console.error('   Ajusta DB_PATH (variable de entorno) al path real de app.db\n');
     process.exit(1);
   }
 
   const Database = loadBetterSqlite3();
   const db = new Database(DB_PATH);
 
-  const { resolved } = resolveColumnMap(db);
+  // Verifica que la tabla existe
+  const cols = db.prepare(`PRAGMA table_info(${TABLE_NAME})`).all();
+  if (cols.length === 0) {
+    console.error(`\n❌ La tabla "${TABLE_NAME}" no existe en ${DB_PATH}.\n`);
+    process.exit(1);
+  }
+  console.log(`📋 Columnas reales de "${TABLE_NAME}":`, cols.map((c) => c.name).join(', '));
 
-  const countRow = db.prepare(`SELECT COUNT(*) as n FROM ${TABLE_NAME}`).get();
+  const countRow = db
+    .prepare(`SELECT COUNT(*) as n FROM ${TABLE_NAME} WHERE type = 'agent'`)
+    .get();
+
   if (countRow.n > 0 && !force) {
-    console.log(`✅ La tabla "${TABLE_NAME}" ya tiene ${countRow.n} fila(s). No se inserta nada.`);
+    console.log(`✅ Ya existen ${countRow.n} agente(s) en "${TABLE_NAME}" (type='agent'). No se inserta nada.`);
     console.log('   (Usa "node init-agents.js --force" para insertar igualmente)\n');
     db.close();
     return;
   }
 
-  const insertCols = Object.values(resolved);
-  const placeholders = insertCols.map(() => '?').join(', ');
-  const sql = `INSERT INTO ${TABLE_NAME} (${insertCols.join(', ')}) VALUES (${placeholders})`;
-  const insert = db.prepare(sql);
+  const userId = resolveUserId(db);
+
+  const insert = db.prepare(`
+    INSERT INTO ${TABLE_NAME} (id, name, type, data, userId, createdAt)
+    VALUES (@id, @name, 'agent', @data, @userId, @createdAt)
+  `);
 
   const insertMany = db.transaction((agents) => {
     for (const agent of agents) {
-      const values = insertCols.map((col) => {
-        const logicalField = Object.keys(resolved).find((k) => resolved[k] === col);
-        switch (logicalField) {
-          case 'name':        return agent.name;
-          case 'role':        return agent.role;
-          case 'description': return agent.description;
-          case 'prompt':      return agent.prompt;
-          case 'avatar':      return agent.avatar;
-          case 'tools':       return JSON.stringify(DEFAULT_TOOLS);
-          case 'model':       return process.env.DEFAULT_MODEL || 'llama3';
-          case 'active':      return 1;
-          case 'created_at':  return new Date().toISOString();
-          default:            return null;
-        }
+      const data = JSON.stringify({
+        role: agent.role,
+        description: agent.description,
+        prompt: agent.prompt,
+        avatar: agent.avatar,
+        model: DEFAULT_MODEL,
+        tools: DEFAULT_TOOLS,
       });
-      insert.run(...values);
+
+      insert.run({
+        id: crypto.randomUUID(),
+        name: agent.name,
+        data,
+        userId,
+        createdAt: new Date().toISOString(),
+      });
     }
   });
 
   insertMany(AGENTS);
 
-  console.log(`✅ Insertados ${AGENTS.length} agentes en la tabla "${TABLE_NAME}".\n`);
+  console.log(`✅ Insertados ${AGENTS.length} agentes en "${TABLE_NAME}" (type='agent').\n`);
   db.close();
 }
 
