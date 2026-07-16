@@ -14,10 +14,10 @@ function fmtEUR(n: number) { return `${(n || 0).toFixed(2)} €`; }
 function fmtDate(s: string) { return new Date(s).toLocaleDateString('es-ES'); }
 
 const MODELOS = [
-  { nombre: 'Zoco Fable 5', backend: 'zoco-fable-5', badge: 'Nuevo', tags: ['Más capaz','Investigación','Tareas de varios días'], color: 'from-blue-500 to-indigo-600', icon: '✦' },
-  { nombre: 'Zoco Opus 4.8', backend: 'zoco-opus-4-8', badge: null, tags: ['Proyectos complejos','Agentes','Programación'], color: 'from-orange-400 to-rose-500', icon: '◈' },
-  { nombre: 'Zoco Sonnet 5', backend: 'zoco-sonnet-5', badge: 'Nuevo', tags: ['Tareas cotidianas','Escritura','Rentable'], color: 'from-gray-500 to-slate-600', icon: '✳' },
-  { nombre: 'Zoco Haiku 4.5', backend: 'zoco-haiku-4-5', badge: null, tags: ['Más rápido','Menor coste','Alto volumen'], color: 'from-teal-400 to-emerald-500', icon: '❋' },
+  { nombre: 'Zoco Fable 5', backend: 'zoco-fable-5', badge: 'Nuevo', ollamaModel: 'mistral-nemo', tags: ['Más capaz','Investigación','Tareas de varios días'], color: 'from-blue-500 to-indigo-600', icon: '✦' },
+  { nombre: 'Zoco Opus 4.8', backend: 'zoco-opus-4-8', badge: null, ollamaModel: 'mistral-nemo', tags: ['Proyectos complejos','Agentes','Programación'], color: 'from-orange-400 to-rose-500', icon: '◈' },
+  { nombre: 'Zoco Sonnet 5', backend: 'zoco-sonnet-5', badge: 'Nuevo', ollamaModel: 'llama3.2', tags: ['Tareas cotidianas','Escritura','Rentable'], color: 'from-gray-500 to-slate-600', icon: '✳' },
+  { nombre: 'Zoco Haiku 4.5', backend: 'zoco-haiku-4-5', badge: null, ollamaModel: 'llama3.2', tags: ['Más rápido','Menor coste','Alto volumen'], color: 'from-teal-400 to-emerald-500', icon: '❋' },
 ];
 
 const RESOURCE_SECTIONS = [
@@ -396,6 +396,7 @@ export default function Dashboard() {
                         <div className="flex flex-wrap gap-1 mt-2">
                           {m.tags.map(t => <span key={t} className="bg-[#252525] text-gray-400 text-[10px] px-1.5 py-0.5 rounded border border-[#333]">{t}</span>)}
                         </div>
+                        <div className="mt-2 text-[10px] text-gray-600 font-mono">→ {m.ollamaModel}</div>
                       </div>
                     </div>
                   );
@@ -443,7 +444,8 @@ export default function Dashboard() {
                   <div className="flex flex-col items-center justify-center h-full text-center text-gray-600">
                     <div className="text-5xl mb-4">Z</div>
                     <p className="text-gray-400 font-medium">Zoco IA listo</p>
-                    <p className="text-xs mt-1 text-gray-600">Modelo activo: {MODELOS.find(m => m.backend === selectedModel)?.nombre || selectedModel}</p>
+                    <p className="text-xs mt-1 text-gray-600">Modelo: {MODELOS.find(m => m.backend === selectedModel)?.nombre || selectedModel}</p>
+                    <p className="text-xs mt-0.5 text-gray-700 font-mono">Ollama: {MODELOS.find(m => m.backend === selectedModel)?.ollamaModel || 'llama3.2'} · Groq fallback: llama-3.3-70b</p>
                     <p className="text-xs mt-1 text-gray-600">🌐 Búsqueda web automática activada</p>
                   </div>
                 )}
