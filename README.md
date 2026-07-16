@@ -1,104 +1,118 @@
-# Zoco IA — infraestructura propia de inferencia
+# Maris AI — Infraestructura propia de inferencia
 
-Proyecto independiente. No comparte código, base de datos ni infraestructura con Maris AI.
-
-Zoco IA es tu propio "mercado" de acceso a modelos de IA open source: alojas la inferencia,
-y vendes acceso por API key con medición de consumo y facturación vía Viva.com.
+Plataforma propia para alojar modelos de IA open source, gestionar API keys de uso personal y alquilar acceso a clientes, similar a la consola de Anthropic/OpenAI pero con tu propia infraestructura.
 
 ## Arquitectura
 
 ```
-Internet → Nginx (TLS, rate limit) → Gateway (auth + medición) → vLLM (GPU) → modelo
-                                            ↓
-                                     SQLite (api_keys, usage_log)
+Internet -> Nginx (TLS, rate limit) -> Gateway (auth + medicion) -> Ollama/vLLM -> modelo
+                                              |
+                                       SQLite (api_keys, usage_log, models_registry)
 ```
 
-- **vLLM**: sirve el modelo open source (Qwen2.5-Coder-32B por defecto), API compatible con OpenAI.
-- **Gateway**: capa propia en Express. Sin esto no puedes controlar ni cobrar a nadie — es lo que faltaba en el manual original.
+- **Gateway**: capa propia en Express. Autenticacion por API key, medicion de tokens, limites por cliente.
+- **Ollama**: sirve modelos open source con API compatible OpenAI (sin GPU requerida).
+- **vLLM**: alternativa con GPU para modelos grandes (Qwen2.5-Coder-32B, etc.).
 - **Nginx**: TLS + rate limiting delante de todo.
-- **Agent**: script de ejemplo con sandbox de ejecución REAL vía Docker (no simulado).
+- **Agent**: agente autonomo con sandbox Docker real y auto-correccion de errores.
+- **Frontend**: consola React (index.tsx) — panel de control, claves API, agentes, analiticas.
 
-## Coste real (para que no haya sorpresas)
+## Modelos de infraestructura
 
-Esto NO es gratis. Cambias coste por token por coste de GPU + tu tiempo de operación:
+| Modelo | Equivalencia | Backend |
+|---|---|---|
+| maris-velox-1b | Equiv. Haiku 4.5 | Ollama (CPU/GPU) |
+| maris-core-7b | Equiv. Sonnet 5 | Ollama/vLLM |
+| maris-pro-32b | Equiv. Opus 4.8 | vLLM (GPU A100) |
 
-- GPU en RunPod/Vast.ai: desde ~0.20-0.50 $/hora para una RTX 4090, más para A100/H100.
-- Si la dejas encendida 24/7: aproximadamente 150-350 $/mes según GPU.
-- Tiempo de mantenimiento: cuenta con algunas horas al mes tuyas (actualizar imágenes, vigilar logs, rotar claves).
+## Inicio rapido
 
-Esto solo compensa frente a la API de Anthropic/OpenAI si tu volumen mensual es alto (varios millones de tokens/mes de forma sostenida). Para volumen bajo, sigue costando más que pagar por token — el ahorro real llega cuando factures a terceros lo suficiente para cubrir la GPU fija.
-
-## Paso 1 — Conseguir una GPU (no necesitas hardware propio)
-
-Opciones sin comprar nada:
-
-**RunPod** (recomendado para empezar):
-1. Crea cuenta en runpod.io
-2. Despliega un "Pod" con plantilla "vLLM" o una imagen base con CUDA, GPU RTX 4090 o A10G
-3. Anota la IP pública o usa su proxy HTTPS integrado
-
-**Vast.ai** (más barato, menos garantías de uptime):
-1. Busca oferta de GPU por hora (filtra por VRAM ≥ 24GB para el modelo de 32B)
-2. Lanza instancia con imagen Docker `vllm/vllm-openai:latest`
-
-Una vez tengas la IP del servidor con GPU, sustituye la sección `vllm` de `docker-compose.yml` para que apunte ahí, o despliega el `docker-compose.yml` completo directamente en esa máquina si tiene Docker + nvidia-container-toolkit instalados.
-
-## Paso 2 — Levantar el stack
-
-En la máquina con GPU (o localmente si tienes una):
+### 1. Clonar y configurar
 
 ```bash
-git clone <tu-repo>
-cd ai-infra-propia
-docker compose up -d vllm
-docker compose up -d gateway
+git clone https://github.com/rrhhmilchollos-jpg/zocoia.git
+cd zocoia
+cp .env.example .env
+# Edita .env con tus valores reales
 ```
 
-Verifica que vLLM responde:
+### 2. Levantar con Docker Compose (sin GPU)
+
 ```bash
-curl http://localhost:8000/v1/models
+docker compose up ollama gateway nginx -d
 ```
 
-## Paso 3 — Crear tu primera API key para vender acceso
+### 3. Crear tu primera API key
 
 ```bash
-docker compose exec gateway node server.js create-key "nombre-del-cliente" 1000000
+# Clave maestra personal
+docker compose exec gateway node server.js create-key "Maria Admin" rrhh.milchollos@gmail.com
+
+# Clave para un cliente con limite de 100k tokens/mes
+docker compose exec gateway node server.js create-key "Cliente S.L." cliente@empresa.com 100000
 ```
-(El segundo argumento es el límite mensual de tokens, opcional — omítelo para ilimitado)
 
-Guarda la key que te devuelve — es la única vez que se muestra en claro.
-
-## Paso 4 — Probar el gateway como lo haría un cliente
+### 4. Probar la API
 
 ```bash
-curl https://tu-dominio.com/v1/chat/completions \
-  -H "Authorization: Bearer sk-priv-xxxxxxxx" \
+curl http://localhost:4000/v1/chat/completions \
+  -H "Authorization: Bearer sk-marisai-TU_CLAVE" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen/Qwen2.5-Coder-32B-Instruct",
-    "messages": [{"role": "user", "content": "Hola"}]
+    "model": "maris-velox-1b",
+    "messages": [{"role": "user", "content": "Hola, quien eres?"}]
   }'
 ```
 
-## Paso 5 — Nginx + dominio propio (para venderlo con cara seria)
+## Endpoints del Gateway
 
-1. Dominio: `zocoia.com`
-2. Apunta el DNS (registro A) a la IP de tu servidor con GPU o a un balanceador
-3. Genera certificados con certbot:
-   ```bash
-   certbot certonly --webroot -w /var/www/certbot -d tu-dominio.com
-   ```
-4. Copia los certificados a `./nginx/certs/`
-5. `docker compose up -d nginx` (el dominio `zocoia.com` ya está configurado en `nginx.conf`)
+| Metodo | Ruta | Descripcion | Auth |
+|---|---|---|---|
+| POST | /v1/chat/completions | Inferencia compatible OpenAI | API key |
+| GET | /v1/models | Modelos disponibles | API key |
+| GET | /v1/usage | Uso del mes actual | API key |
+| GET | /admin/keys | Listar claves de clientes | ADMIN_KEY |
+| POST | /admin/keys | Crear clave para cliente | ADMIN_KEY |
+| DELETE | /admin/keys/:id | Revocar clave | ADMIN_KEY |
+| GET | /admin/stats | Estadisticas globales | ADMIN_KEY |
+| GET | /health | Health check | Publica |
 
-## Pendiente de decidir contigo
+## Uso con Python
 
-- Modelo(s) a servir además de Qwen2.5-Coder (¿necesitas uno de propósito general, no solo código?)
-- Sistema de facturación real (Viva.com conectado al gateway, para cobrar automáticamente por consumo)
-- Panel de administración web (ahora mismo crear keys es solo por CLI)
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:4000/v1",
+    api_key="sk-marisai-TU_CLAVE"
+)
+
+response = client.chat.completions.create(
+    model="maris-velox-1b",
+    messages=[{"role": "user", "content": "Hola"}]
+)
+print(response.choices[0].message.content)
+```
+
+## Modelo de negocio para alquiler de API keys
+
+1. Levantas la infraestructura (Ollama en tu maquina o vLLM en RunPod/Vast.ai)
+2. Creas claves para clientes con limites de tokens o USD
+3. Cobras via Viva.com segun consumo
+4. El gateway registra todo en SQLite para facturacion
+
+## Costes estimados
+
+| Opcion | Coste | Uso recomendado |
+|---|---|---|
+| Ollama en PC local | 0 USD/mes | Desarrollo, uso personal |
+| RunPod RTX 4090 | ~150-200 USD/mes 24/7 | Produccion baja-media |
+| RunPod A100 | ~600-800 USD/mes 24/7 | Produccion alta |
+
+El ahorro frente a Anthropic/OpenAI empieza a ser significativo a partir de varios millones de tokens/mes de forma sostenida.
 
 ## Marca
 
-- Nombre: **Zoco IA**
-- Dominio: `zocoia.com`
-- Naming interno de servicios: `zocoia-gateway`, `zocoia-vllm`, `zocoia-nginx`
+- Nombre: **Maris AI**
+- Propietaria: Maria (rrhh.milchollos@gmail.com)
+- Infraestructura: Docker Desktop + Ollama + Gateway propio

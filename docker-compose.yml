@@ -1,10 +1,21 @@
 version: "3.9"
-
+# ─── Maris AI — Infraestructura completa de inferencia ───────────────────────
+# Servicios:
+#   vllm       -> Servidor de inferencia (GPU requerida para modelos grandes)
+#   gateway    -> Capa de autenticacion, medicion y facturacion
+#   nginx      -> Proxy inverso con TLS y rate limiting
+#   agent      -> Agente autonomo con sandbox Docker
+#
+# NOTA: Ollama corre de forma NATIVA en el host (Windows), no como contenedor.
+# El gateway se conecta a el mediante host.docker.internal:11434
+#
+# Para desarrollo local sin GPU: usa solo gateway + nginx (con Ollama nativo corriendo)
+# Para produccion con GPU:       despliega en RunPod/Vast.ai con vllm
 services:
-
+  # Servidor de inferencia vLLM (requiere GPU NVIDIA)
   vllm:
     image: vllm/vllm-openai:latest
-    container_name: zocoia-vllm
+    container_name: marisai-vllm
     restart: unless-stopped
     runtime: nvidia
     environment:
@@ -26,25 +37,30 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    profiles:
+      - gpu
 
+  # Gateway Maris AI (autenticacion + medicion + facturacion)
   gateway:
     build: ./gateway
-    container_name: zocoia-gateway
+    container_name: marisai-gateway
     restart: unless-stopped
-    depends_on:
-      - vllm
     environment:
-      - VLLM_URL=http://vllm:8000/v1
+      - VLLM_URL=http://host.docker.internal:11434/v1
       - PORT=4000
       - DB_PATH=/data/gateway.db
+      - ADMIN_KEY=${ADMIN_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./gateway/data:/data
     ports:
       - "127.0.0.1:4000:4000"
 
+  # Nginx (proxy inverso con TLS y rate limiting)
   nginx:
     image: nginx:alpine
-    container_name: zocoia-nginx
+    container_name: marisai-nginx
     restart: unless-stopped
     depends_on:
       - gateway
@@ -55,15 +71,17 @@ services:
       - "80:80"
       - "443:443"
 
+  # Agente autonomo con sandbox Docker
   agent-sandbox:
     build: ./agent
-    container_name: zocoia-agent-sandbox
+    container_name: marisai-agent
     restart: "no"
     depends_on:
       - gateway
     environment:
       - GATEWAY_URL=http://gateway:4000/v1
       - GATEWAY_API_KEY=${AGENT_INTERNAL_KEY}
+      - AGENT_MODEL=maris-velox-1b
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./agent/workspace:/workspace

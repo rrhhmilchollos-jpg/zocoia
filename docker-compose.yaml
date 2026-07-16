@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: proxy-postgres
+    environment:
+      POSTGRES_DB: litellm_db
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: TuPasswordSeguraAqui
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: always
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: proxy-gateway
+    ports:
+      - "5050:4000"
+    environment:
+      DATABASE_URL: "postgresql://admin:TuPasswordSeguraAqui@db:5432/litellm_db?sslmode=disable"
+      LITELLM_MASTER_KEY: "sk-master-tu-clave-secreta-administrador"
+      LITELLM_SALT_KEY: "sk-salt-7162bd81273ac6b1"
+      UI_PASSWORD: "admin123"
+      LITELLM_MODE: "proxy" # <- Esta línea obliga a LiteLLM a encender el panel web de producción
+    depends_on:
+      - db
+    restart: always
+    command: [ "--port", "4000", "--host", "0.0.0.0" ]
+
+volumes:
+  pgdata:

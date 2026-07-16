@@ -1,0 +1,31 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "framework": "vite",
+  "rewrites": [
+    {
+      "source": "/v1/:path*",
+      "destination": "https://zocoia-production.up.railway.app/v1/:path*"
+    },
+    {
+      "source": "/admin/:path*",
+      "destination": "https://zocoia-production.up.railway.app/admin/:path*"
+    },
+    {
+      "source": "/auth/:path*",
+      "destination": "https://zocoia-production.up.railway.app/auth/:path*"
+    },
+    {
+      "source": "/api/:path*",
+      "destination": "https://zocoia-production.up.railway.app/api/:path*"
+    },
+    {
+      "source": "/health",
+      "destination": "https://zocoia-production.up.railway.app/health"
+    },
+    {
+      "source": "/((?!v1|admin|auth|api|health|assets).*)",
+      "destination": "/index.html"
+    }
+  ]
+}
