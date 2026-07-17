@@ -76,6 +76,21 @@ export const TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'busqueda_web',
+      description:
+        'Busca información actualizada en internet usando Tavily. Úsala cuando necesites datos recientes, noticias, precios, fechas actuales, o cualquier información que pueda haber cambiado después del entrenamiento del modelo.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Términos de búsqueda' },
+        },
+        required: ['query'],
+      },
+    },
+  },
 ];
 
 export const ALL_TOOL_NAMES = TOOL_DEFINITIONS.map((t) => t.function.name);
@@ -150,15 +165,71 @@ async function executeCode(workspaceDir, { language, code }) {
   });
 }
 
-const EXECUTORS = { createFile, createFolder, readFile, executeCode };
+/**
+ * Búsqueda web real vía Tavily. La clave NO se lee de variables de entorno
+ * globales: se recibe en `context.tavilyApiKey`, que server.js resuelve por
+ * usuario (leyendo su recurso 'credencial'/'habilidad' llamado TAVILY_API_KEY
+ * antes de arrancar el tool loop). Así cada usuario usa su propia clave.
+ * Nunca lanza: cualquier fallo (clave ausente, timeout, error de Tavily)
+ * se devuelve como { success: false, error } para que el modelo lo explique
+ * al usuario en vez de tumbar la petición con un 502.
+ */
+async function busquedaWeb(workspaceDir, { query }, context) {
+  const apiKey = context?.tavilyApiKey;
+  if (!apiKey) {
+    return {
+      success: false,
+      error: 'No hay una clave de Tavily configurada para este usuario. Añádela en "Almacén de credenciales" con el nombre TAVILY_API_KEY.',
+    };
+  }
+  if (!query || !query.trim()) {
+    return { success: false, error: 'Falta el término de búsqueda (query)' };
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
+  try {
+    const resp = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ query, include_answer: true, max_results: 5 }),
+      signal: controller.signal,
+    });
+
+    if (!resp.ok) {
+      const errBody = await resp.json().catch(() => ({}));
+      return {
+        success: false,
+        error: `Tavily respondió con error ${resp.status}: ${errBody.detail || errBody.error || 'token inválido o límite de cuota alcanzado'}`,
+      };
+    }
+
+    const data = await resp.json();
+    return {
+      success: true,
+      answer: data.answer || null,
+      results: (data.results || []).slice(0, 5).map((r) => ({ title: r.title, url: r.url, content: r.content })),
+    };
+  } catch (err) {
+    return {
+      success: false,
+      error: err.name === 'AbortError' ? 'Timeout al buscar en Tavily (10s)' : `No se pudo obtener respuesta de internet: ${err.message}`,
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+const EXECUTORS = { createFile, createFolder, readFile, executeCode, busqueda_web: busquedaWeb };
 
 /**
  * Ejecuta una tool ya autorizada para el agente.
  * workspacesRoot: carpeta raíz (persistente) de todos los workspaces
  * workspaceId: normalmente el agentId
  * allowedTools: array de nombres permitidos para este agente concreto
+ * context: datos externos que algunas tools necesitan (ej: tavilyApiKey)
  */
-export async function runTool(name, args, { workspacesRoot, workspaceId, allowedTools }) {
+export async function runTool(name, args, { workspacesRoot, workspaceId, allowedTools, context }) {
   if (!allowedTools.includes(name)) {
     return { success: false, error: `Tool "${name}" no permitida para este agente` };
   }
@@ -167,7 +238,7 @@ export async function runTool(name, args, { workspacesRoot, workspaceId, allowed
 
   try {
     const workspaceDir = await ensureWorkspace(workspacesRoot, workspaceId);
-    return await fn(workspaceDir, args || {});
+    return await fn(workspaceDir, args || {}, context);
   } catch (err) {
     return { success: false, error: err.message };
   }
@@ -180,8 +251,9 @@ const MAX_TOOL_ITERATIONS = 5;
  * reinyecta el resultado y repite. callModel debe ser una función:
  *   async (messages, tools) => rawResponseJson (formato OpenAI /chat/completions)
  * y debe encargarse ella misma de timeouts/fallback Ollama→Groq.
+ * context: datos externos por-usuario que algunas tools necesitan (ej: tavilyApiKey).
  */
-export async function runToolLoop({ messages, callModel, allowedTools, workspacesRoot, workspaceId }) {
+export async function runToolLoop({ messages, callModel, allowedTools, workspacesRoot, workspaceId, context }) {
   const tools = TOOL_DEFINITIONS.filter((t) => allowedTools.includes(t.function.name));
   const usageTotal = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
   let working = [...messages];
@@ -206,7 +278,7 @@ export async function runToolLoop({ messages, callModel, allowedTools, workspace
         } catch {
           args = {};
         }
-        const result = await runTool(name, args, { workspacesRoot, workspaceId, allowedTools });
+        const result = await runTool(name, args, { workspacesRoot, workspaceId, allowedTools, context });
         working.push({
           role: 'tool',
           tool_call_id: call.id,
