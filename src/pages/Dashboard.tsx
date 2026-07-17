@@ -341,7 +341,11 @@ export default function Dashboard() {
 
   const handleSelectModel = async (modelo: string) => {
     setSelectedModel(modelo);
-    await fetch(`${API_BASE}/api/billing/model`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ modelo }) });
+    await fetch(`${API_BASE}/api/user/modelo`, {
+      method: 'PUT',
+      headers: authHeaders(),
+      body: JSON.stringify({ modelo }),
+    });
   };
 
   const handleBuyPack = async (packId: string) => {
@@ -595,8 +599,10 @@ export default function Dashboard() {
                 </div>
                 <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-5">
                   <div className="flex items-center justify-between mb-2">
-                    <span className="text-gray-500 text-xs">Volumen de tokens</span>
-                    <span className="text-red-400 text-xs">↓ 100%</span>
+                    <span className="text-gray-500 text-xs">Volumen disponible</span>
+                    <span className={`text-xs ${balance > 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      {balance > 0 ? '● activo' : '● sin saldo'}
+                    </span>
                   </div>
                   <div className="text-2xl font-bold text-white">{billing?.clavesActivas ?? 0}</div>
                   <div className="text-gray-600 text-xs mt-2">claves activas · {Object.values(billing?.recursos || {}).reduce((a,b)=>a+b,0)} recursos</div>
