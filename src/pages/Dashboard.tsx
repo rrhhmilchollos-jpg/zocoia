@@ -14,12 +14,11 @@ function fmtEUR(n: number) { return `${(n || 0).toFixed(2)} €`; }
 function fmtDate(s: string) { return new Date(s).toLocaleDateString('es-ES'); }
 
 const MODELOS = [
-  { nombre: 'Zoco Lab', backend: 'zoco-lab', badge: 'Nuevo', ollamaModel: 'Zoco-Lab', tags: ['Más capaz','Investigación','Tareas de varios días'], color: 'from-blue-500 to-indigo-600', icon: '◆' },
-  { nombre: 'Zoco Max', backend: 'zoco-max', badge: null, ollamaModel: 'Zoco-Max', tags: ['Proyectos complejos','Agentes','Programación'], color: 'from-orange-400 to-rose-500', icon: '●' },
-  { nombre: 'Zoco Plus', backend: 'zoco-plus', badge: 'Nuevo', ollamaModel: 'Zoco-Plus', tags: ['Tareas cotidianas','Escritura','Rentable'], color: 'from-gray-500 to-slate-600', icon: '▲' },
-  { nombre: 'Zoco Flash', backend: 'zoco-flash', badge: null, ollamaModel: 'Zoco-Flash', tags: ['Más rápido','Menor coste','Alto volumen'], color: 'from-teal-400 to-emerald-500', icon: '★' },
+  { nombre: 'Zoco Lab', backend: 'zoco-lab', badge: 'Nuevo', ollamaModel: 'mistral-nemo', tags: ['Más capaz','Investigación','Tareas de varios días'], color: 'from-blue-500 to-indigo-600', icon: '◆' },
+  { nombre: 'Zoco Max', backend: 'zoco-max', badge: null, ollamaModel: 'mistral-nemo', tags: ['Proyectos complejos','Agentes','Programación'], color: 'from-orange-400 to-rose-500', icon: '●' },
+  { nombre: 'Zoco Plus', backend: 'zoco-plus', badge: 'Nuevo', ollamaModel: 'llama3.2', tags: ['Tareas cotidianas','Escritura','Rentable'], color: 'from-gray-500 to-slate-600', icon: '▲' },
+  { nombre: 'Zoco Flash', backend: 'zoco-flash', badge: null, ollamaModel: 'llama3.2', tags: ['Más rápido','Menor coste','Alto volumen'], color: 'from-teal-400 to-emerald-500', icon: '★' },
 ];
-
 
 const RESOURCE_SECTIONS = [
   { key: 'archivo', label: 'Archivos', icon: '📁' },
@@ -150,6 +149,10 @@ export default function Dashboard() {
   const [formModelo, setFormModelo] = useState('zoco-plus');
   const [formSystemPrompt, setFormSystemPrompt] = useState('');
   const [formHabilidadesActivas, setFormHabilidadesActivas] = useState<string[]>([]);
+  const [formNumPredict, setFormNumPredict] = useState(4096);
+  const [formNumCtx, setFormNumCtx] = useState(8192);
+  const [formTemperature, setFormTemperature] = useState(0.7);
+  const [formBusquedaWeb, setFormBusquedaWeb] = useState(false);
   const [savingModal, setSavingModal] = useState(false);
 
   const authHeaders = useCallback(() => ({
@@ -197,6 +200,10 @@ export default function Dashboard() {
     setFormModelo(selectedModel);
     setFormSystemPrompt('');
     setFormHabilidadesActivas([]);
+    setFormNumPredict(4096);
+    setFormNumCtx(8192);
+    setFormTemperature(0.7);
+    setFormBusquedaWeb(false);
   };
 
   const openCreateModal = (type: string) => {
@@ -218,6 +225,10 @@ export default function Dashboard() {
     setFormModelo(item.data?.modelo || selectedModel);
     setFormSystemPrompt(item.data?.systemPrompt || '');
     setFormHabilidadesActivas(item.data?.habilidadesActivas || []);
+    setFormNumPredict(item.data?.num_predict ?? 4096);
+    setFormNumCtx(item.data?.num_ctx ?? 8192);
+    setFormTemperature(item.data?.temperature ?? 0.7);
+    setFormBusquedaWeb(!!item.data?.busquedaWeb);
     if (item.type === 'agente') ensureHabilidadesLoaded();
     setModalOpen(true);
   };
@@ -268,6 +279,10 @@ export default function Dashboard() {
         data.modelo = formModelo;
         data.systemPrompt = formSystemPrompt;
         data.habilidadesActivas = formHabilidadesActivas;
+        data.num_predict = formNumPredict;
+        data.num_ctx = formNumCtx;
+        data.temperature = formTemperature;
+        data.busquedaWeb = formBusquedaWeb;
       }
       const payload = { type: modalType, name: formName, data };
 
@@ -1155,10 +1170,54 @@ export default function Dashboard() {
                     placeholder="Describe el rol y comportamiento del agente..."
                   />
                 </div>
+
+                {/* ── Configuración Avanzada de IA ── */}
+                <div className="mb-4 rounded border border-gray-800 bg-[#161618] p-3">
+                  <p className="mb-3 text-xs font-bold uppercase text-[#996dff] tracking-wider">⚙️ Configuración Avanzada de IA</p>
+                  <div className="grid grid-cols-3 gap-3">
+                    <div>
+                      <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500 tracking-wider">Max Tokens</label>
+                      <input
+                        type="number" min={256} max={8192} step={256}
+                        value={formNumPredict}
+                        onChange={e => setFormNumPredict(Math.min(8192, Math.max(256, Number(e.target.value) || 4096)))}
+                        className="w-full rounded border border-gray-800 bg-[#1a1a1e] p-2 text-xs text-white focus:border-[#996dff] focus:outline-none transition-colors"
+                      />
+                      <p className="mt-1 text-[9px] text-gray-600">num_predict · 256–8192</p>
+                    </div>
+                    <div>
+                      <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500 tracking-wider">Ventana Contexto</label>
+                      <input
+                        type="number" min={2048} max={16384} step={1024}
+                        value={formNumCtx}
+                        onChange={e => setFormNumCtx(Math.min(16384, Math.max(2048, Number(e.target.value) || 8192)))}
+                        className="w-full rounded border border-gray-800 bg-[#1a1a1e] p-2 text-xs text-white focus:border-[#996dff] focus:outline-none transition-colors"
+                      />
+                      <p className="mt-1 text-[9px] text-gray-600">num_ctx · 2048–16384</p>
+                    </div>
+                    <div>
+                      <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500 tracking-wider">Temperatura</label>
+                      <input
+                        type="number" min={0} max={1.2} step={0.1}
+                        value={formTemperature}
+                        onChange={e => setFormTemperature(Math.min(1.2, Math.max(0, Number(e.target.value) ?? 0.7)))}
+                        className="w-full rounded border border-gray-800 bg-[#1a1a1e] p-2 text-xs text-white focus:border-[#996dff] focus:outline-none transition-colors"
+                      />
+                      <p className="mt-1 text-[9px] text-gray-600">0.0–1.2</p>
+                    </div>
+                  </div>
+                </div>
+
                 <div className="mb-4">
                   <label className="mb-1 block text-xs font-bold uppercase text-gray-400 tracking-wider">Habilidades activas</label>
+                  <div className="space-y-1.5 rounded border border-gray-800 bg-[#1a1a1e] p-2.5 mb-1.5">
+                    <label className="flex items-center space-x-2 text-xs text-gray-300 cursor-pointer">
+                      <input type="checkbox" checked={formBusquedaWeb} onChange={() => setFormBusquedaWeb(v => !v)} />
+                      <span>🌐 Búsqueda web (Tavily)</span>
+                    </label>
+                  </div>
                   {habilidadesDisponibles.length === 0 ? (
-                    <p className="text-xs text-gray-600">No hay habilidades creadas todavía. Ve a "Habilidades" para añadir alguna.</p>
+                    <p className="text-xs text-gray-600">No hay más habilidades creadas todavía. Ve a "Habilidades" para añadir alguna.</p>
                   ) : (
                     <div className="space-y-1.5 rounded border border-gray-800 bg-[#1a1a1e] p-2.5">
                       {habilidadesDisponibles.map(h => (
@@ -1172,6 +1231,7 @@ export default function Dashboard() {
                 </div>
               </>
             )}
+
 
             <div className="flex justify-end gap-3 border-t border-gray-800/80 pt-4">
               <button onClick={closeModal} className="px-4 py-2 text-sm text-gray-400 hover:text-white transition-colors">
