@@ -107,6 +107,36 @@ export default function Dashboard() {
   const [activeAgent, setActiveAgent] = useState<Recurso | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
+  // Clave de localStorage para el historial de chat: distinta por usuario y por agente
+  // (o 'general' si es el chat sin agente), para que no se mezclen conversaciones.
+  const chatStorageKey = `zoco_chat_history:${user?.id || 'anon'}:${activeAgent?.id || 'general'}`;
+
+  // Al cambiar de agente (o al volver al chat general), restaura el historial guardado
+  // en vez de empezar en blanco.
+  useEffect(() => {
+    if (!user?.id) return;
+    try {
+      const saved = localStorage.getItem(chatStorageKey);
+      setChatMessages(saved ? JSON.parse(saved) : []);
+    } catch {
+      setChatMessages([]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, activeAgent?.id]);
+
+  // Cada vez que cambian los mensajes, se guarda una copia en localStorage.
+  useEffect(() => {
+    if (!user?.id) return;
+    try {
+      if (chatMessages.length > 0) {
+        localStorage.setItem(chatStorageKey, JSON.stringify(chatMessages));
+      } else {
+        localStorage.removeItem(chatStorageKey);
+      }
+    } catch {}
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatMessages, chatStorageKey]);
+
   const [modalOpen, setModalOpen] = useState(false);
   const [modalMode, setModalMode] = useState<'create' | 'edit'>('create');
   const [modalType, setModalType] = useState('');
