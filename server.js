@@ -553,6 +553,51 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
   }
 });
 
+// Adaptador para el Dashboard: el frontend llama a POST /api/chat con
+// { message, agentId, model, history } y espera { response }. Toda la lógica
+// real (créditos, memoria de agente, caché de prompts, Ollama/Groq) ya vive
+// en /v1/chat/completions, así que aquí solo traducimos el contrato y
+// reenviamos la petición internamente, sin duplicar nada.
+app.post('/api/chat', authMiddleware, async (req, res) => {
+  try {
+    const { message, agentId, model, history } = req.body || {};
+    if (!message || !String(message).trim()) {
+      return res.status(400).json({ error: 'El mensaje es obligatorio' });
+    }
+
+    const historialMensajes = Array.isArray(history)
+      ? history
+          .filter(m => m && typeof m.content === 'string')
+          .map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content }))
+      : [];
+
+    const messages = [...historialMensajes, { role: 'user', content: String(message) }];
+
+    const internalUrl = `http://localhost:${port}/v1/chat/completions`;
+    const internalResp = await fetch(internalUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: req.headers.authorization || '',
+      },
+      body: JSON.stringify({ agentId, model, messages }),
+    });
+
+    const data = await internalResp.json();
+
+    if (!internalResp.ok) {
+      return res.status(internalResp.status).json({ error: data.error || 'Error al procesar el chat' });
+    }
+
+    const respuesta = data.choices?.[0]?.message?.content || '';
+    res.json({ response: respuesta, usage: data.usage, model: data.model });
+
+  } catch (err) {
+    console.error('Error en /api/chat:', err);
+    res.status(500).json({ error: 'Error interno al procesar el mensaje' });
+  }
+});
+
 app.get('/api/cache/stats', authMiddleware, (req, res) => {
   const rows = db.prepare(
     'SELECT cache_key, agente_id, hits, token_estimate, expires_at FROM prompt_cache WHERE user_id = ? AND expires_at > ?'
