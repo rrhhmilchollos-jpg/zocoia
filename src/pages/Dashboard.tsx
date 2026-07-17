@@ -14,10 +14,10 @@ function fmtEUR(n: number) { return `${(n || 0).toFixed(2)} €`; }
 function fmtDate(s: string) { return new Date(s).toLocaleDateString('es-ES'); }
 
 const MODELOS = [
-  { nombre: 'Zoco Fable 5', backend: 'zoco-fable-5', badge: 'Nuevo', ollamaModel: 'mistral-nemo', tags: ['Más capaz','Investigación','Tareas de varios días'], color: 'from-blue-500 to-indigo-600', icon: '✦' },
-  { nombre: 'Zoco Opus 4.8', backend: 'zoco-opus-4-8', badge: null, ollamaModel: 'mistral-nemo', tags: ['Proyectos complejos','Agentes','Programación'], color: 'from-orange-400 to-rose-500', icon: '◈' },
-  { nombre: 'Zoco Sonnet 5', backend: 'zoco-sonnet-5', badge: 'Nuevo', ollamaModel: 'llama3.2', tags: ['Tareas cotidianas','Escritura','Rentable'], color: 'from-gray-500 to-slate-600', icon: '✳' },
-  { nombre: 'Zoco Haiku 4.5', backend: 'zoco-haiku-4-5', badge: null, ollamaModel: 'llama3.2', tags: ['Más rápido','Menor coste','Alto volumen'], color: 'from-teal-400 to-emerald-500', icon: '❋' },
+  { nombre: 'Zoco Lab', backend: 'zoco-lab', badge: 'Nuevo', ollamaModel: 'mistral-nemo', tags: ['Más capaz','Investigación','Tareas de varios días'], color: 'from-blue-500 to-indigo-600', icon: '◆' },
+  { nombre: 'Zoco Max', backend: 'zoco-max', badge: null, ollamaModel: 'mistral-nemo', tags: ['Proyectos complejos','Agentes','Programación'], color: 'from-orange-400 to-rose-500', icon: '●' },
+  { nombre: 'Zoco Plus', backend: 'zoco-plus', badge: 'Nuevo', ollamaModel: 'llama3.2', tags: ['Tareas cotidianas','Escritura','Rentable'], color: 'from-gray-500 to-slate-600', icon: '▲' },
+  { nombre: 'Zoco Flash', backend: 'zoco-flash', badge: null, ollamaModel: 'llama3.2', tags: ['Más rápido','Menor coste','Alto volumen'], color: 'from-teal-400 to-emerald-500', icon: '★' },
 ];
 
 const RESOURCE_SECTIONS = [
@@ -31,11 +31,56 @@ const RESOURCE_SECTIONS = [
   { key: 'memoria', label: 'Almacenes de memoria', icon: '🧠' },
 ];
 
-// Tipos de recurso que necesitan campo "Valor / Clave API" en el formulario
-const TIPOS_CON_VALOR = ['habilidad', 'credencial'];
+// Tipos de recurso que necesitan campo dinámico "tercer campo" en el formulario
+const TIPOS_CON_VALOR = ['habilidad', 'credencial', 'entorno', 'implementacion', 'lote', 'memoria', 'archivo'];
+
+// Configuración del tercer campo del modal: label + placeholder según el tipo de recurso.
+// Sustituye el antiguo campo genérico "Valor / Clave API" por algo específico de cada módulo.
+const CAMPO_VALOR_CONFIG: Record<string, { label: string; placeholder: string }> = {
+  habilidad: {
+    label: 'Clave API / Token de Acceso',
+    placeholder: 'Pega aquí el token o identificador proporcionado por el proveedor (Tavily, Serper, etc.)...',
+  },
+  credencial: {
+    label: 'Clave API / Token de Acceso',
+    placeholder: 'Pega aquí el token o identificador proporcionado por el proveedor (Tavily, Serper, etc.)...',
+  },
+  entorno: {
+    label: 'URL del Servidor / Endpoint',
+    placeholder: 'Ej: https://ngrok-free.dev o https://zocoia.app...',
+  },
+  implementacion: {
+    label: 'URL del Servidor / Endpoint',
+    placeholder: 'Ej: https://ngrok-free.dev o https://zocoia.app...',
+  },
+  lote: {
+    label: 'Configuración del Lote (JSON o Parámetros)',
+    placeholder: 'Ej: {"max_concurrent": 3, "retry_attempts": 2} o parámetros de velocidad...',
+  },
+  memoria: {
+    label: 'Identificador / Nombre del Índice de Vectores',
+    placeholder: 'Ej: zoco_ia_memoria_index o nombre de la colección en la base de datos...',
+  },
+  archivo: {
+    label: 'Ruta del Directorio / Ubicación del Archivo',
+    placeholder: 'Ej: /app/data/storage/files o ruta del volumen persistente...',
+  },
+};
+
+function getCampoValorConfig(modalType: string) {
+  return CAMPO_VALOR_CONFIG[modalType] || { label: 'Valor', placeholder: 'Valor asociado a este recurso...' };
+}
 
 export default function Dashboard() {
   const { user, token, logout } = useAuth();
+
+  // Guard de montaje. Nota: este proyecto es una SPA de Vite (sin SSR de Next.js),
+  // así que los errores de hidratación #418/#423 no pueden producirse aquí — ese
+  // fallo es específico de Next.js renderizando en servidor. Se deja este guard
+  // por si en el futuro se migra a un framework con SSR, pero hoy no corrige nada.
+  const [isMounted, setIsMounted] = useState(false);
+  useEffect(() => { setIsMounted(true); }, []);
+
   const [activeTab, setActiveTab] = useState('panel');
   const [billing, setBilling] = useState<BillingSummary | null>(null);
   const [agentes, setAgentes] = useState<Recurso[]>([]);
@@ -46,7 +91,7 @@ export default function Dashboard() {
   const [adminLogs, setAdminLogs] = useState<any[]>([]);
   const [payments, setPayments] = useState<Payment[]>([]);
   const [creditPacks, setCreditPacks] = useState<CreditPack[]>([]);
-  const [selectedModel, setSelectedModel] = useState('zoco-sonnet-5');
+  const [selectedModel, setSelectedModel] = useState('zoco-plus');
   const [expandedAgentId, setExpandedAgentId] = useState<string|null>(null);
   const [agentMemory, setAgentMemory] = useState<Record<string, {mensajes: MemoriaMensaje[]; cacheActiva: boolean}>>({});
   const [adminTab, setAdminTab] = useState<'usuarios'|'pagos'|'sistema'|'logs'>('usuarios');
@@ -59,26 +104,19 @@ export default function Dashboard() {
   const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
-  // NUEVO: agente actualmente seleccionado para el chat individual
   const [activeAgent, setActiveAgent] = useState<Recurso | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
-  // ==========================================
-  // ESTADOS DE CONTROL PARA EL FORMULARIO MODAL (crear / editar)
-  // Sustituye los antiguos window.prompt() por un formulario embebido.
-  // ==========================================
   const [modalOpen, setModalOpen] = useState(false);
   const [modalMode, setModalMode] = useState<'create' | 'edit'>('create');
-  const [modalType, setModalType] = useState(''); // 'agente' | 'apikey' | uno de los RESOURCE_SECTIONS.key
+  const [modalType, setModalType] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
 
-  // Campos comunes del formulario
   const [formName, setFormName] = useState('');
   const [formDesc, setFormDesc] = useState('');
-  const [formValor, setFormValor] = useState(''); // Valor / Clave API (habilidad, credencial)
+  const [formValor, setFormValor] = useState('');
 
-  // Campos específicos del formulario avanzado de Agentes
-  const [formModelo, setFormModelo] = useState('zoco-sonnet-5');
+  const [formModelo, setFormModelo] = useState('zoco-plus');
   const [formSystemPrompt, setFormSystemPrompt] = useState('');
   const [formHabilidadesActivas, setFormHabilidadesActivas] = useState<string[]>([]);
   const [savingModal, setSavingModal] = useState(false);
@@ -106,7 +144,6 @@ export default function Dashboard() {
     if (activeTab === 'keys') load('/api/keys', setKeys);
     if (activeTab === 'billing') { load('/api/payments/history', setPayments); load('/api/billing/summary', setBilling); }
     if (activeTab === 'admin') { load('/admin/clientes', setAdminUsuarios); load('/admin/stats', setAdminStats); }
-    // Si se sale de la pestaña de chat, se limpia el agente activo para no arrastrarlo por accidente
     if (activeTab !== 'chat') setActiveAgent(null);
     const rs = RESOURCE_SECTIONS.find(s => s.key === activeTab);
     if (rs) load(`/api/resources?type=${rs.key}`, d => setResourcesByType(p => ({ ...p, [rs.key]: d })));
@@ -116,17 +153,11 @@ export default function Dashboard() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages]);
 
-  // La lista de habilidades hace falta tanto en la pestaña "Habilidades" como en el
-  // formulario avanzado de Agentes (checkboxes). La cargamos bajo demanda si aún no está.
   const ensureHabilidadesLoaded = useCallback(() => {
     if (!resourcesByType['habilidad']) {
       load('/api/resources?type=habilidad', d => setResourcesByType(p => ({ ...p, habilidad: d })));
     }
   }, [load, resourcesByType]);
-
-  // ==========================================
-  // FUNCIONES DE CONTROL DEL MODAL (reemplazan a los antiguos prompt())
-  // ==========================================
 
   const resetForm = () => {
     setFormName('');
@@ -179,11 +210,10 @@ export default function Dashboard() {
 
   const handleSaveResource = async () => {
     if (!formName.trim()) { alert('El nombre es obligatorio'); return; }
-    if (TIPOS_CON_VALOR.includes(modalType) && !formValor.trim()) { alert('El valor / clave API es obligatorio'); return; }
+    if (TIPOS_CON_VALOR.includes(modalType) && !formValor.trim()) { alert(`${getCampoValorConfig(modalType).label} es obligatorio`); return; }
 
     setSavingModal(true);
     try {
-      // ── Claves de API: endpoint y payload propios (el token lo genera el backend) ──
       if (modalType === 'apikey') {
         if (modalMode === 'create') {
           const r = await fetch(`${API_BASE}/api/keys`, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ name: formName }) });
@@ -193,7 +223,6 @@ export default function Dashboard() {
             load('/api/keys', setKeys);
           } else { const e = await r.json(); alert(e.error || 'Error'); }
         } else {
-          // TODO(backend): confirmar que existe PUT /api/keys/:id para renombrar.
           const r = await fetch(`${API_BASE}/api/keys/${editingId}`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ name: formName }) });
           if (r.ok) load('/api/keys', setKeys);
           else alert('No se pudo renombrar la clave (verifica que el backend soporte PUT /api/keys/:id).');
@@ -202,7 +231,6 @@ export default function Dashboard() {
         return;
       }
 
-      // ── Agentes y recursos genéricos (habilidad, credencial, archivo, lote, sesion, implementacion, entorno, memoria) ──
       const data: Record<string, any> = { descripcion: formDesc };
       if (TIPOS_CON_VALOR.includes(modalType)) data.valor = formValor;
       if (modalType === 'agente') {
@@ -291,7 +319,6 @@ export default function Dashboard() {
     if (r.ok) load('/admin/clientes', setAdminUsuarios);
   };
 
-  // NUEVO: abrir el chat individual de un agente concreto desde su tarjeta
   const handleOpenAgentChat = (agente: Recurso) => {
     setActiveAgent(agente);
     setChatMessages([]);
@@ -310,7 +337,6 @@ export default function Dashboard() {
         body: JSON.stringify({
           messages: newMessages,
           model: selectedModel,
-          // CLAVE: sin esto el backend nunca sabía qué agente (systemPrompt + memoria) usar
           agentId: activeAgent?.id,
         }),
       });
@@ -334,7 +360,6 @@ export default function Dashboard() {
     </button>
   );
 
-  // Botones de icono reutilizables (lápiz / papelera) para todas las listas
   const IconAction = ({ onClick, title, danger, children }: { onClick: (e: React.MouseEvent) => void; title: string; danger?: boolean; children: React.ReactNode }) => (
     <button
       onClick={(e) => { e.stopPropagation(); onClick(e); }}
@@ -344,6 +369,8 @@ export default function Dashboard() {
       {children}
     </button>
   );
+
+  if (!isMounted) return null;
 
   return (
     <div className="flex h-screen bg-[#111111] text-gray-200 font-sans overflow-hidden text-sm">
@@ -423,7 +450,6 @@ export default function Dashboard() {
           </nav>
         )}
 
-        {/* Footer sidebar */}
         {sidebarOpen && (
           <div className="border-t border-[#222] p-3 space-y-2">
             {balanceLow && (
@@ -454,7 +480,6 @@ export default function Dashboard() {
       {/* MAIN */}
       <main className="flex-1 overflow-y-auto h-full bg-[#111111]">
 
-        {/* Banner alertas */}
         {notification && (
           <div className="bg-[#1a1a2e] border-b border-[#333] px-6 py-2.5 flex items-center justify-between text-[12px]">
             <span className="text-blue-300">ℹ️ Zoco IA Console activo · Groq Cloud IA en línea · {agentes.length} agentes registrados</span>
@@ -464,7 +489,6 @@ export default function Dashboard() {
 
         <div className="p-8">
 
-          {/* ── PANEL PRINCIPAL ── */}
           {activeTab === 'panel' && (
             <>
               <div className="flex items-center justify-between mb-8">
@@ -482,7 +506,6 @@ export default function Dashboard() {
                 </div>
               </div>
 
-              {/* Alert saldo bajo */}
               {balanceLow && (
                 <div className="mb-6 bg-amber-950/40 border border-amber-700/50 rounded-xl p-4 flex items-center justify-between">
                   <div className="flex items-center space-x-3">
@@ -496,7 +519,6 @@ export default function Dashboard() {
                 </div>
               )}
 
-              {/* Stats */}
               <div className="grid grid-cols-3 gap-4 mb-8">
                 <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-5">
                   <div className="flex items-center justify-between mb-2">
@@ -528,7 +550,6 @@ export default function Dashboard() {
                 </div>
               </div>
 
-              {/* Modelos */}
               <h2 className="text-lg font-bold text-white mb-4">Modelos</h2>
               <div className="grid grid-cols-4 gap-4 mb-8">
                 {MODELOS.map(m => {
@@ -555,7 +576,6 @@ export default function Dashboard() {
                 })}
               </div>
 
-              {/* Recursos */}
               <h2 className="text-lg font-bold text-white mb-4">Recursos</h2>
               <div className="grid grid-cols-4 gap-3">
                 {[
@@ -577,7 +597,6 @@ export default function Dashboard() {
             </>
           )}
 
-          {/* ── CHAT ── */}
           {activeTab === 'chat' && (
             <div className="max-w-3xl mx-auto flex flex-col" style={{height: 'calc(100vh - 120px)'}}>
               <div className="flex items-center justify-between mb-4">
@@ -652,7 +671,6 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* ── CLAVES API ── */}
           {activeTab === 'keys' && (
             <div className="max-w-4xl">
               <div className="flex items-center justify-between mb-6">
@@ -682,7 +700,6 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* ── FACTURACIÓN ── */}
           {activeTab === 'billing' && (
             <div className="max-w-4xl">
               <h1 className="text-2xl font-bold text-white mb-2">Facturación y créditos</h1>
@@ -749,7 +766,6 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* ── AGENTES ── */}
           {(activeTab === 'agentes' || activeTab === 'mis-agentes') && (
             <div className="max-w-4xl">
               <div className="flex items-center justify-between mb-6">
@@ -812,7 +828,6 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* ── RECURSOS GENÉRICOS ── */}
           {RESOURCE_SECTIONS.filter(s => !['sesion','memoria','credencial','entorno','implementacion'].includes(s.key) ? false : s.key === activeTab).map(s => (
             <div key={s.key} className="max-w-4xl">
               <div className="flex justify-between items-center mb-6">
@@ -839,7 +854,6 @@ export default function Dashboard() {
             </div>
           ))}
 
-          {/* Archivo, habilidad, lote */}
           {['archivo','habilidad','lote'].includes(activeTab) && (() => {
             const s = RESOURCE_SECTIONS.find(x => x.key === activeTab)!;
             return (
@@ -868,7 +882,6 @@ export default function Dashboard() {
             );
           })()}
 
-          {/* ── USO ── */}
           {activeTab === 'uso' && (
             <div className="max-w-4xl">
               <h1 className="text-2xl font-bold text-white mb-6">Uso general</h1>
@@ -882,7 +895,6 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* ── DOCS ── */}
           {activeTab === 'docs' && (
             <div className="max-w-3xl">
               <h1 className="text-2xl font-bold text-white mb-6">Documentación</h1>
@@ -890,7 +902,7 @@ export default function Dashboard() {
                 {[
                   {title:'Inicio rápido',desc:'Empieza a usar la API de Zoco IA en minutos',icon:'🚀'},
                   {title:'Referencia API',desc:'Documentación completa de todos los endpoints',icon:'📋'},
-                  {title:'Guía de modelos',desc:'Compara Zoco Fable, Opus, Sonnet y Haiku',icon:'🤖'},
+                  {title:'Guía de modelos',desc:'Compara Zoco Lab, Max, Plus y Flash',icon:'🤖'},
                   {title:'Ejemplos de código',desc:'Snippets en Python, JavaScript y más',icon:'💻'},
                   {title:'Límites y cuotas',desc:'Información sobre rate limits y facturación',icon:'📊'},
                   {title:'Soporte',desc:'Contacta con el equipo de Zoco IA',icon:'💬'},
@@ -905,7 +917,6 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* ── ADMIN ── */}
           {activeTab === 'admin' && user?.isAdmin && (
             <div className="max-w-6xl">
               <div className="flex items-center space-x-3 mb-6">
@@ -1044,14 +1055,6 @@ export default function Dashboard() {
         </div>
       </main>
 
-      {/* ══════════════════════════════════════════════════════════════
-          MODAL DE CREAR / EDITAR — sustituye a los antiguos window.prompt()
-          Campos que se muestran según el tipo de recurso (modalType):
-            - agente: Nombre, Descripción, Modelo, System Prompt, checkboxes de Habilidades
-            - habilidad / credencial: Nombre, Descripción, Valor / Clave API (obligatorio)
-            - apikey: solo Nombre (el token lo genera el backend)
-            - resto (archivo, lote, sesion, implementacion, entorno, memoria): Nombre, Descripción
-         ══════════════════════════════════════════════════════════════ */}
       {modalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-75 p-4 backdrop-blur-sm">
           <div className="w-full max-w-md rounded-xl border border-gray-800 bg-[#121214] p-6 text-white shadow-2xl max-h-[85vh] overflow-y-auto">
@@ -1088,13 +1091,13 @@ export default function Dashboard() {
 
             {TIPOS_CON_VALOR.includes(modalType) && (
               <div className="mb-4">
-                <label className="mb-1 block text-xs font-bold uppercase text-gray-400 tracking-wider">Valor / Clave API</label>
+                <label className="mb-1 block text-xs font-bold uppercase text-gray-400 tracking-wider">{getCampoValorConfig(modalType).label}</label>
                 <textarea
                   value={formValor}
                   onChange={e => setFormValor(e.target.value)}
                   rows={3}
                   className="w-full rounded border border-gray-800 bg-[#1a1a1e] p-2.5 text-xs font-mono text-white focus:border-[#996dff] focus:outline-none transition-colors"
-                  placeholder="Pega aquí el token o identificador (Tavily, Google, etc.)"
+                  placeholder={getCampoValorConfig(modalType).placeholder}
                 />
               </div>
             )}
