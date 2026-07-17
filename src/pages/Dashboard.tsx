@@ -14,11 +14,12 @@ function fmtEUR(n: number) { return `${(n || 0).toFixed(2)} €`; }
 function fmtDate(s: string) { return new Date(s).toLocaleDateString('es-ES'); }
 
 const MODELOS = [
-  { nombre: 'Zoco Lab', backend: 'zoco-lab', badge: 'Nuevo', ollamaModel: 'mistral-nemo', tags: ['Más capaz','Investigación','Tareas de varios días'], color: 'from-blue-500 to-indigo-600', icon: '◆' },
-  { nombre: 'Zoco Max', backend: 'zoco-max', badge: null, ollamaModel: 'mistral-nemo', tags: ['Proyectos complejos','Agentes','Programación'], color: 'from-orange-400 to-rose-500', icon: '●' },
-  { nombre: 'Zoco Plus', backend: 'zoco-plus', badge: 'Nuevo', ollamaModel: 'llama3.2', tags: ['Tareas cotidianas','Escritura','Rentable'], color: 'from-gray-500 to-slate-600', icon: '▲' },
-  { nombre: 'Zoco Flash', backend: 'zoco-flash', badge: null, ollamaModel: 'llama3.2', tags: ['Más rápido','Menor coste','Alto volumen'], color: 'from-teal-400 to-emerald-500', icon: '★' },
+  { nombre: 'Zoco Lab', backend: 'zoco-lab', badge: 'Nuevo', ollamaModel: 'Zoco-Lab', tags: ['Más capaz','Investigación','Tareas de varios días'], color: 'from-blue-500 to-indigo-600', icon: '◆' },
+  { nombre: 'Zoco Max', backend: 'zoco-max', badge: null, ollamaModel: 'Zoco-Max', tags: ['Proyectos complejos','Agentes','Programación'], color: 'from-orange-400 to-rose-500', icon: '●' },
+  { nombre: 'Zoco Plus', backend: 'zoco-plus', badge: 'Nuevo', ollamaModel: 'Zoco-Plus', tags: ['Tareas cotidianas','Escritura','Rentable'], color: 'from-gray-500 to-slate-600', icon: '▲' },
+  { nombre: 'Zoco Flash', backend: 'zoco-flash', badge: null, ollamaModel: 'Zoco-Flash', tags: ['Más rápido','Menor coste','Alto volumen'], color: 'from-teal-400 to-emerald-500', icon: '★' },
 ];
+
 
 const RESOURCE_SECTIONS = [
   { key: 'archivo', label: 'Archivos', icon: '📁' },
