@@ -8,6 +8,7 @@ const crypto = require('crypto');
 const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
+const { webSearchDuckDuckGo, formatResultsAsContext } = require('./websearch');
 
 const PORT = process.env.PORT || 4000;
 const VLLM_URL = process.env.VLLM_URL || 'http://localhost:8000/v1';
@@ -54,12 +55,15 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS usage_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     key_id INTEGER NOT NULL,
+    agent_id INTEGER DEFAULT NULL,
     prompt_tokens INTEGER DEFAULT 0,
     completion_tokens INTEGER DEFAULT 0,
     model TEXT,
+    used_web_search INTEGER DEFAULT 0,
     endpoint TEXT DEFAULT '/v1/chat/completions',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (key_id) REFERENCES api_keys(id)
+    FOREIGN KEY (key_id) REFERENCES api_keys(id),
+    FOREIGN KEY (agent_id) REFERENCES agents(id)
   );
 
   CREATE TABLE IF NOT EXISTS models_registry (
@@ -268,8 +272,35 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: `Modelo "${modelId}" no encontrado o inactivo en models_registry` });
     }
 
-    // Reescribimos el "model" del body con el nombre real que Ollama entiende (ej: llama3.2:1b)
-    const upstreamBody = { ...req.body, model: modelRow.backend_model_id };
+    // agent_id (opcional): permite desglosar el consumo de tokens por agente en vez de solo por api key
+    const agentId = req.body.agent_id || null;
+
+    // web_search (opcional): { web_search: { query: "..." } } o simplemente true para usar el último mensaje del usuario
+    let messages = req.body.messages || [];
+    let usedWebSearch = false;
+
+    if (req.body.web_search) {
+      const query = typeof req.body.web_search === 'object' && req.body.web_search.query
+        ? req.body.web_search.query
+        : messages.filter(m => m.role === 'user').slice(-1)[0]?.content;
+
+      if (query) {
+        try {
+          const results = await webSearchDuckDuckGo(query, 5);
+          const context = formatResultsAsContext(query, results);
+          messages = [{ role: 'system', content: context }, ...messages];
+          usedWebSearch = true;
+        } catch (searchErr) {
+          console.error('Error en búsqueda web:', searchErr.message);
+          // Si falla la búsqueda, seguimos sin ella en vez de romper la petición
+        }
+      }
+    }
+
+    // Reescribimos "model" con el nombre real de Ollama y "messages" con el contexto de búsqueda si aplica
+    const upstreamBody = { ...req.body, model: modelRow.backend_model_id, messages };
+    delete upstreamBody.web_search;
+    delete upstreamBody.agent_id;
 
     const upstream = await fetch(`${modelRow.backend_url}/chat/completions`, {
       method: 'POST',
@@ -282,8 +313,12 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
     const completionTokens = data.usage?.completion_tokens || 0;
 
     if (req.apiKeyRow.id !== 0) {
-      db.prepare('INSERT INTO usage_log (key_id, prompt_tokens, completion_tokens, model, endpoint) VALUES (?, ?, ?, ?, ?)')
-        .run(req.apiKeyRow.id, promptTokens, completionTokens, modelId, '/v1/chat/completions');
+      db.prepare('INSERT INTO usage_log (key_id, agent_id, prompt_tokens, completion_tokens, model, used_web_search, endpoint) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(req.apiKeyRow.id, agentId, promptTokens, completionTokens, modelId, usedWebSearch ? 1 : 0, '/v1/chat/completions');
+
+      if (agentId) {
+        db.prepare('UPDATE agents SET sesiones = sesiones + 1, ultima_actividad = CURRENT_TIMESTAMP WHERE id = ?').run(agentId);
+      }
     }
 
     res.status(upstream.status).json(data);
@@ -349,6 +384,28 @@ app.get('/admin/users', authMiddleware, (req, res) => {
   if (!req.isAdmin) return res.status(403).json({ error: 'Solo accesible con ADMIN_KEY' });
   const users = db.prepare('SELECT id, email, nombre, rol, saldo, tokens_comprados, tokens_usados, activo, created_at FROM users').all();
   res.json(users);
+});
+
+app.get('/admin/agents-usage', authMiddleware, (req, res) => {
+  if (!req.isAdmin) return res.status(403).json({ error: 'Solo accesible con ADMIN_KEY' });
+  const rows = db.prepare(`
+    SELECT
+      a.id,
+      a.nombre,
+      a.modelo,
+      a.estado,
+      a.sesiones,
+      a.ultima_actividad,
+      COALESCE(SUM(u.prompt_tokens + u.completion_tokens), 0) AS tokens_totales,
+      COALESCE(SUM(CASE WHEN strftime('%Y-%m', u.created_at) = strftime('%Y-%m', 'now') THEN u.prompt_tokens + u.completion_tokens ELSE 0 END), 0) AS tokens_este_mes,
+      COUNT(u.id) AS peticiones_totales,
+      SUM(u.used_web_search) AS busquedas_web
+    FROM agents a
+    LEFT JOIN usage_log u ON u.agent_id = a.id
+    GROUP BY a.id
+    ORDER BY tokens_totales DESC
+  `).all();
+  res.json(rows);
 });
 
 app.get('/admin/stats', authMiddleware, (req, res) => {
