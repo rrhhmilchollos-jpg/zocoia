@@ -153,6 +153,9 @@ export default function Dashboard() {
   const [formNumCtx, setFormNumCtx] = useState(8192);
   const [formTemperature, setFormTemperature] = useState(0.7);
   const [formBusquedaWeb, setFormBusquedaWeb] = useState(false);
+  const [formTopP, setFormTopP] = useState(1);
+  const [formSystemPromptExtendido, setFormSystemPromptExtendido] = useState('');
+  const [formSystemContext, setFormSystemContext] = useState('');
   const [savingModal, setSavingModal] = useState(false);
 
   const authHeaders = useCallback(() => ({
@@ -204,6 +207,9 @@ export default function Dashboard() {
     setFormNumCtx(8192);
     setFormTemperature(0.7);
     setFormBusquedaWeb(false);
+    setFormTopP(1);
+    setFormSystemPromptExtendido('');
+    setFormSystemContext('');
   };
 
   const openCreateModal = (type: string) => {
@@ -229,6 +235,9 @@ export default function Dashboard() {
     setFormNumCtx(item.data?.num_ctx ?? 8192);
     setFormTemperature(item.data?.temperature ?? 0.7);
     setFormBusquedaWeb(!!item.data?.busquedaWeb);
+    setFormTopP(item.data?.top_p ?? 1);
+    setFormSystemPromptExtendido(item.data?.systemPromptExtendido || '');
+    setFormSystemContext(item.data?.systemContext || '');
     if (item.type === 'agente') ensureHabilidadesLoaded();
     setModalOpen(true);
   };
@@ -283,6 +292,9 @@ export default function Dashboard() {
         data.num_ctx = formNumCtx;
         data.temperature = formTemperature;
         data.busquedaWeb = formBusquedaWeb;
+        data.top_p = formTopP;
+        data.systemPromptExtendido = formSystemPromptExtendido;
+        data.systemContext = formSystemContext;
       }
       const payload = { type: modalType, name: formName, data };
 
