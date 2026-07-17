@@ -108,8 +108,8 @@ db.exec(`
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434/v1';
 
 const modelosDefecto = [
-  { model_id: 'maris-velox-1b', display_name: 'Maris Velox 1B', equivalencia: 'Modelo ligero (Llama 3.2 1B)', backend_url: OLLAMA_URL, backend_model_id: 'llama3.2:1b', active: 1, price: 0.0005 },
-  { model_id: 'maris-core-7b', display_name: 'Maris Core 3B', equivalencia: 'Modelo intermedio (Qwen2.5 3B)', backend_url: OLLAMA_URL, backend_model_id: 'qwen2.5:3b', active: 1, price: 0.002 },
+  { model_id: 'maris-velox-1b', display_name: 'Zoco Nano', equivalencia: 'Modelo ligero y rápido', backend_url: OLLAMA_URL, backend_model_id: 'llama3.2:1b', active: 1, price: 0.0005 },
+  { model_id: 'maris-core-7b', display_name: 'Zoco Core', equivalencia: 'Modelo intermedio, más capaz', backend_url: OLLAMA_URL, backend_model_id: 'qwen2.5:3b', active: 1, price: 0.002 },
 ];
 for (const m of modelosDefecto) {
   const exists = db.prepare('SELECT id FROM models_registry WHERE model_id = ?').get(m.model_id);
