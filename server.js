@@ -36,6 +36,21 @@ if (dbDir && !fs.existsSync(dbDir)) {
 }
 
 console.log(`🗄️ Usando base de datos en: ${DB_PATH}`);
+
+// Aviso crítico: si estamos en producción (Railway) y NO hay un volumen
+// persistente montado, todo lo que se guarde en `db` (agentes, habilidades,
+// entornos, memoria...) vivirá SOLO dentro del contenedor y desaparecerá en
+// el próximo deploy/reinicio. Esto no se puede arreglar solo con código: hay
+// que adjuntar un Volumen al servicio desde el dashboard/CLI de Railway
+// (Command Palette ⌘K → "Create Volume", montado p. ej. en /data). En cuanto
+// exista, Railway inyecta RAILWAY_VOLUME_MOUNT_PATH automáticamente y esta
+// misma línea de arriba empezará a usarlo sin tocar nada más.
+if (process.env.NODE_ENV === 'production' && !process.env.RAILWAY_VOLUME_MOUNT_PATH && !process.env.DB_PATH) {
+  console.warn('⚠️⚠️⚠️  ATENCIÓN: no se detecta ningún volumen persistente de Railway (RAILWAY_VOLUME_MOUNT_PATH no está definido).');
+  console.warn('⚠️⚠️⚠️  La base de datos SQLite vive dentro del contenedor y SE BORRARÁ en el próximo deploy/reinicio.');
+  console.warn('⚠️⚠️⚠️  Solución: adjunta un Volumen a este servicio en el dashboard de Railway (Command Palette ⌘K → "Create Volume"), móntalo en /data, y haz redeploy.');
+}
+
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
@@ -241,6 +256,65 @@ function seedAdminAccount() {
   }
 }
 seedAdminAccount();
+
+// Catálogo de los 11 agentes por defecto de Zoco IA. Se recrean automáticamente
+// al arrancar el servidor SI el usuario admin no tiene todavía ningún agente
+// (es idempotente: si el volumen persistente ya está funcionando, esto no
+// hará nada tras la primera vez; si por lo que sea el disco vuelve a estar
+// vacío tras un deploy, actúa como red de seguridad y los recrea solos).
+// NOTA: solo cubre el agente en sí (nombre + system prompt + parámetros).
+// Las Habilidades/Entornos/Implementaciones específicas de tu operación no
+// estaban detalladas, así que no se inventan valores (API keys, URLs, etc.);
+// puedes añadirlos desde el panel una vez creados los agentes.
+const DEFAULT_AGENTS = [
+  { name: 'Agente de Investigación (Researcher)', systemPrompt: 'Eres el Agente de Investigación de Zoco IA. Tu trabajo es buscar información actualizada en internet, analizarla y sintetizarla en briefs técnicos claros, con fuentes cuando sea posible.' },
+  { name: 'Agente Arquitecto', systemPrompt: 'Eres el Agente Arquitecto de Zoco IA. Diseñas arquitecturas de software (backend, frontend, infraestructura) y tomas decisiones técnicas de alto nivel, explicando trade-offs.' },
+  { name: 'Agente de Diseño (Diseñador)', systemPrompt: 'Eres el Agente de Diseño de Zoco IA. Ayudas con UX/UI, sistemas de diseño, wireframes y decisiones visuales, priorizando claridad y usabilidad.' },
+  { name: 'Agente de Interfaz', systemPrompt: 'Eres el Agente de Interfaz de Zoco IA. Te especializas en implementar componentes de frontend (React/TypeScript), maquetación y experiencia de usuario en código real.' },
+  { name: 'Agente de Backend', systemPrompt: 'Eres el Agente de Backend de Zoco IA. Implementas APIs, lógica de servidor, autenticación e integración con bases de datos, priorizando seguridad y buenas prácticas.' },
+  { name: 'Agente de Base de Datos', systemPrompt: 'Eres el Agente de Base de Datos de Zoco IA. Diseñas esquemas, escribes consultas eficientes y asesoras sobre migraciones, índices y modelado de datos.' },
+  { name: 'Agente de Integraciones', systemPrompt: 'Eres el Agente de Integraciones de Zoco IA. Conectas servicios de terceros (pagos, email, APIs externas) y resuelves problemas de autenticación/webhooks entre sistemas.' },
+  { name: 'Agente de Control de Calidad (QA)', systemPrompt: 'Eres el Agente de QA de Zoco IA. Revisas código y funcionalidades en busca de bugs, casos límite y regresiones, y propones planes de prueba.' },
+  { name: 'Agente DevOps', systemPrompt: 'Eres el Agente DevOps de Zoco IA. Te ocupas de despliegues, CI/CD, variables de entorno, contenedores y la fiabilidad de la infraestructura (incluyendo Railway).' },
+  { name: 'Agente de Pruebas (Testing)', systemPrompt: 'Eres el Agente de Pruebas de Zoco IA. Escribes y ejecutas tests unitarios, de integración y end-to-end, e informas resultados de forma clara.' },
+  { name: 'Agente de Reparación', systemPrompt: 'Eres el Agente de Reparación de Zoco IA. Diagnosticas errores a partir de logs/stack traces y propones o aplicas el fix más seguro y mínimo posible.' },
+];
+
+function seedDefaultAgents() {
+  const email = process.env.ADMIN_EMAIL;
+  if (!email) {
+    console.log('ℹ️  ADMIN_EMAIL no configurado: no se siembran agentes por defecto (no hay usuario al que asignarlos).');
+    return;
+  }
+  const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email.toLowerCase());
+  if (!user) return; // No debería pasar justo después de seedAdminAccount(), pero por seguridad.
+
+  const existentes = db.prepare("SELECT name FROM resources WHERE user_id = ? AND type = 'agente'").all(user.id);
+  const nombresExistentes = new Set(existentes.map(r => r.name));
+
+  const insert = db.prepare('INSERT INTO resources (id, user_id, type, name, data) VALUES (?, ?, ?, ?, ?)');
+  let creados = 0;
+  for (const agente of DEFAULT_AGENTS) {
+    if (nombresExistentes.has(agente.name)) continue; // ya existe: no duplicar
+    insert.run(uuidv4(), user.id, 'agente', agente.name, JSON.stringify({
+      systemPrompt: agente.systemPrompt,
+      modelo: 'zoco-plus',
+      habilidadesActivas: [],
+      allowedTools: ALL_TOOL_NAMES,
+      num_predict: 4096,
+      num_ctx: 8192,
+      temperature: 0.7,
+      busquedaWeb: true,
+    }));
+    creados++;
+  }
+  if (creados > 0) {
+    console.log(`✅ Sembrados ${creados} agente(s) por defecto para ${email} (de un total de ${DEFAULT_AGENTS.length} esperados).`);
+  } else {
+    console.log(`ℹ️  Los ${DEFAULT_AGENTS.length} agentes por defecto ya existen para ${email}; no se crea ninguno nuevo.`);
+  }
+}
+seedDefaultAgents();
 
 app.use(cors());
 app.use(express.json());
