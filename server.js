@@ -397,23 +397,31 @@ async function callChatModel({ usandoOllama, ollamaUrl, ollamaModel, groqModel, 
   return await doFetch(GROQ_API_URL, `Bearer ${GROQ_API_KEY}`, groqModel);
 }
 
-app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
+/**
+ * Lógica compartida de inferencia (créditos, agente, caché de prompts, tools,
+ * Ollama/Groq). Extraída para que /v1/chat/completions y /api/chat la llamen
+ * directamente en memoria — SIN hacer una petición HTTP de vuelta al propio
+ * servidor (evitar eso es importante: un fetch a "http://localhost:PORT/..."
+ * puede colgarse por resolución IPv4/IPv6 de "localhost" en algunos entornos
+ * como Railway, dejando el chat "parado" sin motivo aparente).
+ * Lanza errores con `.status` adjunto (mismo patrón que ya usaba esta ruta).
+ */
+async function processChatCompletion(authSub, { agentId, messages, model, temperature: temperatureInput, max_tokens: maxTokensInput }) {
   if (!GROQ_API_KEY) {
-    return res.status(503).json({ error: 'GROQ_API_KEY no configurada en el servidor' });
+    const e = new Error('GROQ_API_KEY no configurada en el servidor'); e.status = 503; throw e;
   }
 
-  const userCheck = db.prepare('SELECT creditos, activo FROM users WHERE id = ?').get(req.auth.sub);
+  const userCheck = db.prepare('SELECT creditos, activo FROM users WHERE id = ?').get(authSub);
   if (!userCheck || !userCheck.activo) {
-    return res.status(403).json({ error: 'Cuenta desactivada' });
+    const e = new Error('Cuenta desactivada'); e.status = 403; throw e;
   }
   if (userCheck.creditos <= 0) {
-    return res.status(402).json({ error: 'Créditos insuficientes. Recarga tu cuenta en zocoia.es/billing', code: 'insufficient_credits' });
+    const e = new Error('Créditos insuficientes. Recarga tu cuenta en zocoia.es/billing'); e.status = 402; e.code = 'insufficient_credits'; throw e;
   }
 
-  const { agentId, messages, model } = req.body || {};
   const userMessage = Array.isArray(messages) && messages.length ? messages[messages.length - 1] : null;
 
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.auth.sub);
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(authSub);
   const modeloZocoia = model || user?.modelo_activo || 'zoco-plus';
   const groqModel = GROQ_MODEL_MAP[modeloZocoia] || GROQ_MODEL_MAP['zoco-plus'];
 
@@ -421,143 +429,145 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
   let agenteData = {};
   let cacheResult = { hit: false, cachedTokens: 0 };
 
-  try {
-    let mensajesParaGroq = [];
-    let systemPromptText = '';
+  let mensajesParaGroq = [];
+  let systemPromptText = '';
 
-    if (agentId) {
-      agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(agentId, req.auth.sub, 'agente');
-      if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
+  if (agentId) {
+    agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(agentId, authSub, 'agente');
+    if (!agente) { const e = new Error('Agente no encontrado'); e.status = 404; throw e; }
 
-      agenteData = agente.data ? JSON.parse(agente.data) : {};
-      const historial = db.prepare('SELECT role, content FROM agent_memory WHERE agente_id = ? ORDER BY created_at ASC LIMIT 50').all(agentId);
+    agenteData = agente.data ? JSON.parse(agente.data) : {};
+    const historial = db.prepare('SELECT role, content FROM agent_memory WHERE agente_id = ? ORDER BY created_at ASC LIMIT 50').all(agentId);
 
-      systemPromptText = agenteData.systemPrompt || `Eres ${agente.name}, un asistente de IA útil y preciso.`;
-      mensajesParaGroq.push({ role: 'system', content: systemPromptText });
-      mensajesParaGroq = mensajesParaGroq.concat(historial);
-      if (userMessage) mensajesParaGroq.push({ role: 'user', content: String(userMessage.content) });
+    systemPromptText = agenteData.systemPrompt || `Eres ${agente.name}, un asistente de IA útil y preciso.`;
+    mensajesParaGroq.push({ role: 'system', content: systemPromptText });
+    mensajesParaGroq = mensajesParaGroq.concat(historial);
+    if (userMessage) mensajesParaGroq.push({ role: 'user', content: String(userMessage.content) });
 
-      // Caché de prompts: si este mismo system prompt (por agente+usuario) se usó
-      // hace menos de PROMPT_CACHE_TTL_MS, no se vuelve a cobrar por esos tokens.
-      cacheResult = checkAndUpdatePromptCache(req.auth.sub, agentId, systemPromptText);
-    } else {
-      mensajesParaGroq = Array.isArray(messages) ? messages : [{ role: 'user', content: 'Hola' }];
-    }
+    // Caché de prompts: si este mismo system prompt (por agente+usuario) se usó
+    // hace menos de PROMPT_CACHE_TTL_MS, no se vuelve a cobrar por esos tokens.
+    cacheResult = checkAndUpdatePromptCache(authSub, agentId, systemPromptText);
+  } else {
+    mensajesParaGroq = Array.isArray(messages) ? messages : [{ role: 'user', content: 'Hola' }];
+  }
 
-    const lastUserMsg = mensajesParaGroq.filter(m => m.role === 'user').slice(-1)[0]?.content || '';
-    if (needsWebSearch(lastUserMsg)) {
-      const searchResults = await webSearch(lastUserMsg);
-      if (searchResults) {
-        const webCtx = `\n\n[CONTEXTO WEB - ${new Date().toLocaleDateString('es-ES')}]\n${searchResults}\n[FIN CONTEXTO WEB]\nUsa este contexto para responder con información actualizada.`;
-        const sysIdx = mensajesParaGroq.findIndex(m => m.role === 'system');
-        if (sysIdx >= 0) {
-          mensajesParaGroq[sysIdx] = { ...mensajesParaGroq[sysIdx], content: mensajesParaGroq[sysIdx].content + webCtx };
-        } else {
-          mensajesParaGroq.unshift({ role: 'system', content: `Eres Zoco IA, un asistente útil y preciso.${webCtx}` });
-        }
-        console.log('🌐 Web search inyectado para:', lastUserMsg.slice(0, 60));
+  const lastUserMsg = mensajesParaGroq.filter(m => m.role === 'user').slice(-1)[0]?.content || '';
+  if (needsWebSearch(lastUserMsg)) {
+    const searchResults = await webSearch(lastUserMsg);
+    if (searchResults) {
+      const webCtx = `\n\n[CONTEXTO WEB - ${new Date().toLocaleDateString('es-ES')}]\n${searchResults}\n[FIN CONTEXTO WEB]\nUsa este contexto para responder con información actualizada.`;
+      const sysIdx = mensajesParaGroq.findIndex(m => m.role === 'system');
+      if (sysIdx >= 0) {
+        mensajesParaGroq[sysIdx] = { ...mensajesParaGroq[sysIdx], content: mensajesParaGroq[sysIdx].content + webCtx };
+      } else {
+        mensajesParaGroq.unshift({ role: 'system', content: `Eres Zoco IA, un asistente útil y preciso.${webCtx}` });
       }
+      console.log('🌐 Web search inyectado para:', lastUserMsg.slice(0, 60));
     }
+  }
 
-    const usandoOllama = !!OLLAMA_URL;
-    const inferUrl   = usandoOllama ? `${OLLAMA_URL.replace(/\/+$/, '')}/v1/chat/completions` : GROQ_API_URL;
-    const inferAuth  = usandoOllama ? 'Bearer ollama' : `Bearer ${GROQ_API_KEY}`;
-    const modeloFinal = usandoOllama
-      ? (OLLAMA_MODEL_MAP[modeloZocoia] || modeloZocoia)
-      : groqModel;
-    console.log(`[IA] ${modeloZocoia} → ${modeloFinal} via ${usandoOllama ? 'Ollama' : 'Groq'}`);
+  const usandoOllama = !!OLLAMA_URL;
+  const modeloFinal = usandoOllama
+    ? (OLLAMA_MODEL_MAP[modeloZocoia] || modeloZocoia)
+    : groqModel;
+  console.log(`[IA] ${modeloZocoia} → ${modeloFinal} via ${usandoOllama ? 'Ollama' : 'Groq'}`);
 
-    // Parámetros avanzados de IA por agente (num_predict / num_ctx / temperature),
-    // con límites de seguridad y valores por defecto si el agente no los define.
-    const clamp = (v, min, max, fallback) => {
-      const n = Number(v);
-      if (!Number.isFinite(n)) return fallback;
-      return Math.min(max, Math.max(min, n));
-    };
-    const numPredict = clamp(agenteData.num_predict, 256, 8192, 4096);
-    const numCtx = clamp(agenteData.num_ctx, 2048, 16384, 8192);
-    const temperature = clamp(req.body.temperature ?? agenteData.temperature, 0, 1.2, 0.7);
-    const maxTokens = req.body.max_tokens || numPredict;
+  // Parámetros avanzados de IA por agente (num_predict / num_ctx / temperature),
+  // con límites de seguridad y valores por defecto si el agente no los define.
+  const clamp = (v, min, max, fallback) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, n));
+  };
+  const numPredict = clamp(agenteData.num_predict, 256, 8192, 4096);
+  const numCtx = clamp(agenteData.num_ctx, 2048, 16384, 8192);
+  const temperature = clamp(temperatureInput ?? agenteData.temperature, 0, 1.2, 0.7);
+  const maxTokens = maxTokensInput || numPredict;
 
-    // options nativas de Ollama; solo tienen efecto cuando usandoOllama = true
-    const ollamaOptions = { num_predict: numPredict, num_ctx: numCtx };
+  // options nativas de Ollama; solo tienen efecto cuando usandoOllama = true
+  const ollamaOptions = { num_predict: numPredict, num_ctx: numCtx };
 
-    const allowedTools = agentId
-      ? (Array.isArray(agenteData.allowedTools) ? agenteData.allowedTools : ALL_TOOL_NAMES)
-      : [];
+  const allowedTools = agentId
+    ? (Array.isArray(agenteData.allowedTools) ? agenteData.allowedTools : ALL_TOOL_NAMES)
+    : [];
 
-    const callModel = (msgs, tools) =>
-      callChatModel({
-        usandoOllama,
-        ollamaUrl: OLLAMA_URL,
-        ollamaModel: modeloFinal,
-        groqModel,
-        messages: msgs,
-        maxTokens,
-        temperature,
-        tools,
-        ollamaOptions,
-      });
-
-    let respuesta;
-    let usage;
-
-    if (allowedTools.length > 0) {
-      const result = await runToolLoop({
-        messages: mensajesParaGroq,
-        callModel,
-        allowedTools,
-        workspacesRoot: WORKSPACES_ROOT,
-        workspaceId: agentId,
-      });
-      respuesta = result.finalMessage;
-      usage = result.usage;
-    } else {
-      const data = await callModel(mensajesParaGroq, undefined);
-      respuesta = data.choices?.[0]?.message?.content || '';
-      usage = data.usage || {};
-    }
-
-    if (agentId && userMessage?.content) {
-      db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)')
-        .run(uuidv4(), agentId, req.auth.sub, 'user', String(userMessage.content));
-      db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)')
-        .run(uuidv4(), agentId, req.auth.sub, 'assistant', respuesta);
-    }
-
-    const totalTokens = usage.total_tokens || 0;
-    const tokensConDescuento = cacheResult.hit ? Math.max(0, totalTokens - Math.round(cacheResult.cachedTokens * 0.9)) : totalTokens;
-    const costeEuros = tokensConDescuento * 0.000002;
-    if (costeEuros > 0) {
-      db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)')
-        .run(uuidv4(), req.auth.sub, costeEuros, 'gasto', `Groq ${groqModel}${cacheResult.hit ? ' (caché de prompt)' : ''}`);
-      db.prepare('UPDATE users SET creditos = MAX(0, creditos - ?) WHERE id = ?')
-        .run(costeEuros, req.auth.sub);
-    }
-
-    res.json({
-      choices: [{ message: { role: 'assistant', content: respuesta } }],
-      usage: {
-        input_tokens: usage.prompt_tokens || 0,
-        output_tokens: usage.completion_tokens || 0,
-        total_tokens: totalTokens,
-        cache_read_tokens: cacheResult.hit ? cacheResult.cachedTokens : 0,
-      },
-      model: groqModel,
+  const callModel = (msgs, tools) =>
+    callChatModel({
+      usandoOllama,
+      ollamaUrl: OLLAMA_URL,
+      ollamaModel: modeloFinal,
+      groqModel,
+      messages: msgs,
+      maxTokens,
+      temperature,
+      tools,
+      ollamaOptions,
     });
 
+  let respuesta;
+  let usage;
+
+  if (allowedTools.length > 0) {
+    const result = await runToolLoop({
+      messages: mensajesParaGroq,
+      callModel,
+      allowedTools,
+      workspacesRoot: WORKSPACES_ROOT,
+      workspaceId: agentId,
+    });
+    respuesta = result.finalMessage;
+    usage = result.usage;
+  } else {
+    const data = await callModel(mensajesParaGroq, undefined);
+    respuesta = data.choices?.[0]?.message?.content || '';
+    usage = data.usage || {};
+  }
+
+  if (agentId && userMessage?.content) {
+    db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)')
+      .run(uuidv4(), agentId, authSub, 'user', String(userMessage.content));
+    db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)')
+      .run(uuidv4(), agentId, authSub, 'assistant', respuesta);
+  }
+
+  const totalTokens = usage.total_tokens || 0;
+  const tokensConDescuento = cacheResult.hit ? Math.max(0, totalTokens - Math.round(cacheResult.cachedTokens * 0.9)) : totalTokens;
+  const costeEuros = tokensConDescuento * 0.000002;
+  if (costeEuros > 0) {
+    db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)')
+      .run(uuidv4(), authSub, costeEuros, 'gasto', `Groq ${groqModel}${cacheResult.hit ? ' (caché de prompt)' : ''}`);
+    db.prepare('UPDATE users SET creditos = MAX(0, creditos - ?) WHERE id = ?')
+      .run(costeEuros, authSub);
+  }
+
+  return {
+    choices: [{ message: { role: 'assistant', content: respuesta } }],
+    usage: {
+      input_tokens: usage.prompt_tokens || 0,
+      output_tokens: usage.completion_tokens || 0,
+      total_tokens: totalTokens,
+      cache_read_tokens: cacheResult.hit ? cacheResult.cachedTokens : 0,
+    },
+    model: groqModel,
+  };
+}
+
+app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
+  try {
+    const result = await processChatCompletion(req.auth.sub, req.body || {});
+    res.json(result);
   } catch (err) {
     console.error('Error inferencia:', err);
     const status = err.status || 500;
-    res.status(status).json({ error: err.message || 'Error interno al procesar la solicitud' });
+    res.status(status).json({ error: err.message || 'Error interno al procesar la solicitud', ...(err.code ? { code: err.code } : {}) });
   }
 });
 
 // Adaptador para el Dashboard: el frontend llama a POST /api/chat con
-// { message, agentId, model, history } y espera { response }. Toda la lógica
-// real (créditos, memoria de agente, caché de prompts, Ollama/Groq) ya vive
-// en /v1/chat/completions, así que aquí solo traducimos el contrato y
-// reenviamos la petición internamente, sin duplicar nada.
+// { message, agentId, model, history } y espera { response }. Reutiliza
+// processChatCompletion() directamente (llamada de función, no de red), así
+// que toda la lógica de créditos/memoria/Ollama-Groq sigue siendo una única
+// fuente de verdad y no hay ningún salto de red que se pueda quedar colgado.
 app.post('/api/chat', authMiddleware, async (req, res) => {
   try {
     const { message, agentId, model, history } = req.body || {};
@@ -573,28 +583,13 @@ app.post('/api/chat', authMiddleware, async (req, res) => {
 
     const messages = [...historialMensajes, { role: 'user', content: String(message) }];
 
-    const internalUrl = `http://localhost:${port}/v1/chat/completions`;
-    const internalResp = await fetch(internalUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: req.headers.authorization || '',
-      },
-      body: JSON.stringify({ agentId, model, messages }),
-    });
-
-    const data = await internalResp.json();
-
-    if (!internalResp.ok) {
-      return res.status(internalResp.status).json({ error: data.error || 'Error al procesar el chat' });
-    }
-
-    const respuesta = data.choices?.[0]?.message?.content || '';
-    res.json({ response: respuesta, usage: data.usage, model: data.model });
+    const result = await processChatCompletion(req.auth.sub, { agentId, model, messages });
+    res.json({ response: result.choices?.[0]?.message?.content || '', usage: result.usage, model: result.model });
 
   } catch (err) {
     console.error('Error en /api/chat:', err);
-    res.status(500).json({ error: 'Error interno al procesar el mensaje' });
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message || 'Error interno al procesar el mensaje', ...(err.code ? { code: err.code } : {}) });
   }
 });
 
