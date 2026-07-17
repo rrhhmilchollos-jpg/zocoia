@@ -157,14 +157,10 @@ const GROQ_MODEL_MAP = {
 };
 
 const OLLAMA_MODEL_MAP = {
-  'zoco-flash': 'llama3.2',
-  'zoco-plus':  'llama3.2',
-  'zoco-max':   'mistral-nemo',
-  'zoco-lab':   'mistral-nemo',
-  'maris-velox-1b': 'llama3.2',
-  'maris-core-7b':  'llama3.2',
-  'maris-pro-32b':  'mistral-nemo',
-  'maris-beta-70b': 'mistral-nemo',
+  'zoco-flash': 'Zoco-Flash',
+  'zoco-plus':  'Zoco-Plus',
+  'zoco-max':   'Zoco-Max',
+  'zoco-lab':   'Zoco-Lab'
 };
 
 const OLLAMA_URL = process.env.OLLAMA_URL;
