@@ -39,8 +39,6 @@ console.log(`🗄️ Usando base de datos en: ${DB_PATH}`);
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
-// Workspaces de los agentes (para createFile/createFolder/readFile/executeCode)
-// viven en el mismo volumen persistente que la BD, así sobreviven a redeploys.
 const WORKSPACES_ROOT = makeWorkspacesRoot(dbDir);
 fs.mkdirSync(WORKSPACES_ROOT, { recursive: true });
 
@@ -134,78 +132,60 @@ db.exec(`
   );
 `);
 
-// Migración simple: añade la columna modelo_activo si no existe todavía.
 const userColumns = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
 if (!userColumns.includes('modelo_activo')) {
-  db.exec("ALTER TABLE users ADD COLUMN modelo_activo TEXT DEFAULT 'maris-core-7b'");
+  db.exec("ALTER TABLE users ADD COLUMN modelo_activo TEXT DEFAULT 'zoco-plus'");
 }
 
 const RESOURCE_TYPES = ['agente', 'archivo', 'habilidad', 'lote', 'sesion', 'implementacion', 'entorno', 'credencial', 'memoria'];
 
-// Modelos Groq disponibles con sus IDs reales
-// Nombres válidos — todos los identificadores que acepta la API
 const MODELOS_VALIDOS = [
-  // Zoco (nombres canónicos del frontend)
-  'zoco-haiku-4-5', 'zoco-sonnet-5', 'zoco-opus-4-8', 'zoco-fable-5',
-  // Legacy
+  'zoco-flash', 'zoco-plus', 'zoco-max', 'zoco-lab',
   'maris-velox', 'maris-core', 'maris-pro', 'maris-beta',
   'maris-velox-1b', 'maris-core-7b', 'maris-pro-32b', 'maris-beta-70b',
 ];
 
-// Mapa: nombre del frontend → modelo real en GROQ (cuando no hay Ollama)
 const GROQ_MODEL_MAP = {
-  'zoco-haiku-4-5': 'llama-3.3-70b-versatile',   // más rápido disponible en Groq
-  'zoco-sonnet-5':  'llama-3.3-70b-versatile',
-  'zoco-opus-4-8':  'llama-3.3-70b-versatile',
-  'zoco-fable-5':   'llama-3.3-70b-versatile',
-  // Legacy
+  'zoco-flash': 'llama-3.3-70b-versatile',
+  'zoco-plus':  'llama-3.3-70b-versatile',
+  'zoco-max':   'llama-3.3-70b-versatile',
+  'zoco-lab':   'llama-3.3-70b-versatile',
   'maris-velox': 'llama-3.3-70b-versatile', 'maris-velox-1b': 'llama-3.3-70b-versatile',
   'maris-core':  'llama-3.3-70b-versatile', 'maris-core-7b':  'llama-3.3-70b-versatile',
   'maris-pro':   'llama-3.3-70b-versatile', 'maris-pro-32b':  'llama-3.3-70b-versatile',
   'maris-beta':  'llama-3.3-70b-versatile', 'maris-beta-70b': 'llama-3.3-70b-versatile',
 };
 
-// Mapa: nombre del frontend → modelo REAL en Ollama local
-// Estos son los nombres exactos que tienes clonados con `ollama cp`
 const OLLAMA_MODEL_MAP = {
-  'zoco-haiku-4-5': 'llama3.2',        // el más rápido y ligero
-  'zoco-sonnet-5':  'llama3.2',        // equilibrado uso general
-  'zoco-opus-4-8':  'mistral-nemo',    // potente para razonamiento
-  'zoco-fable-5':   'mistral-nemo',    // avanzado/experimental
-  // Legacy por si acaso
+  'zoco-flash': 'llama3.2',
+  'zoco-plus':  'llama3.2',
+  'zoco-max':   'mistral-nemo',
+  'zoco-lab':   'mistral-nemo',
   'maris-velox-1b': 'llama3.2',
   'maris-core-7b':  'llama3.2',
   'maris-pro-32b':  'mistral-nemo',
   'maris-beta-70b': 'mistral-nemo',
 };
 
-// Si hay OLLAMA_URL (Ngrok), usamos Ollama local; si no, Groq cloud
-const OLLAMA_URL = process.env.OLLAMA_URL; // ej: https://xxxx.ngrok-free.app
+const OLLAMA_URL = process.env.OLLAMA_URL;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
-// ─── Web Search con DuckDuckGo (sin API key, sin dependencias extra) ──────────
 async function webSearch(query) {
   try {
-    // DuckDuckGo Instant Answer API — pública y sin clave
     const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
     const res = await fetch(url, { headers: { 'User-Agent': 'ZocoIA/1.0' }, signal: AbortSignal.timeout(5000) });
     if (!res.ok) return null;
     const data = await res.json();
 
     const results = [];
-
-    // Respuesta directa
     if (data.AbstractText) results.push(`Resumen: ${data.AbstractText}`);
-
-    // Resultados relacionados
     if (data.RelatedTopics) {
       data.RelatedTopics.slice(0, 5).forEach(t => {
         if (t.Text) results.push(t.Text);
       });
     }
 
-    // Resultados de búsqueda adicionales via HTML scraping ligero
     try {
       const htmlRes = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ZocoIA/1.0)' },
@@ -228,7 +208,6 @@ async function webSearch(query) {
   }
 }
 
-// Detectar si el mensaje necesita búsqueda web
 function needsWebSearch(text) {
   if (!text) return false;
   const keywords = [
@@ -287,14 +266,46 @@ function publicUser(user) {
     isSupport: !!user.is_support,
     creditos: user.creditos,
     activo: !!user.activo,
-    modeloActivo: user.modelo_activo || 'maris-core-7b',
+    modeloActivo: user.modelo_activo || 'zoco-plus',
     createdAt: user.created_at,
   };
 }
 
 function estimateTokens(text) {
-  // Estimación simple (~4 caracteres por token), suficiente para simular la caché.
   return Math.max(1, Math.ceil((text || '').length / 4));
+}
+
+function buildCacheKey(userId, agentId, systemPromptText) {
+  return crypto.createHash('sha256').update(`${userId}::${agentId || 'general'}::${systemPromptText}`).digest('hex');
+}
+
+/**
+ * Comprueba si el system prompt de esta conversación ya está "cacheado" (se usó
+ * hace menos de PROMPT_CACHE_TTL_MS). Si es así, devuelve el descuento de tokens
+ * a aplicar en el coste (no se vuelve a cobrar por reprocesar ese prefijo).
+ * Si no, crea/renueva la entrada de caché para la próxima llamada.
+ */
+function checkAndUpdatePromptCache(userId, agentId, systemPromptText) {
+  const cacheKey = buildCacheKey(userId, agentId, systemPromptText);
+  const tokenEstimate = estimateTokens(systemPromptText);
+  const now = Date.now();
+
+  const existing = db.prepare('SELECT * FROM prompt_cache WHERE cache_key = ?').get(cacheKey);
+
+  if (existing && existing.expires_at > now) {
+    db.prepare('UPDATE prompt_cache SET hits = hits + 1, expires_at = ? WHERE cache_key = ?')
+      .run(now + PROMPT_CACHE_TTL_MS, cacheKey);
+    return { hit: true, cachedTokens: existing.token_estimate };
+  }
+
+  if (existing) {
+    db.prepare('UPDATE prompt_cache SET hits = 0, token_estimate = ?, expires_at = ? WHERE cache_key = ?')
+      .run(tokenEstimate, now + PROMPT_CACHE_TTL_MS, cacheKey);
+  } else {
+    db.prepare('INSERT INTO prompt_cache (cache_key, agente_id, user_id, token_estimate, hits, expires_at) VALUES (?, ?, ?, ?, 0, ?)')
+      .run(cacheKey, agentId || 'general', userId, tokenEstimate, now + PROMPT_CACHE_TTL_MS);
+  }
+  return { hit: false, cachedTokens: 0 };
 }
 
 function authMiddleware(req, res, next) {
@@ -336,13 +347,8 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'Zoco IA conectado con éxito' });
 });
 
-/**
- * Llama a un endpoint /chat/completions estilo OpenAI (Groq o el compat de Ollama),
- * con timeout de 30s y fallback automático a Groq si Ollama no responde a tiempo.
- * Devuelve el JSON crudo de la respuesta (con choices[].message y usage).
- */
-async function callChatModel({ usandoOllama, ollamaUrl, ollamaModel, groqModel, messages, maxTokens, temperature, tools }) {
-  async function doFetch(url, auth, model) {
+async function callChatModel({ usandoOllama, ollamaUrl, ollamaModel, groqModel, messages, maxTokens, temperature, tools, ollamaOptions }) {
+  async function doFetch(url, auth, model, extraOllamaOptions) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 30000);
     try {
@@ -355,6 +361,10 @@ async function callChatModel({ usandoOllama, ollamaUrl, ollamaModel, groqModel, 
           max_tokens: maxTokens,
           temperature,
           ...(tools && tools.length ? { tools } : {}),
+          // 'options' es una extensión propia de Ollama (num_ctx, num_predict, etc.)
+          // sobre el endpoint compatible con OpenAI. Groq la ignora si se le llegara
+          // a enviar, así que solo se añade cuando se llama de verdad a Ollama.
+          ...(extraOllamaOptions ? { options: extraOllamaOptions } : {}),
         }),
         signal: controller.signal,
       });
@@ -372,7 +382,7 @@ async function callChatModel({ usandoOllama, ollamaUrl, ollamaModel, groqModel, 
 
   if (usandoOllama) {
     try {
-      return await doFetch(`${ollamaUrl.replace(/\/+$/, '')}/v1/chat/completions`, 'Bearer ollama', ollamaModel);
+      return await doFetch(`${ollamaUrl.replace(/\/+$/, '')}/v1/chat/completions`, 'Bearer ollama', ollamaModel, ollamaOptions);
     } catch (err) {
       if (err.name === 'AbortError' && GROQ_API_KEY) {
         console.warn('Ollama timeout — usando Groq como fallback');
@@ -396,7 +406,6 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
     return res.status(503).json({ error: 'GROQ_API_KEY no configurada en el servidor' });
   }
 
-  // Bloquear si el usuario no tiene créditos
   const userCheck = db.prepare('SELECT creditos, activo FROM users WHERE id = ?').get(req.auth.sub);
   if (!userCheck || !userCheck.activo) {
     return res.status(403).json({ error: 'Cuenta desactivada' });
@@ -408,43 +417,41 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
   const { agentId, messages, model } = req.body || {};
   const userMessage = Array.isArray(messages) && messages.length ? messages[messages.length - 1] : null;
 
-  // Determinar modelo Groq a usar
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.auth.sub);
-  const modeloZocoia = model || user?.modelo_activo || 'maris-core';
-  const groqModel = GROQ_MODEL_MAP[modeloZocoia] || GROQ_MODEL_MAP['maris-core'];
+  const modeloZocoia = model || user?.modelo_activo || 'zoco-plus';
+  const groqModel = GROQ_MODEL_MAP[modeloZocoia] || GROQ_MODEL_MAP['zoco-plus'];
 
   let agente = null;
   let agenteData = {};
+  let cacheResult = { hit: false, cachedTokens: 0 };
 
   try {
     let mensajesParaGroq = [];
+    let systemPromptText = '';
 
     if (agentId) {
-      // Con agente: usar memoria persistente
       agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(agentId, req.auth.sub, 'agente');
       if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
 
       agenteData = agente.data ? JSON.parse(agente.data) : {};
       const historial = db.prepare('SELECT role, content FROM agent_memory WHERE agente_id = ? ORDER BY created_at ASC LIMIT 50').all(agentId);
 
-      if (agenteData.systemPrompt) {
-        mensajesParaGroq.push({ role: 'system', content: agenteData.systemPrompt });
-      } else {
-        mensajesParaGroq.push({ role: 'system', content: `Eres ${agente.name}, un asistente de IA útil y preciso.` });
-      }
+      systemPromptText = agenteData.systemPrompt || `Eres ${agente.name}, un asistente de IA útil y preciso.`;
+      mensajesParaGroq.push({ role: 'system', content: systemPromptText });
       mensajesParaGroq = mensajesParaGroq.concat(historial);
       if (userMessage) mensajesParaGroq.push({ role: 'user', content: String(userMessage.content) });
+
+      // Caché de prompts: si este mismo system prompt (por agente+usuario) se usó
+      // hace menos de PROMPT_CACHE_TTL_MS, no se vuelve a cobrar por esos tokens.
+      cacheResult = checkAndUpdatePromptCache(req.auth.sub, agentId, systemPromptText);
     } else {
-      // Sin agente: pasar mensajes directamente
       mensajesParaGroq = Array.isArray(messages) ? messages : [{ role: 'user', content: 'Hola' }];
     }
 
-    // Web Search automático si el mensaje parece necesitar info actual
     const lastUserMsg = mensajesParaGroq.filter(m => m.role === 'user').slice(-1)[0]?.content || '';
     if (needsWebSearch(lastUserMsg)) {
       const searchResults = await webSearch(lastUserMsg);
       if (searchResults) {
-        // Inyectar contexto web en el system prompt
         const webCtx = `\n\n[CONTEXTO WEB - ${new Date().toLocaleDateString('es-ES')}]\n${searchResults}\n[FIN CONTEXTO WEB]\nUsa este contexto para responder con información actualizada.`;
         const sysIdx = mensajesParaGroq.findIndex(m => m.role === 'system');
         if (sysIdx >= 0) {
@@ -456,22 +463,29 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
       }
     }
 
-    // Llamada a Ollama local (si OLLAMA_URL está activa) o Groq cloud
     const usandoOllama = !!OLLAMA_URL;
-    // Ollama expone /api/chat (nativo) o /v1/chat/completions (modo OpenAI-compat)
-    // Usamos /v1/chat/completions que es el modo compatible con OpenAI
     const inferUrl   = usandoOllama ? `${OLLAMA_URL.replace(/\/+$/, '')}/v1/chat/completions` : GROQ_API_URL;
     const inferAuth  = usandoOllama ? 'Bearer ollama' : `Bearer ${GROQ_API_KEY}`;
-    // Mapear al nombre real del modelo: Ollama usa nombres clonados, Groq usa sus propios
     const modeloFinal = usandoOllama
       ? (OLLAMA_MODEL_MAP[modeloZocoia] || modeloZocoia)
       : groqModel;
     console.log(`[IA] ${modeloZocoia} → ${modeloFinal} via ${usandoOllama ? 'Ollama' : 'Groq'}`);
 
-    const maxTokens = req.body.max_tokens || 2048;
-    const temperature = req.body.temperature ?? 0.7;
+    // Parámetros avanzados de IA por agente (num_predict / num_ctx / temperature),
+    // con límites de seguridad y valores por defecto si el agente no los define.
+    const clamp = (v, min, max, fallback) => {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return fallback;
+      return Math.min(max, Math.max(min, n));
+    };
+    const numPredict = clamp(agenteData.num_predict, 256, 8192, 4096);
+    const numCtx = clamp(agenteData.num_ctx, 2048, 16384, 8192);
+    const temperature = clamp(req.body.temperature ?? agenteData.temperature, 0, 1.2, 0.7);
+    const maxTokens = req.body.max_tokens || numPredict;
 
-    // Tools solo se activan si hay un agente detrás y tiene tools permitidas
+    // options nativas de Ollama; solo tienen efecto cuando usandoOllama = true
+    const ollamaOptions = { num_predict: numPredict, num_ctx: numCtx };
+
     const allowedTools = agentId
       ? (Array.isArray(agenteData.allowedTools) ? agenteData.allowedTools : ALL_TOOL_NAMES)
       : [];
@@ -486,13 +500,13 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
         maxTokens,
         temperature,
         tools,
+        ollamaOptions,
       });
 
     let respuesta;
     let usage;
 
     if (allowedTools.length > 0) {
-      // Con agente y tools habilitadas: loop de function-calling
       const result = await runToolLoop({
         messages: mensajesParaGroq,
         callModel,
@@ -503,13 +517,11 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
       respuesta = result.finalMessage;
       usage = result.usage;
     } else {
-      // Sin agente, o agente sin tools: llamada simple, igual que antes
       const data = await callModel(mensajesParaGroq, undefined);
       respuesta = data.choices?.[0]?.message?.content || '';
       usage = data.usage || {};
     }
 
-    // Persistir en memoria del agente si aplica
     if (agentId && userMessage?.content) {
       db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)')
         .run(uuidv4(), agentId, req.auth.sub, 'user', String(userMessage.content));
@@ -517,11 +529,12 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
         .run(uuidv4(), agentId, req.auth.sub, 'assistant', respuesta);
     }
 
-    // Registrar uso y descontar créditos
-    const costeEuros = (usage.total_tokens || 0) * 0.000002; // ~0.002€ por 1000 tokens
+    const totalTokens = usage.total_tokens || 0;
+    const tokensConDescuento = cacheResult.hit ? Math.max(0, totalTokens - Math.round(cacheResult.cachedTokens * 0.9)) : totalTokens;
+    const costeEuros = tokensConDescuento * 0.000002;
     if (costeEuros > 0) {
       db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)')
-        .run(uuidv4(), req.auth.sub, costeEuros, 'gasto', `Groq ${groqModel}`);
+        .run(uuidv4(), req.auth.sub, costeEuros, 'gasto', `Groq ${groqModel}${cacheResult.hit ? ' (caché de prompt)' : ''}`);
       db.prepare('UPDATE users SET creditos = MAX(0, creditos - ?) WHERE id = ?')
         .run(costeEuros, req.auth.sub);
     }
@@ -531,7 +544,8 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
       usage: {
         input_tokens: usage.prompt_tokens || 0,
         output_tokens: usage.completion_tokens || 0,
-        total_tokens: usage.total_tokens || 0,
+        total_tokens: totalTokens,
+        cache_read_tokens: cacheResult.hit ? cacheResult.cachedTokens : 0,
       },
       model: groqModel,
     });
@@ -543,7 +557,20 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
   }
 });
 
-// ─── Selección de modelo activo ────────────────────────────────────────────────
+app.get('/api/cache/stats', authMiddleware, (req, res) => {
+  const rows = db.prepare(
+    'SELECT cache_key, agente_id, hits, token_estimate, expires_at FROM prompt_cache WHERE user_id = ? AND expires_at > ?'
+  ).all(req.auth.sub, Date.now());
+  const totalHits = rows.reduce((sum, r) => sum + r.hits, 0);
+  const tokensAhorrados = rows.reduce((sum, r) => sum + (r.hits * Math.round(r.token_estimate * 0.9)), 0);
+  res.json({
+    entradasActivas: rows.length,
+    totalHits,
+    tokensAhorrados,
+    ahorroEstimadoEuros: tokensAhorrados * 0.000002,
+  });
+});
+
 app.put('/api/user/modelo', authMiddleware, (req, res) => {
   const { modelo } = req.body || {};
   if (!MODELOS_VALIDOS.includes(modelo)) return res.status(400).json({ error: 'Modelo no válido' });
@@ -554,7 +581,6 @@ app.put('/api/user/modelo', authMiddleware, (req, res) => {
   res.json({ user: publicUser(user) });
 });
 
-// ─── Memoria persistente por agente ─────────────────────────────────────────────
 app.get('/api/agentes/:id/memoria', authMiddleware, (req, res) => {
   const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(req.params.id, req.auth.sub, 'agente');
   if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
@@ -694,7 +720,6 @@ async function sendPasswordResetEmail(toEmail, resetLink) {
   }
 }
 
-// ─── Claves de API ──────────────────────────────────────────────────────────────
 app.get('/api/keys', authMiddleware, (req, res) => {
   const rows = db.prepare(
     'SELECT id, name, key_prefix, last_used_at, revoked, created_at FROM api_keys WHERE user_id = ? ORDER BY created_at DESC'
@@ -733,7 +758,6 @@ app.delete('/api/keys/:id', authMiddleware, (req, res) => {
   res.json({ ok: true });
 });
 
-// ─── Recursos genéricos ─────────────────────────────────────────────────────────
 app.get('/api/resources', authMiddleware, (req, res) => {
   const { type } = req.query;
   if (type && !RESOURCE_TYPES.includes(type)) return res.status(400).json({ error: 'Tipo de recurso no válido' });
@@ -790,7 +814,6 @@ app.delete('/api/resources/:id', authMiddleware, (req, res) => {
   res.json({ ok: true });
 });
 
-// ─── Facturación / uso real ─────────────────────────────────────────────────────
 app.get('/api/billing/summary', authMiddleware, (req, res) => {
   const user = getUserOr404(req.auth.sub, res);
   if (!user) return;
@@ -832,17 +855,14 @@ app.post('/api/billing/topup', authMiddleware, (req, res) => {
   res.json({ creditos: user.creditos });
 });
 
-// ─── Pagos con Viva.com ─────────────────────────────────────────────────────────
-
 const VIVA_CLIENT_ID     = process.env.VIVA_CLIENT_ID;
 const VIVA_CLIENT_SECRET = process.env.VIVA_CLIENT_SECRET;
 const VIVA_SOURCE_CODE   = process.env.VIVA_SOURCE_CODE;
-const VIVA_IS_DEMO       = process.env.VIVA_IS_DEMO !== 'false'; // true por defecto hasta producción
+const VIVA_IS_DEMO       = process.env.VIVA_IS_DEMO !== 'false';
 const VIVA_BASE          = VIVA_IS_DEMO ? 'https://demo.vivapayments.com' : 'https://www.vivapayments.com';
 const VIVA_API_BASE      = VIVA_IS_DEMO ? 'https://demo-api.vivapayments.com' : 'https://api.vivapayments.com';
 const APP_URL            = process.env.APP_URL || 'https://zocoia-production.up.railway.app';
 
-// Paquetes de créditos disponibles
 const CREDIT_PACKS = [
   { id: 'starter',  euros: 5,   credits: 5,   label: 'Starter'     },
   { id: 'basic',    euros: 10,  credits: 11,  label: 'Basic'       },
@@ -866,12 +886,10 @@ async function getVivaToken() {
   return data.access_token;
 }
 
-// Listar paquetes disponibles
 app.get('/api/payments/packs', authMiddleware, (req, res) => {
   res.json(CREDIT_PACKS);
 });
 
-// Historial de pagos del usuario
 app.get('/api/payments/history', authMiddleware, (req, res) => {
   const payments = db.prepare(
     'SELECT * FROM payments WHERE user_id = ? ORDER BY created_at DESC LIMIT 50'
@@ -879,7 +897,6 @@ app.get('/api/payments/history', authMiddleware, (req, res) => {
   res.json(payments);
 });
 
-// Crear orden de pago en Viva.com
 app.post('/api/payments/create', authMiddleware, async (req, res) => {
   if (!VIVA_CLIENT_ID || !VIVA_CLIENT_SECRET || !VIVA_SOURCE_CODE) {
     return res.status(503).json({ error: 'Pasarela de pago no configurada todavía' });
@@ -895,7 +912,6 @@ app.post('/api/payments/create', authMiddleware, async (req, res) => {
   try {
     const token = await getVivaToken();
 
-    // Crear orden de pago en Viva
     const orderRes = await fetch(`${VIVA_API_BASE}/checkout/v2/orders`, {
       method: 'POST',
       headers: {
@@ -903,7 +919,7 @@ app.post('/api/payments/create', authMiddleware, async (req, res) => {
         'Authorization': `Bearer ${token}`,
       },
       body: JSON.stringify({
-        amount: Math.round(pack.euros * 100), // en céntimos
+        amount: Math.round(pack.euros * 100),
         customerTrns: `Zoco IA — ${pack.label} (${pack.credits} créditos)`,
         customer: { email: user.email, fullName: user.nombre },
         paymentTimeout: 1800,
@@ -914,13 +930,11 @@ app.post('/api/payments/create', authMiddleware, async (req, res) => {
         merchantTrns: `zocoia-${req.auth.sub}-${pack.id}`,
         sourceCode: VIVA_SOURCE_CODE,
         tags: [`user:${req.auth.sub}`, `pack:${pack.id}`],
-        // Solo Visa/Mastercard débito o crédito — sin prepago ni regalo
         paymentMethodFees: [],
         disabledPaymentMethods: [
           'paypal', 'mbway', 'mbreference', 'mobilepay',
           'cash', 'wallet', 'prepaid',
         ],
-        // Forzar solo tarjetas (TypeId 0 = card)
         allowedPaymentMethods: [0],
       }),
     });
@@ -934,15 +948,12 @@ app.post('/api/payments/create', authMiddleware, async (req, res) => {
     const orderData = await orderRes.json();
     const orderCode = orderData.orderCode;
 
-    // Guardar pago pendiente en BD
     const paymentId = uuidv4();
     db.prepare(
       'INSERT INTO payments (id, user_id, amount, credits, status, provider, order_code) VALUES (?, ?, ?, ?, ?, ?, ?)'
     ).run(paymentId, req.auth.sub, pack.euros, pack.credits, 'pending', 'viva', String(orderCode));
 
-    // URL de pago de Viva
-    // color negro Zoco IA, solo tarjeta, idioma español
-        const checkoutUrl = `${VIVA_BASE}/web/checkout?ref=${orderCode}&color=1a1a2e&langs=es&paymentMethod=0`;
+    const checkoutUrl = `${VIVA_BASE}/web/checkout?ref=${orderCode}&color=1a1a2e&langs=es&paymentMethod=0`;
     res.json({ checkoutUrl, orderCode, paymentId });
 
   } catch (err) {
@@ -951,12 +962,9 @@ app.post('/api/payments/create', authMiddleware, async (req, res) => {
   }
 });
 
-// Webhook de Viva.com — confirmar pago completado
 app.post('/api/payments/webhook', async (req, res) => {
   try {
     const { EventTypeId, EventData } = req.body || {};
-
-    // EventTypeId 1796 = Transaction Payment Created (pago completado)
     if (EventTypeId !== 1796) return res.json({ ok: true });
 
     const { OrderCode, TransactionId, Amount } = EventData || {};
@@ -968,7 +976,6 @@ app.post('/api/payments/webhook', async (req, res) => {
       return res.json({ ok: true });
     }
 
-    // Marcar pago como completado y añadir créditos al usuario
     db.prepare('UPDATE payments SET status = ?, transaction_id = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?')
       .run('completed', TransactionId, payment.id);
 
@@ -987,14 +994,12 @@ app.post('/api/payments/webhook', async (req, res) => {
   }
 });
 
-// Verificación GET del webhook (Viva lo requiere — debe devolver {"Key":"..."})
 app.get('/api/payments/webhook', (req, res) => {
   const key = String(process.env.VIVA_WEBHOOK_KEY || '');
   res.setHeader('Content-Type', 'application/json');
   res.end(JSON.stringify({ Key: key }));
 });
 
-// Página de éxito tras pago
 app.get('/api/payments/success', authMiddleware, (req, res) => {
   const { s, orderCode } = req.query;
   const payment = db.prepare('SELECT * FROM payments WHERE order_code = ?').get(String(orderCode));
@@ -1004,10 +1009,6 @@ app.get('/api/payments/success', authMiddleware, (req, res) => {
   res.json({ ok: false, message: 'Pago pendiente de confirmación' });
 });
 
-// ─── Bloqueo por créditos insuficientes en inferencia ───────────────────────────
-// (ya integrado en /v1/chat/completions — se descuentan automáticamente y se bloquea si creditos < 0)
-
-// ─── Ollama ──────────────────────────────────────────────────────────────────────
 app.get('/api/system/ollama', authMiddleware, async (req, res) => {
   const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
   try {
@@ -1020,7 +1021,6 @@ app.get('/api/system/ollama', authMiddleware, async (req, res) => {
   }
 });
 
-// ─── Admin: stats globales ─────────────────────────────────────────────────────
 app.get('/admin/stats', authMiddleware, requireAdmin, (req, res) => {
   const totalUsuarios = db.prepare('SELECT COUNT(*) as n FROM users').get().n;
   const usuariosActivos = db.prepare("SELECT COUNT(*) as n FROM users WHERE activo = 1").get().n;
@@ -1037,25 +1037,21 @@ app.get('/admin/stats', authMiddleware, requireAdmin, (req, res) => {
   res.json({ totalUsuarios, usuariosActivos, ingresosTotal, llamadasHoy, ultimosPagos, vivaConfigurado, ollamaOnline });
 });
 
-// ─── Admin: logs de uso ─────────────────────────────────────────────────────────
 app.get('/admin/logs', authMiddleware, requireAdmin, (req, res) => {
   const logs = db.prepare('SELECT * FROM usage_log ORDER BY created_at DESC LIMIT 100').all();
   res.json(logs);
 });
 
-// ─── Admin: listar clientes ─────────────────────────────────────────────────────
 app.get('/admin/clientes', authMiddleware, requireAdmin, (req, res) => {
   const users = db.prepare('SELECT id, email, nombre, is_admin, is_support, creditos, activo, created_at FROM users ORDER BY created_at DESC').all();
   res.json(users.map(publicUser));
 });
 
-// ─── Admin: editar un cliente ───────────────────────────────────────────────────
 app.put('/admin/clientes/:id', authMiddleware, requireAdmin, (req, res) => {
   const target = getUserOr404(req.params.id, res);
   if (!target) return;
 
   const { creditos, activo, isAdmin, isSupport, nombre, _addCredits } = req.body || {};
-  // Si _addCredits=true, sumamos los créditos en lugar de reemplazar
   const newCreditos = creditos !== undefined
     ? (_addCredits ? target.creditos + Number(creditos) : Number(creditos))
     : target.creditos;
@@ -1072,7 +1068,6 @@ app.put('/admin/clientes/:id', authMiddleware, requireAdmin, (req, res) => {
   res.json(publicUser(updated));
 });
 
-// ─── Servir el frontend ──────────────────────────────────────────────────────────
 const publicDir = path.join(__dirname, 'public');
 if (fs.existsSync(publicDir)) {
   app.use(express.static(publicDir));
