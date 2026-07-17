@@ -14,10 +14,10 @@ function fmtEUR(n: number) { return `${(n || 0).toFixed(2)} €`; }
 function fmtDate(s: string) { return new Date(s).toLocaleDateString('es-ES'); }
 
 const MODELOS = [
-  { id: 'zoco-lab', name: 'Zoco Lab', ollamaModel: 'Zoco-Lab' },
-  { id: 'zoco-max', name: 'Zoco Max', ollamaModel: 'Zoco-Max' },
-  { id: 'zoco-plus', name: 'Zoco Plus', ollamaModel: 'Zoco-Plus' },
-  { id: 'zoco-flash', name: 'Zoco Flash', ollamaModel: 'Zoco-Flash' }
+  { id: 'zoco-lab', name: 'Zoco Lab', ollamaModel: 'Zoco-Lab', backend: 'zoco-lab', icon: '🧪', color: 'from-blue-500 to-indigo-600', tags: ['Rápido', 'Eficiente'], badge: 'Beta', nombre: 'Zoco Lab' },
+  { id: 'zoco-max', name: 'Zoco Max', ollamaModel: 'Zoco-Max', backend: 'zoco-max', icon: '🚀', color: 'from-purple-600 to-pink-600', tags: ['Potente', 'Creativo'], badge: 'Pro', nombre: 'Zoco Max' },
+  { id: 'zoco-plus', name: 'Zoco Plus', ollamaModel: 'Zoco-Plus', backend: 'zoco-plus', icon: '💎', color: 'from-amber-400 to-orange-600', tags: ['Equilibrado'], badge: 'Recomendado', nombre: 'Zoco Plus' },
+  { id: 'zoco-flash', name: 'Zoco Flash', ollamaModel: 'Zoco-Flash', backend: 'zoco-flash', icon: '⚡', color: 'from-green-400 to-cyan-500', tags: ['Ultra-rápido'], badge: 'Nuevo', nombre: 'Zoco Flash' }
 ];
 
 const RESOURCE_SECTIONS = [
@@ -329,177 +329,172 @@ export default function Dashboard() {
 
   const handleSelectModel = async (modelo: string) => {
     setSelectedModel(modelo);
-    await fetch(`${API_BASE}/api/user/modelo`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ modelo }) });
+    await fetch(`${API_BASE}/api/billing/model`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ modelo }) });
   };
 
   const handleBuyPack = async (packId: string) => {
     setPayingPack(packId);
     try {
       const r = await fetch(`${API_BASE}/api/payments/create`, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ packId }) });
-      const d = await r.json();
-      if (r.ok && d.checkoutUrl) window.open(d.checkoutUrl, '_blank');
-      else alert(d.error || 'Error al crear el pago');
+      if (r.ok) { const { url } = await r.json(); window.location.href = url; }
     } finally { setPayingPack(null); }
   };
 
-  const handleToggleMemoria = async (agentId: string) => {
-    if (expandedAgentId === agentId) { setExpandedAgentId(null); return; }
-    setExpandedAgentId(agentId);
-    load(`/api/agentes/${agentId}/memoria`, d => setAgentMemory(p => ({ ...p, [agentId]: d })));
+  const handleOpenAgentChat = (a: Recurso) => {
+    setActiveAgent(a);
+    setActiveTab('chat');
   };
 
-  const handleClearMemoria = async (agentId: string) => {
-    if (!confirm('¿Borrar toda la memoria?')) return;
-    await fetch(`${API_BASE}/api/agentes/${agentId}/memoria`, { method: 'DELETE', headers: authHeaders() });
-    setAgentMemory(p => ({ ...p, [agentId]: { mensajes: [], cacheActiva: false } }));
+  const handleToggleMemoria = async (id: string) => {
+    setExpandedAgentId(p => p === id ? null : id);
+    if (expandedAgentId !== id && !agentMemory[id]) {
+      const r = await fetch(`${API_BASE}/api/resources/${id}/memory`, { headers: authHeaders() });
+      if (r.ok) { const d = await r.json(); setAgentMemory(p => ({ ...p, [id]: d })); }
+    }
   };
 
-  const handleAdminTopup = async (userId: string, email: string) => {
-    const amt = prompt(`Créditos a añadir a ${email}:`, '10'); if (!amt) return;
-    const r = await fetch(`${API_BASE}/admin/clientes/${userId}`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ creditos: Number(amt), _addCredits: true }) });
+  const handleClearMemoria = async (id: string) => {
+    if (!confirm('¿Borrar memoria?')) return;
+    const r = await fetch(`${API_BASE}/api/resources/${id}/memory`, { method: 'DELETE', headers: authHeaders() });
+    if (r.ok) setAgentMemory(p => ({ ...p, [id]: { mensajes: [], cacheActiva: false } }));
+  };
+
+  const handleAdminTopup = async (id: string, email: string) => {
+    const amount = prompt(`Créditos a añadir para ${email}:`, '10');
+    if (!amount) return;
+    const r = await fetch(`${API_BASE}/admin/topup`, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ userId: id, amount: parseFloat(amount) }) });
     if (r.ok) load('/admin/clientes', setAdminUsuarios);
   };
 
   const handleToggleUser = async (u: AdminUsuario) => {
-    const r = await fetch(`${API_BASE}/admin/clientes/${u.id}`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ activo: !u.activo }) });
+    const r = await fetch(`${API_BASE}/admin/clientes/${u.id}/toggle`, { method: 'POST', headers: authHeaders() });
     if (r.ok) load('/admin/clientes', setAdminUsuarios);
   };
 
-  const handleOpenAgentChat = (agente: Recurso) => {
-    setActiveAgent(agente);
-    setChatMessages([]);
-    setActiveTab('chat');
-  };
-
   const sendChat = async () => {
-    const msg = chatInput.trim(); if (!msg || chatLoading) return;
+    if (!chatInput.trim() || chatLoading) return;
+    const userMsg = { role: 'user', content: chatInput };
+    setChatMessages(p => [...p, userMsg]);
     setChatInput('');
-    const newMessages: ChatMsg[] = [...chatMessages, { role: 'user', content: msg }];
-    setChatMessages(newMessages);
     setChatLoading(true);
     try {
-      const r = await fetch(`${API_BASE}/v1/chat/completions`, {
-        method: 'POST', headers: authHeaders(),
+      const r = await fetch(`${API_BASE}/api/chat`, {
+        method: 'POST',
+        headers: authHeaders(),
         body: JSON.stringify({
-          messages: newMessages,
-          model: selectedModel,
+          message: chatInput,
           agentId: activeAgent?.id,
-        }),
+          model: selectedModel,
+          history: chatMessages
+        })
       });
-      const d = await r.json();
-      if (r.ok) setChatMessages(prev => [...prev, { role: 'assistant', content: d.choices?.[0]?.message?.content || '' }]);
-      else setChatMessages(prev => [...prev, { role: 'assistant', content: `Error: ${d.error || 'Sin respuesta'}` }]);
-    } catch {
-      setChatMessages(prev => [...prev, { role: 'assistant', content: 'Error de conexión con el servidor.' }]);
+      if (r.ok) {
+        const d = await r.json();
+        setChatMessages(p => [...p, { role: 'assistant', content: d.response }]);
+      }
     } finally { setChatLoading(false); }
   };
 
   const balance = billing?.creditos ?? 0;
   const spend = billing?.gastoEsteMes ?? 0;
-  const balanceLow = balance < 1;
-  const habilidadesDisponibles = resourcesByType['habilidad'] || [];
+  const balanceLow = balance <= 0.5;
 
-  const NavItem = ({ tab, label, icon }: { tab: string; label: string; icon: string }) => (
-    <button onClick={() => setActiveTab(tab)}
-      className={`w-full flex items-center space-x-2.5 px-3 py-2 rounded-lg text-left text-[13px] transition-colors ${activeTab === tab ? 'bg-[#2a2a2a] text-white font-medium' : 'text-gray-400 hover:text-gray-200 hover:bg-[#1e1e1e]'}`}>
-      <span className="text-base">{icon}</span><span>{label}</span>
-    </button>
-  );
-
-  const IconAction = ({ onClick, title, danger, children }: { onClick: (e: React.MouseEvent) => void; title: string; danger?: boolean; children: React.ReactNode }) => (
-    <button
-      onClick={(e) => { e.stopPropagation(); onClick(e); }}
-      title={title}
-      className={`text-xs border border-[#333] px-2 py-1 rounded-lg transition-colors ${danger ? 'text-gray-600 hover:text-red-400 hover:border-red-800/40' : 'text-gray-500 hover:text-purple-400 hover:border-purple-800/40'}`}
-    >
-      {children}
-    </button>
-  );
+  function IconAction({ children, onClick, title, danger }: { children: React.ReactNode, onClick: (e: React.MouseEvent) => void, title: string, danger?: boolean }) {
+    return (
+      <button onClick={(e) => { e.stopPropagation(); onClick(e); }} title={title}
+        className={`w-7 h-7 flex items-center justify-center rounded-lg border transition-colors text-xs ${danger ? 'border-red-900/30 text-red-500/70 hover:bg-red-500/10' : 'border-[#333] text-gray-500 hover:bg-[#252525] hover:text-gray-300'}`}>
+        {children}
+      </button>
+    );
+  }
 
   if (!isMounted) return null;
 
   return (
-    <div className="flex h-screen bg-[#111111] text-gray-200 font-sans overflow-hidden text-sm">
-
+    <div className="flex h-screen w-full bg-[#0a0a0a] text-gray-300 font-sans selection:bg-purple-500/30">
+      
       {/* SIDEBAR */}
-      <aside className={`${sidebarOpen ? 'w-60' : 'w-14'} bg-[#151515] border-r border-[#222] flex flex-col transition-all duration-200 shrink-0 h-full overflow-y-auto`}>
-        <div className="p-3 flex items-center justify-between border-b border-[#222]">
-          {sidebarOpen && (
-            <div className="flex items-center space-x-2">
-              <div className="w-6 h-6 bg-gradient-to-br from-purple-500 to-blue-600 rounded flex items-center justify-center text-white text-xs font-bold">Z</div>
-              <span className="font-semibold text-white text-sm">Zoco IA Console</span>
-            </div>
-          )}
-          <button onClick={() => setSidebarOpen(!sidebarOpen)} className="text-gray-500 hover:text-gray-300 p-1">
+      <aside className={`${sidebarOpen ? 'w-64' : 'w-20'} flex flex-col border-r border-[#1a1a1a] bg-[#0d0d0d] transition-all duration-300 relative shrink-0`}>
+        <div className="p-6 flex items-center justify-between">
+          <div className="flex items-center space-x-3 overflow-hidden">
+            <div className="w-8 h-8 bg-gradient-to-tr from-purple-600 to-blue-500 rounded-lg flex items-center justify-center text-white font-black text-xl shrink-0 shadow-lg shadow-purple-500/20">Z</div>
+            {sidebarOpen && <span className="font-black text-white tracking-tighter text-xl">ZOCO IA</span>}
+          </div>
+          <button onClick={() => setSidebarOpen(!sidebarOpen)} className="text-gray-600 hover:text-gray-400 transition-colors">
             {sidebarOpen ? '◀' : '▶'}
           </button>
         </div>
 
-        {sidebarOpen && (
-          <nav className="flex-1 p-2 space-y-0.5">
-            <NavItem tab="panel" label="Panel de control" icon="🏠" />
-            <NavItem tab="keys" label="Claves de API" icon="🔑" />
-            <NavItem tab="chat" label="Chat IA" icon="💬" />
-            <NavItem tab="billing" label="Facturación" icon="💳" />
+        <nav className="flex-1 px-3 space-y-1 overflow-y-auto custom-scrollbar">
+          <div className="pb-4">
+            {sidebarOpen && <p className="px-3 text-[10px] font-bold text-gray-600 uppercase tracking-widest mb-2">Principal</p>}
+            <button onClick={() => setActiveTab('panel')} className={`w-full flex items-center ${sidebarOpen ? 'space-x-3 px-3' : 'justify-center'} py-2 rounded-xl transition-all ${activeTab === 'panel' ? 'bg-purple-600/10 text-purple-400 border border-purple-500/20' : 'hover:bg-[#161616] text-gray-500'}`}>
+              <span className="text-lg">🏠</span>
+              {sidebarOpen && <span className="text-sm font-medium">Dashboard</span>}
+            </button>
+            <button onClick={() => setActiveTab('chat')} className={`w-full mt-1 flex items-center ${sidebarOpen ? 'space-x-3 px-3' : 'justify-center'} py-2 rounded-xl transition-all ${activeTab === 'chat' ? 'bg-purple-600/10 text-purple-400 border border-purple-500/20' : 'hover:bg-[#161616] text-gray-500'}`}>
+              <span className="text-lg">💬</span>
+              {sidebarOpen && <span className="text-sm font-medium">Chat Playground</span>}
+            </button>
+          </div>
 
-            <div className="pt-3">
-              <button onClick={() => setBuildExpanded(!buildExpanded)} className="w-full flex items-center justify-between px-3 py-1.5 text-[11px] font-bold text-gray-500 uppercase tracking-wider hover:text-gray-300">
-                <span>Compilar</span><span>{buildExpanded ? '▾' : '▸'}</span>
-              </button>
-              {buildExpanded && (
-                <div className="mt-0.5 space-y-0.5">
-                  <NavItem tab="archivo" label="Archivos" icon="📁" />
-                  <NavItem tab="habilidad" label="Habilidades" icon="⚡" />
-                  <NavItem tab="lote" label="Lotes" icon="📦" />
-                </div>
-              )}
+          <div className="pb-4">
+            <div className="flex items-center justify-between px-3 mb-2">
+              {sidebarOpen && <p className="text-[10px] font-bold text-gray-600 uppercase tracking-widest">Agentes</p>}
+              {sidebarOpen && <button onClick={() => setAgentsExpanded(!agentsExpanded)} className="text-[10px] text-gray-700 hover:text-gray-500">{agentsExpanded ? '▼' : '▶'}</button>}
             </div>
-
-            <div className="pt-2">
-              <button onClick={() => setAgentsExpanded(!agentsExpanded)} className="w-full flex items-center justify-between px-3 py-1.5 text-[11px] font-bold text-gray-500 uppercase tracking-wider hover:text-gray-300">
-                <span>Agentes gestionados</span><span>{agentsExpanded ? '▾' : '▸'}</span>
-              </button>
-              {agentsExpanded && (
-                <div className="mt-0.5 space-y-0.5">
-                  <NavItem tab="agentes" label="Inicio rápido" icon="🚀" />
-                  <NavItem tab="mis-agentes" label="Agentes" icon="🤖" />
-                  <NavItem tab="sesion" label="Sesiones" icon="💬" />
-                  <NavItem tab="implementacion" label="Implementaciones" icon="⚙️" />
-                  <NavItem tab="entorno" label="Entornos" icon="🌐" />
-                  <NavItem tab="credencial" label="Almacén de cred." icon="🔒" />
-                  <NavItem tab="memoria" label="Almacenes memoria" icon="🧠" />
-                </div>
-              )}
-            </div>
-
-            <div className="pt-2">
-              <button onClick={() => setAnalyticsExpanded(!analyticsExpanded)} className="w-full flex items-center justify-between px-3 py-1.5 text-[11px] font-bold text-gray-500 uppercase tracking-wider hover:text-gray-300">
-                <span>Analíticas</span><span>{analyticsExpanded ? '▾' : '▸'}</span>
-              </button>
-              {analyticsExpanded && (
-                <div className="mt-0.5 space-y-0.5">
-                  <NavItem tab="uso" label="Uso general" icon="📊" />
-                </div>
-              )}
-            </div>
-
-            {user?.isAdmin && (
-              <div className="pt-2">
-                <div className="px-3 py-1.5 text-[11px] font-bold text-red-500 uppercase tracking-wider">Administración</div>
-                <NavItem tab="admin" label="Panel Admin" icon="🛡️" />
-              </div>
+            {agentsExpanded && (
+              <>
+                <button onClick={() => setActiveTab('agentes')} className={`w-full flex items-center ${sidebarOpen ? 'space-x-3 px-3' : 'justify-center'} py-2 rounded-xl transition-all ${activeTab === 'agentes' ? 'bg-purple-600/10 text-purple-400 border border-purple-500/20' : 'hover:bg-[#161616] text-gray-500'}`}>
+                  <span className="text-lg">🤖</span>
+                  {sidebarOpen && <span className="text-sm font-medium">Mis Agentes</span>}
+                </button>
+                {sidebarOpen && (agentes || []).slice(0, 5).map(a => (
+                  <button key={a.id} onClick={() => handleOpenAgentChat(a)} className="w-full flex items-center space-x-3 px-4 py-1.5 text-xs text-gray-600 hover:text-purple-400 transition-colors truncate">
+                    <span className="w-1.5 h-1.5 rounded-full bg-purple-500/40"></span>
+                    <span className="truncate">{a.name}</span>
+                  </button>
+                ))}
+              </>
             )}
+          </div>
 
-            <div className="pt-2">
-              <NavItem tab="docs" label="Documentación" icon="📖" />
+          <div className="pb-4">
+            <div className="flex items-center justify-between px-3 mb-2">
+              {sidebarOpen && <p className="text-[10px] font-bold text-gray-600 uppercase tracking-widest">Recursos</p>}
+              {sidebarOpen && <button onClick={() => setBuildExpanded(!buildExpanded)} className="text-[10px] text-gray-700 hover:text-gray-500">{buildExpanded ? '▼' : '▶'}</button>}
             </div>
-          </nav>
-        )}
+            {buildExpanded && (RESOURCE_SECTIONS || []).map(s => (
+              <button key={s.key} onClick={() => setActiveTab(s.key)} className={`w-full flex items-center ${sidebarOpen ? 'space-x-3 px-3' : 'justify-center'} py-2 rounded-xl transition-all ${activeTab === s.key ? 'bg-purple-600/10 text-purple-400 border border-purple-500/20' : 'hover:bg-[#161616] text-gray-500'}`}>
+                <span className="text-lg">{s.icon}</span>
+                {sidebarOpen && <span className="text-sm font-medium">{s.label}</span>}
+              </button>
+            ))}
+          </div>
+
+          <div className="pb-4">
+            {sidebarOpen && <p className="px-3 text-[10px] font-bold text-gray-600 uppercase tracking-widest mb-2">Configuración</p>}
+            <button onClick={() => setActiveTab('keys')} className={`w-full flex items-center ${sidebarOpen ? 'space-x-3 px-3' : 'justify-center'} py-2 rounded-xl transition-all ${activeTab === 'keys' ? 'bg-purple-600/10 text-purple-400 border border-purple-500/20' : 'hover:bg-[#161616] text-gray-500'}`}>
+              <span className="text-lg">🔑</span>
+              {sidebarOpen && <span className="text-sm font-medium">API Keys</span>}
+            </button>
+            <button onClick={() => setActiveTab('billing')} className={`w-full mt-1 flex items-center ${sidebarOpen ? 'space-x-3 px-3' : 'justify-center'} py-2 rounded-xl transition-all ${activeTab === 'billing' ? 'bg-purple-600/10 text-purple-400 border border-purple-500/20' : 'hover:bg-[#161616] text-gray-500'}`}>
+              <span className="text-lg">💳</span>
+              {sidebarOpen && <span className="text-sm font-medium">Facturación</span>}
+            </button>
+            {user?.isAdmin && (
+              <button onClick={() => setActiveTab('admin')} className={`w-full mt-1 flex items-center ${sidebarOpen ? 'space-x-3 px-3' : 'justify-center'} py-2 rounded-xl transition-all ${activeTab === 'admin' ? 'bg-red-600/10 text-red-400 border border-red-500/20' : 'hover:bg-[#161616] text-gray-500'}`}>
+                <span className="text-lg">🛡️</span>
+                {sidebarOpen && <span className="text-sm font-medium">Admin Panel</span>}
+              </button>
+            )}
+          </div>
+        </nav>
 
         {sidebarOpen && (
-          <div className="border-t border-[#222] p-3 space-y-2">
+          <div className="p-4 border-t border-[#1a1a1a] bg-[#0a0a0a]">
             {balanceLow && (
-              <div className="bg-amber-900/30 border border-amber-700/40 rounded-lg p-2.5 text-[11px] text-amber-300">
+              <div className="bg-amber-900/30 border border-amber-700/40 rounded-lg p-2.5 text-[11px] text-amber-300 mb-3">
                 ⚠️ Saldo bajo ({fmtEUR(balance)}). <button onClick={() => setActiveTab('billing')} className="underline">Añadir fondos</button>
               </div>
             )}
@@ -515,7 +510,7 @@ export default function Dashboard() {
               </div>
               <button onClick={logout} title="Cerrar sesión" className="text-gray-600 hover:text-red-400 text-xs ml-1">⏏</button>
             </div>
-            <div className="flex items-center justify-between text-[11px]">
+            <div className="flex items-center justify-between text-[11px] mt-2">
               <span className={`font-bold ${balanceLow ? 'text-amber-400' : 'text-green-400'}`}>{fmtEUR(balance)}</span>
               <button onClick={() => setActiveTab('billing')} className="text-purple-400 hover:text-purple-300">+ Añadir fondos</button>
             </div>
@@ -528,7 +523,7 @@ export default function Dashboard() {
 
         {notification && (
           <div className="bg-[#1a1a2e] border-b border-[#333] px-6 py-2.5 flex items-center justify-between text-[12px]">
-            <span className="text-blue-300">ℹ️ Zoco IA Console activo · Groq Cloud IA en línea · {agentes.length} agentes registrados</span>
+            <span className="text-blue-300">ℹ️ Zoco IA Console activo · Groq Cloud IA en línea · {(agentes || []).length} agentes registrados</span>
             <button onClick={() => setNotification(false)} className="text-gray-600 hover:text-gray-400">✕</button>
           </div>
         )}
@@ -598,7 +593,7 @@ export default function Dashboard() {
 
               <h2 className="text-lg font-bold text-white mb-4">Modelos</h2>
               <div className="grid grid-cols-4 gap-4 mb-8">
-                {MODELOS.map(m => {
+                {(MODELOS || []).map(m => {
                   const active = selectedModel === m.backend;
                   return (
                     <div key={m.backend} onClick={() => { handleSelectModel(m.backend); setActiveAgent(null); setActiveTab('chat'); }}
@@ -613,7 +608,7 @@ export default function Dashboard() {
                           {m.badge && <span className="bg-purple-900/50 text-purple-300 text-[9px] px-1.5 py-0.5 rounded border border-purple-700/40">{m.badge}</span>}
                         </div>
                         <div className="flex flex-wrap gap-1 mt-2">
-                          {m.tags.map(t => <span key={t} className="bg-[#252525] text-gray-400 text-[10px] px-1.5 py-0.5 rounded border border-[#333]">{t}</span>)}
+                          {(m.tags || []).map(t => <span key={t} className="bg-[#252525] text-gray-400 text-[10px] px-1.5 py-0.5 rounded border border-[#333]">{t}</span>)}
                         </div>
                         <div className="mt-2 text-[10px] text-gray-600 font-mono">→ {m.ollamaModel}</div>
                       </div>
@@ -663,24 +658,24 @@ export default function Dashboard() {
                   <span className="text-xs text-gray-500">Modelo:</span>
                   <select value={selectedModel} onChange={e => handleSelectModel(e.target.value)}
                     className="bg-[#1a1a1a] border border-[#333] text-gray-300 text-xs px-2 py-1 rounded-lg">
-                    {MODELOS.map(m => <option key={m.backend} value={m.backend}>{m.nombre}</option>)}
+                    {(MODELOS || []).map(m => <option key={m.backend} value={m.backend}>{m.nombre}</option>)}
                   </select>
                   <button onClick={() => setChatMessages([])} className="text-gray-600 hover:text-red-400 text-xs border border-[#333] px-2 py-1 rounded-lg">🗑 Limpiar</button>
                 </div>
               </div>
               <div className="flex-1 overflow-y-auto bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-4 mb-4 space-y-4">
-                {chatMessages.length === 0 && (
+                {(chatMessages || []).length === 0 && (
                   <div className="flex flex-col items-center justify-center h-full text-center text-gray-600">
                     <div className="text-5xl mb-4">{activeAgent ? activeAgent.name.charAt(0).toUpperCase() : 'Z'}</div>
                     <p className="text-gray-400 font-medium">{activeAgent ? `${activeAgent.name} listo` : 'Zoco IA listo'}</p>
-                    <p className="text-xs mt-1 text-gray-600">Modelo: {MODELOS.find(m => m.backend === selectedModel)?.nombre || selectedModel}</p>
-                    <p className="text-xs mt-0.5 text-gray-700 font-mono">Ollama: {MODELOS.find(m => m.backend === selectedModel)?.ollamaModel || 'llama3.2'} · Groq fallback: llama-3.3-70b</p>
+                    <p className="text-xs mt-1 text-gray-600">Modelo: {(MODELOS || []).find(m => m.backend === selectedModel)?.nombre || selectedModel}</p>
+                    <p className="text-xs mt-0.5 text-gray-700 font-mono">Ollama: {(MODELOS || []).find(m => m.backend === selectedModel)?.ollamaModel || 'llama3.2'} · Groq fallback: llama-3.3-70b</p>
                     {activeAgent
                       ? <p className="text-xs mt-1 text-gray-600">🧠 Memoria persistente de este agente activada</p>
                       : <p className="text-xs mt-1 text-gray-600">🌐 Búsqueda web automática activada</p>}
                   </div>
                 )}
-                {chatMessages.map((m, i) => (
+                {(chatMessages || []).map((m, i) => (
                   <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                     {m.role === 'assistant' && (
                       <div className="w-6 h-6 bg-gradient-to-br from-purple-500 to-blue-600 rounded-full flex items-center justify-center text-white text-[10px] font-bold mr-2 mt-0.5 shrink-0">
@@ -721,15 +716,15 @@ export default function Dashboard() {
             <div className="max-w-4xl">
               <div className="flex items-center justify-between mb-6">
                 <div>
-                  <h1 className="text-2xl font-bold text-white">Claves de API</h1>
+                  <h1 className="text-2xl font-bold text-white">API Keys</h1>
                   <p className="text-gray-500 text-xs mt-1">Claves secretas para autenticarte en la API de Zoco IA</p>
                 </div>
                 <button onClick={() => openCreateModal('apikey')} className="bg-white text-black px-4 py-2 rounded-lg font-medium text-xs hover:bg-gray-200">+ Nueva clave</button>
               </div>
               <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl overflow-hidden">
-                {keys.length === 0 ? (
+                {(keys || []).length === 0 ? (
                   <div className="p-10 text-center text-gray-600">No tienes claves de API todavía.</div>
-                ) : keys.map(k => (
+                ) : (keys || []).map(k => (
                   <div key={k.id} className="flex items-center justify-between p-4 border-b border-[#222] last:border-0 hover:bg-[#1e1e1e]">
                     <div>
                       <p className="font-medium text-white">{k.name}</p>
@@ -759,7 +754,11 @@ export default function Dashboard() {
                 <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-5 col-span-2">
                   <div className="text-gray-500 text-xs mb-3">Estado de la cuenta</div>
                   <div className="space-y-2 text-xs">
-                    {[['Claves activas', billing?.clavesActivas ?? 0], ['Recursos totales', Object.values(billing?.recursos || {}).reduce((a,b)=>a+b,0)], ['Pagos realizados', payments.filter(p=>p.status==='completed').length]].map(([k,v]) => (
+                    {[
+                      ['Claves activas', billing?.clavesActivas ?? 0],
+                      ['Recursos totales', Object.values(billing?.recursos || {}).reduce((a,b)=>a+b,0)],
+                      ['Pagos realizados', (payments || []).filter(p=>p.status==='completed').length]
+                    ].map(([k,v]) => (
                       <div key={String(k)} className="flex justify-between border-b border-[#222] pb-2">
                         <span className="text-gray-500">{k}</span><span className="font-bold text-white">{v}</span>
                       </div>
@@ -769,7 +768,7 @@ export default function Dashboard() {
               </div>
               <h2 className="text-base font-bold text-white mb-4">Paquetes de créditos</h2>
               <div className="grid grid-cols-5 gap-3 mb-8">
-                {(creditPacks.length > 0 ? creditPacks : [
+                {((creditPacks || []).length > 0 ? creditPacks : [
                   {id:'starter',euros:5,credits:5,label:'Starter'},{id:'basic',euros:10,credits:11,label:'Basic'},
                   {id:'pro',euros:25,credits:28,label:'Pro'},{id:'business',euros:50,credits:60,label:'Business'},{id:'enterprise',euros:100,credits:125,label:'Enterprise'}
                 ]).map(pack => (
@@ -787,13 +786,13 @@ export default function Dashboard() {
               </div>
               <h2 className="text-base font-bold text-white mb-4">Historial de pagos</h2>
               <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl overflow-hidden">
-                {payments.length === 0 ? <div className="p-8 text-center text-gray-600 text-sm">Sin pagos todavía.</div> : (
+                {(payments || []).length === 0 ? <div className="p-8 text-center text-gray-600 text-sm">Sin pagos todavía.</div> : (
                   <table className="w-full text-xs">
                     <thead className="bg-[#161616] border-b border-[#222] text-gray-500">
                       <tr>{['Fecha','Importe','Créditos','Estado'].map(h=><th key={h} className="px-4 py-3 text-left">{h}</th>)}</tr>
                     </thead>
                     <tbody className="divide-y divide-[#1e1e1e]">
-                      {payments.map(p=>(
+                      {(payments || []).map(p=>(
                         <tr key={p.id} className="hover:bg-[#1e1e1e]">
                           <td className="px-4 py-3 text-gray-500">{fmtDate(p.created_at)}</td>
                           <td className="px-4 py-3 font-medium text-white">{fmtEUR(p.amount)}</td>
@@ -821,13 +820,13 @@ export default function Dashboard() {
                 </div>
                 <button onClick={() => openCreateModal('agente')} className="bg-white text-black px-4 py-2 rounded-lg text-xs font-medium hover:bg-gray-200">+ Nuevo agente</button>
               </div>
-              {agentes.length === 0 ? (
+              {(agentes || []).length === 0 ? (
                 <div className="bg-[#1a1a1a] border border-dashed border-[#333] rounded-xl p-16 text-center">
                   <div className="text-5xl mb-4">🤖</div>
                   <p className="text-gray-500 text-sm">No tienes agentes todavía.</p>
                   <button onClick={() => openCreateModal('agente')} className="mt-4 text-purple-400 text-xs hover:underline">Crear el primero →</button>
                 </div>
-              ) : agentes.map(a => (
+              ) : (agentes || []).map(a => (
                 <div
                   key={a.id}
                   onClick={() => handleOpenAgentChat(a)}
@@ -874,7 +873,7 @@ export default function Dashboard() {
             </div>
           )}
 
-          {RESOURCE_SECTIONS.filter(s => !['sesion','memoria','credencial','entorno','implementacion'].includes(s.key) ? false : s.key === activeTab).map(s => (
+          {(RESOURCE_SECTIONS || []).filter(s => !['sesion','memoria','credencial','entorno','implementacion'].includes(s.key) ? false : s.key === activeTab).map(s => (
             <div key={s.key} className="max-w-4xl">
               <div className="flex justify-between items-center mb-6">
                 <h1 className="text-2xl font-bold text-white">{s.label}</h1>
@@ -901,7 +900,7 @@ export default function Dashboard() {
           ))}
 
           {['archivo','habilidad','lote'].includes(activeTab) && (() => {
-            const s = RESOURCE_SECTIONS.find(x => x.key === activeTab)!;
+            const s = (RESOURCE_SECTIONS || []).find(x => x.key === activeTab)!;
             return (
               <div className="max-w-4xl">
                 <div className="flex justify-between items-center mb-6">
@@ -932,7 +931,12 @@ export default function Dashboard() {
             <div className="max-w-4xl">
               <h1 className="text-2xl font-bold text-white mb-6">Uso general</h1>
               <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-6 space-y-3">
-                {[['Créditos disponibles', fmtEUR(balance)],['Gasto este mes',fmtEUR(spend)],['Claves activas',billing?.clavesActivas??0],...Object.entries(billing?.recursos||{}).map(([k,v])=>[k,v])].map(([k,v])=>(
+                {[
+                  ['Créditos disponibles', fmtEUR(balance)],
+                  ['Gasto este mes', fmtEUR(spend)],
+                  ['Claves activas', billing?.clavesActivas ?? 0],
+                  ...Object.entries(billing?.recursos || {}).map(([k,v]) => [k,v])
+                ].map(([k,v]) => (
                   <div key={String(k)} className="flex justify-between border-b border-[#222] pb-3 text-sm last:border-0">
                     <span className="text-gray-500 capitalize">{k}</span><span className="font-bold text-white">{v}</span>
                   </div>
@@ -974,7 +978,12 @@ export default function Dashboard() {
               </div>
               {adminStats && (
                 <div className="grid grid-cols-4 gap-4 mb-6">
-                  {[['Usuarios',adminStats.totalUsuarios,'👥'],['Ingresos',fmtEUR(adminStats.ingresosTotal||0),'💰'],['Llamadas hoy',adminStats.llamadasHoy||0,'🤖'],['Activos',adminStats.usuariosActivos||0,'✅']].map(([l,v,ic])=>(
+                  {[
+                    ['Usuarios', adminStats.totalUsuarios, '👥'],
+                    ['Ingresos', fmtEUR(adminStats.ingresosTotal || 0), '💰'],
+                    ['Llamadas hoy', adminStats.llamadasHoy || 0, '🤖'],
+                    ['Activos', adminStats.usuariosActivos || 0, '✅']
+                  ].map(([l,v,ic]) => (
                     <div key={String(l)} className="bg-[#1a1a1a] border border-[#2a2a2a] p-4 rounded-xl">
                       <div className="text-gray-500 text-xs">{ic} {l}</div>
                       <div className="text-xl font-bold text-white mt-1">{v}</div>
@@ -998,7 +1007,7 @@ export default function Dashboard() {
                       <tr>{['Usuario','Email','Rol','Créditos','Estado','Registro','Acciones'].map(h=><th key={h} className="px-4 py-3 text-left">{h}</th>)}</tr>
                     </thead>
                     <tbody className="divide-y divide-[#1e1e1e]">
-                      {adminUsuarios.map(u=>(
+                      {(adminUsuarios || []).map(u=>(
                         <tr key={u.id} className="hover:bg-[#1e1e1e]">
                           <td className="px-4 py-3 font-medium text-white">{u.nombre}</td>
                           <td className="px-4 py-3 text-gray-500">{u.email}</td>
@@ -1022,7 +1031,14 @@ export default function Dashboard() {
                   <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-6">
                     <h3 className="font-bold text-white mb-4">⚙️ Estado del sistema</h3>
                     <div className="space-y-3 text-xs">
-                      {[['Backend','● Online','text-green-400'],['Motor IA',adminStats.ollamaOnline?'🖥 Ollama local':'☁️ Groq Cloud','text-blue-400'],['Base de datos','SQLite + Volumen Railway','text-gray-300'],['Pasarela de pago',adminStats.vivaConfigurado?'✓ Viva.com':'⚠️ No configurada',adminStats.vivaConfigurado?'text-green-400':'text-amber-400'],['Total usuarios',adminStats.totalUsuarios,'text-white'],['Ingresos totales',fmtEUR(adminStats.ingresosTotal||0),'text-green-400']].map(([k,v,c])=>(
+                      {[
+                        ['Backend', '● Online', 'text-green-400'],
+                        ['Motor IA', adminStats.ollamaOnline ? '🖥 Ollama local' : '☁️ Groq Cloud', 'text-blue-400'],
+                        ['Base de datos', 'SQLite + Volumen Railway', 'text-gray-300'],
+                        ['Pasarela de pago', adminStats.vivaConfigurado ? '✓ Viva.com' : '⚠️ No configurada', adminStats.vivaConfigurado ? 'text-green-400' : 'text-amber-400'],
+                        ['Total usuarios', adminStats.totalUsuarios, 'text-white'],
+                        ['Ingresos totales', fmtEUR(adminStats.ingresosTotal || 0), 'text-green-400']
+                      ].map(([k,v,c]) => (
                         <div key={String(k)} className="flex justify-between border-b border-[#222] pb-2">
                           <span className="text-gray-500">{k}</span><span className={String(c)}>{v}</span>
                         </div>
@@ -1032,7 +1048,14 @@ export default function Dashboard() {
                   <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-6">
                     <h3 className="font-bold text-white mb-4">🔑 Variables de entorno</h3>
                     <div className="space-y-2 text-xs font-mono">
-                      {[['GROQ_API_KEY','Motor IA cloud'],['OLLAMA_URL','Ollama/Ngrok local'],['VIVA_CLIENT_ID','Pagos'],['VIVA_CLIENT_SECRET','Pagos'],['VIVA_SOURCE_CODE','Pagos'],['JWT_SECRET','✓ Configurado']].map(([k,v])=>(
+                      {[
+                        ['GROQ_API_KEY', 'Motor IA cloud'],
+                        ['OLLAMA_URL', 'Ollama/Ngrok local'],
+                        ['VIVA_CLIENT_ID', 'Pagos'],
+                        ['VIVA_CLIENT_SECRET', 'Pagos'],
+                        ['VIVA_SOURCE_CODE', 'Pagos'],
+                        ['JWT_SECRET', '✓ Configurado']
+                      ].map(([k,v]) => (
                         <div key={k} className="flex justify-between p-2 bg-[#161616] rounded border border-[#222]">
                           <span className="text-purple-400">{k}</span><span className="text-gray-600">{v}</span>
                         </div>
@@ -1049,13 +1072,13 @@ export default function Dashboard() {
                     <button onClick={() => load('/admin/logs', setAdminLogs)} className="text-xs text-purple-400 hover:underline">↻ Actualizar</button>
                   </div>
                   <div className="max-h-[500px] overflow-y-auto">
-                    {adminLogs.length === 0 ? <p className="p-6 text-center text-gray-600 text-sm">Sin logs.</p> : (
+                    {(adminLogs || []).length === 0 ? <p className="p-6 text-center text-gray-600 text-sm">Sin logs.</p> : (
                       <table className="w-full text-xs">
                         <thead className="bg-[#161616] border-b border-[#222] text-gray-500 sticky top-0">
                           <tr>{['Fecha','Usuario','Tipo','Importe','Descripción'].map(h=><th key={h} className="px-4 py-2 text-left">{h}</th>)}</tr>
                         </thead>
                         <tbody className="divide-y divide-[#1a1a1a]">
-                          {adminLogs.map((l:any)=>(
+                          {(adminLogs || []).map((l:any)=>(
                             <tr key={l.id} className="hover:bg-[#1e1e1e]">
                               <td className="px-4 py-2 text-gray-600">{fmtDate(l.created_at)}</td>
                               <td className="px-4 py-2 text-gray-500 font-mono">{l.user_id?.slice(0,8)}...</td>
@@ -1107,7 +1130,7 @@ export default function Dashboard() {
             <h3 className="mb-4 text-xl font-black text-[#996dff]">
               {modalMode === 'create' ? '✨ Crear nuevo elemento' : '✏️ Editar registro'}
               <span className="text-xs block text-gray-500 font-mono mt-1 font-normal">
-                {modalType === 'apikey' ? 'Clave de API' : RESOURCE_SECTIONS.find(s => s.key === modalType)?.label || (modalType === 'agente' ? 'Agente' : modalType)}
+                {modalType === 'apikey' ? 'Clave de API' : (RESOURCE_SECTIONS || []).find(s => s.key === modalType)?.label || (modalType === 'agente' ? 'Agente' : modalType)}
               </span>
             </h3>
 
@@ -1157,7 +1180,7 @@ export default function Dashboard() {
                     onChange={e => setFormModelo(e.target.value)}
                     className="w-full rounded border border-gray-800 bg-[#1a1a1e] p-2.5 text-sm text-white focus:border-[#996dff] focus:outline-none transition-colors"
                   >
-                    {MODELOS.map(m => <option key={m.backend} value={m.backend}>{m.nombre} — {m.ollamaModel}</option>)}
+                    {(MODELOS || []).map(m => <option key={m.backend} value={m.backend}>{m.nombre} — {m.ollamaModel}</option>)}
                   </select>
                 </div>
                 <div className="mb-4">
@@ -1167,83 +1190,55 @@ export default function Dashboard() {
                     onChange={e => setFormSystemPrompt(e.target.value)}
                     rows={4}
                     className="w-full rounded border border-gray-800 bg-[#1a1a1e] p-2.5 text-xs text-white focus:border-[#996dff] focus:outline-none transition-colors"
-                    placeholder="Describe el rol y comportamiento del agente..."
+                    placeholder="Ej: Eres un asistente experto en programación..."
                   />
                 </div>
-
-                {/* ── Configuración Avanzada de IA ── */}
-                <div className="mb-4 rounded border border-gray-800 bg-[#161618] p-3">
-                  <p className="mb-3 text-xs font-bold uppercase text-[#996dff] tracking-wider">⚙️ Configuración Avanzada de IA</p>
-                  <div className="grid grid-cols-3 gap-3">
-                    <div>
-                      <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500 tracking-wider">Max Tokens</label>
-                      <input
-                        type="number" min={256} max={8192} step={256}
-                        value={formNumPredict}
-                        onChange={e => setFormNumPredict(Math.min(8192, Math.max(256, Number(e.target.value) || 4096)))}
-                        className="w-full rounded border border-gray-800 bg-[#1a1a1e] p-2 text-xs text-white focus:border-[#996dff] focus:outline-none transition-colors"
-                      />
-                      <p className="mt-1 text-[9px] text-gray-600">num_predict · 256–8192</p>
-                    </div>
-                    <div>
-                      <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500 tracking-wider">Ventana Contexto</label>
-                      <input
-                        type="number" min={2048} max={16384} step={1024}
-                        value={formNumCtx}
-                        onChange={e => setFormNumCtx(Math.min(16384, Math.max(2048, Number(e.target.value) || 8192)))}
-                        className="w-full rounded border border-gray-800 bg-[#1a1a1e] p-2 text-xs text-white focus:border-[#996dff] focus:outline-none transition-colors"
-                      />
-                      <p className="mt-1 text-[9px] text-gray-600">num_ctx · 2048–16384</p>
-                    </div>
-                    <div>
-                      <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500 tracking-wider">Temperatura</label>
-                      <input
-                        type="number" min={0} max={1.2} step={0.1}
-                        value={formTemperature}
-                        onChange={e => setFormTemperature(Math.min(1.2, Math.max(0, Number(e.target.value) ?? 0.7)))}
-                        className="w-full rounded border border-gray-800 bg-[#1a1a1e] p-2 text-xs text-white focus:border-[#996dff] focus:outline-none transition-colors"
-                      />
-                      <p className="mt-1 text-[9px] text-gray-600">0.0–1.2</p>
-                    </div>
+                <div className="mb-4">
+                  <label className="mb-2 block text-xs font-bold uppercase text-gray-400 tracking-wider">Habilidades disponibles</label>
+                  <div className="space-y-1 max-h-32 overflow-y-auto p-2 bg-[#1a1a1e] rounded border border-gray-800">
+                    {(resourcesByType['habilidad'] || []).length === 0 ? (
+                      <p className="text-[10px] text-gray-600 italic">No hay habilidades creadas.</p>
+                    ) : (resourcesByType['habilidad'] || []).map(h => (
+                      <div key={h.id} onClick={() => toggleHabilidadForm(h.id)} className="flex items-center space-x-2 cursor-pointer group">
+                        <div className={`w-3.5 h-3.5 rounded border flex items-center justify-center transition-colors ${formHabilidadesActivas.includes(h.id) ? 'bg-[#996dff] border-[#996dff]' : 'border-gray-700 group-hover:border-gray-500'}`}>
+                          {formHabilidadesActivas.includes(h.id) && <span className="text-[10px]">✓</span>}
+                        </div>
+                        <span className="text-xs text-gray-400 group-hover:text-gray-200">{h.name}</span>
+                      </div>
+                    ))}
                   </div>
                 </div>
-
-                <div className="mb-4">
-                  <label className="mb-1 block text-xs font-bold uppercase text-gray-400 tracking-wider">Habilidades activas</label>
-                  <div className="space-y-1.5 rounded border border-gray-800 bg-[#1a1a1e] p-2.5 mb-1.5">
-                    <label className="flex items-center space-x-2 text-xs text-gray-300 cursor-pointer">
-                      <input type="checkbox" checked={formBusquedaWeb} onChange={() => setFormBusquedaWeb(v => !v)} />
-                      <span>🌐 Búsqueda web (Tavily)</span>
+                <div className="grid grid-cols-2 gap-3 mb-4">
+                  <div>
+                    <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500">Temp</label>
+                    <input type="number" step="0.1" value={formTemperature} onChange={e => setFormTemperature(parseFloat(e.target.value))} className="w-full rounded border border-gray-800 bg-[#1a1a1e] p-2 text-xs text-white" />
+                  </div>
+                  <div className="flex items-end">
+                    <label className="flex items-center space-x-2 cursor-pointer mb-2">
+                      <input type="checkbox" checked={formBusquedaWeb} onChange={e => setFormBusquedaWeb(e.target.checked)} className="rounded border-gray-800 bg-[#1a1a1e] text-[#996dff]" />
+                      <span className="text-[10px] font-bold uppercase text-gray-500">Búsqueda Web</span>
                     </label>
                   </div>
-                  {habilidadesDisponibles.length === 0 ? (
-                    <p className="text-xs text-gray-600">No hay más habilidades creadas todavía. Ve a "Habilidades" para añadir alguna.</p>
-                  ) : (
-                    <div className="space-y-1.5 rounded border border-gray-800 bg-[#1a1a1e] p-2.5">
-                      {habilidadesDisponibles.map(h => (
-                        <label key={h.id} className="flex items-center space-x-2 text-xs text-gray-300 cursor-pointer">
-                          <input type="checkbox" checked={formHabilidadesActivas.includes(h.id)} onChange={() => toggleHabilidadForm(h.id)} />
-                          <span>{h.name}</span>
-                        </label>
-                      ))}
-                    </div>
-                  )}
                 </div>
               </>
             )}
 
-
-            <div className="flex justify-end gap-3 border-t border-gray-800/80 pt-4">
-              <button onClick={closeModal} className="px-4 py-2 text-sm text-gray-400 hover:text-white transition-colors">
-                Cancelar
-              </button>
-              <button onClick={handleSaveResource} disabled={savingModal} className="rounded bg-[#996dff] hover:bg-[#8257e5] px-4 py-2 text-sm font-bold text-white shadow-lg transition-all disabled:opacity-50">
-                {savingModal ? 'Guardando...' : (modalMode === 'create' ? 'Crear' : 'Guardar cambios')}
+            <div className="mt-6 flex space-x-3">
+              <button onClick={closeModal} className="flex-1 rounded-lg border border-gray-800 py-2.5 text-xs font-bold uppercase tracking-widest text-gray-500 hover:bg-gray-800 transition-colors">Cancelar</button>
+              <button onClick={handleSaveResource} disabled={savingModal} className="flex-1 rounded-lg bg-[#996dff] py-2.5 text-xs font-bold uppercase tracking-widest text-white shadow-lg shadow-purple-500/20 hover:bg-[#8359e6] disabled:opacity-50 transition-colors">
+                {savingModal ? 'Guardando...' : 'Guardar'}
               </button>
             </div>
           </div>
         </div>
       )}
+
+      <style>{`
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #222; border-radius: 10px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #333; }
+      `}</style>
     </div>
   );
 }
