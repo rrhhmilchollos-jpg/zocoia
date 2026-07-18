@@ -223,7 +223,7 @@ async function runStaticAnalysis(userContent, config) {
     '-v', `${config.workspace_path}:/workspace:ro`,
     config.image || 'zocoia/static-analyzer:latest',
     '--file', file_path || '', '--trace', error_trace || '',
-  ], { timeout: 30_000 });
+  ], { timeout: Number(process.env.SANDBOX_ANALYSIS_TIMEOUT_MS || 120_000) });
 
   const result = JSON.parse(stdout);
   return { status: 'ok', file_path, diff: result.diff, diagnostics: result.diagnostics };
@@ -231,7 +231,7 @@ async function runStaticAnalysis(userContent, config) {
 
 // Reparación: ejecución + auto-corrección iterativa en sandbox.
 async function runSandboxRepair(userContent, config) {
-  const { file_path, max_attempts = 3 } = safeParseInput(userContent);
+  const { file_path, max_attempts = Number(process.env.SANDBOX_REPAIR_MAX_ATTEMPTS || 10) } = safeParseInput(userContent);
   if (!config.workspace_path) return { status: 'error', notes: 'workspace_path no configurado' };
 
   let attempt = 0, lastError = null;
@@ -243,7 +243,7 @@ async function runSandboxRepair(userContent, config) {
         '-v', `${config.workspace_path}:/workspace:rw`,
         config.image || 'zocoia/sandbox-runner:latest',
         '--file', file_path || '',
-      ], { timeout: 20_000 });
+      ], { timeout: Number(process.env.SANDBOX_REPAIR_TIMEOUT_MS || 60_000) });
       if (!stderr) return { status: 'ok', file_path, attempts: attempt, output: stdout };
       lastError = stderr;
     } catch (err) {
