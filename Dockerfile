@@ -33,8 +33,4 @@ ENV PORT=8080
 # Volume al servicio (dashboard → Command Palette ⌘K → "Create Volume",
 # montado en /data), Railway crea y gestiona ese directorio en tiempo de
 # arranque del contenedor — no en tiempo de build. RAILWAY_VOLUME_MOUNT_PATH
-# se inyecta automáticamente y server.js ya lo usa sin tocar nada más.
-
-EXPOSE 8080
-
-CMD ["node", "server.js"]
+# se inyecta automáticamente y server.js ya lo usa sin tocar nad
