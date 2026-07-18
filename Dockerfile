@@ -21,7 +21,7 @@ RUN npm install --omit=dev
 COPY --from=frontend-builder /app/dist ./public
 
 # Copy the server script and its local modules
-COPY server.js tools.js ./
+COPY server.js tools.js bridge-marisai.js ./
 
 # Set environment variables
 ENV NODE_ENV=production
