@@ -184,16 +184,11 @@ async function busquedaWeb(workspaceDir, { query }, context) {
   if (!apiKey) {
     return {
       success: false,
-      // Mensaje deliberadamente directivo: algunos modelos (p.ej. DeepSeek-R1
-      // vía Ollama) reciben un tool result de error y, en vez de aceptarlo,
-      // vuelven a intentar la misma tool — esto se combina con el freno de
-      // bucle de runToolLoop() más abajo, pero un texto claro aquí reduce
-      // las probabilidades de que el modelo reintente en primer lugar.
-      error: 'No hay una clave de Tavily configurada para este usuario, así que la búsqueda web NO está disponible ahora mismo. NO vuelvas a llamar a busqueda_web en este turno: responde directamente al usuario con tu propio conocimiento, e indícale que puede añadir una clave de Tavily en "Almacén de credenciales" (nombre TAVILY_API_KEY) para activar la búsqueda real.',
+      error: 'No hay una clave de Tavily configurada para este usuario. Añádela en "Almacén de credenciales" con el nombre TAVILY_API_KEY.',
     };
   }
   if (!query || !query.trim()) {
-    return { success: false, error: 'Falta el término de búsqueda (query). No reintentes la misma tool sin especificar un query válido.' };
+    return { success: false, error: 'Falta el término de búsqueda (query)' };
   }
 
   const controller = new AbortController();
@@ -268,22 +263,8 @@ export async function runToolLoop({ messages, callModel, allowedTools, workspace
   const usageTotal = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
   let working = [...messages];
 
-  // BLINDAJE — FRENO DE BUCLE: algunos modelos (DeepSeek-R1 vía Ollama en
-  // particular) pueden quedarse pidiendo la misma tool una y otra vez si no
-  // "aceptan" bien un resultado de error como final. En vez de esperar a
-  // agotar las MAX_TOOL_ITERATIONS (25) vueltas reales -incluyendo llamadas
-  // de red reales a Tavily cada vez-, se cuenta cuántas veces SEGUIDAS se
-  // pide el mismo nombre de tool. Al superar el límite, se le devuelve un
-  // resultado de tool que le prohíbe explícitamente reintentar, y en la
-  // siguiente vuelta se le quitan las tools por completo (forceNoTools),
-  // obligándolo a responder solo con texto.
-  const MAX_CONSECUTIVE_SAME_TOOL = Number(process.env.MAX_CONSECUTIVE_SAME_TOOL || 2);
-  let lastToolName = null;
-  let consecutiveSameTool = 0;
-  let forceNoTools = false;
-
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
-    const data = await callModel(working, !forceNoTools && tools.length ? tools : undefined);
+    const data = await callModel(working, tools.length ? tools : undefined);
     const usage = data.usage || {};
     usageTotal.prompt_tokens += usage.prompt_tokens || 0;
     usageTotal.completion_tokens += usage.completion_tokens || 0;
@@ -291,7 +272,7 @@ export async function runToolLoop({ messages, callModel, allowedTools, workspace
 
     const message = data.choices?.[0]?.message || {};
 
-    if (message.tool_calls && message.tool_calls.length > 0 && !forceNoTools) {
+    if (message.tool_calls && message.tool_calls.length > 0) {
       working.push({ role: 'assistant', content: message.content || null, tool_calls: message.tool_calls });
 
       for (const call of message.tool_calls) {
@@ -302,28 +283,6 @@ export async function runToolLoop({ messages, callModel, allowedTools, workspace
         } catch {
           args = {};
         }
-
-        consecutiveSameTool = name === lastToolName ? consecutiveSameTool + 1 : 1;
-        lastToolName = name;
-
-        if (consecutiveSameTool > MAX_CONSECUTIVE_SAME_TOOL) {
-          // No se ejecuta de nuevo (evita otra llamada real de red/coste si
-          // es busqueda_web u otra tool cara) — se corta aquí mismo con un
-          // resultado explícito, y se desactivan las tools para el resto
-          // del turno.
-          forceNoTools = true;
-          working.push({
-            role: 'tool',
-            tool_call_id: call.id,
-            name,
-            content: JSON.stringify({
-              success: false,
-              error: `Has llamado a "${name}" ${consecutiveSameTool} veces seguidas. Está BLOQUEADA por el resto de este turno. Responde ahora directamente al usuario en texto plano con la mejor respuesta que puedas dar con la información que ya tienes, sin pedir ninguna otra tool.`,
-            }),
-          });
-          continue;
-        }
-
         const result = await runTool(name, args, { workspacesRoot, workspaceId, allowedTools, context });
         working.push({
           role: 'tool',
