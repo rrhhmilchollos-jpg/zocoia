@@ -12,6 +12,7 @@ import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { TOOL_DEFINITIONS, ALL_TOOL_NAMES, runToolLoop, makeWorkspacesRoot } from './tools.js';
 import { runDeterministicAgent, resolveTemplatePrompt, registerBridgeAdminRoutes } from './bridge-marisai.js';
+import { seedOwnerAgentsIfEmpty } from './seed-owner-agents.js';
 
 dotenv.config();
 
@@ -336,6 +337,16 @@ function seedDefaultAgents() {
   if (!user) return; // No debería pasar justo después de seedAdminAccount(), pero por seguridad.
 
   const existentes = db.prepare("SELECT name FROM resources WHERE user_id = ? AND type = 'agente'").all(user.id);
+  if (existentes.length > 0) {
+    // Si el usuario ya tiene CUALQUIER agente (típicamente porque
+    // seedOwnerAgentsIfEmpty ya sembró los 11 reales justo antes de esta
+    // llamada), no se rellena con los genéricos de respaldo — evita
+    // mezclar nombres distintos (ej. "Agente de Pruebas (Testing)" de
+    // DEFAULT_AGENTS junto a "Agente Corrector Automatizado (Patcher)"
+    // de la siembra real) y terminar con más de 11 agentes.
+    console.log(`ℹ️  ${email} ya tiene ${existentes.length} agente(s) — no se aplica la siembra genérica de respaldo.`);
+    return;
+  }
   const nombresExistentes = new Set(existentes.map(r => r.name));
 
   const insert = db.prepare('INSERT INTO resources (id, user_id, type, name, data) VALUES (?, ?, ?, ?, ?)');
@@ -363,7 +374,8 @@ function seedDefaultAgents() {
     console.log(`ℹ️  Los ${DEFAULT_AGENTS.length} agentes por defecto ya existen para ${email}; no se crea ninguno nuevo.`);
   }
 }
-seedDefaultAgents();
+seedOwnerAgentsIfEmpty(db); // siembra los 11 agentes reales (prompts extraídos de Marisai) si la cuenta owner existe y aún no tiene ninguno
+seedDefaultAgents(); // red de seguridad: solo actúa si ADMIN_EMAIL no coincide con el owner, o si por lo que sea la siembra real no pudo ejecutarse
 
 app.use(cors());
 app.use(express.json());
