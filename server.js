@@ -334,7 +334,43 @@ function seedDefaultAgents() {
 }
 seedDefaultAgents();
 
-app.use(cors());
+// ── CORS ────────────────────────────────────────────────────────────────
+// Lista blanca explícita de orígenes permitidos. Se puede ampliar sin tocar
+// código añadiendo CORS_EXTRA_ORIGINS="https://foo.com,https://bar.com" en
+// las variables de entorno de Railway (separados por comas).
+const DEFAULT_ALLOWED_ORIGINS = [
+  'https://zocoia.es',
+  'https://www.zocoia.es',
+  'https://marisai.es',
+  'https://www.marisai.es',
+  'http://localhost:5173',
+  'http://localhost:3000',
+];
+const EXTRA_ORIGINS = (process.env.CORS_EXTRA_ORIGINS || '')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
+const ALLOWED_ORIGINS = [...DEFAULT_ALLOWED_ORIGINS, ...EXTRA_ORIGINS];
+
+const corsOptions = {
+  origin(origin, callback) {
+    // Peticiones sin origin (curl, health checks, server-to-server) se permiten.
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    console.warn(`⚠️  CORS bloqueado para origin no permitido: ${origin}`);
+    return callback(new Error(`Origin no permitido por CORS: ${origin}`));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+// Responde explícitamente a las peticiones preflight (OPTIONS) para
+// cualquier ruta, usando las mismas opciones que arriba.
+app.options('*', cors(corsOptions));
+
 app.use(express.json());
 
 function signToken(user) {
