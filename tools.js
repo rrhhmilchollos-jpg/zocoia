@@ -274,4 +274,72 @@ export async function runToolLoop({ messages, callModel, allowedTools, workspace
   // agotar las MAX_TOOL_ITERATIONS (25) vueltas reales -incluyendo llamadas
   // de red reales a Tavily cada vez-, se cuenta cuántas veces SEGUIDAS se
   // pide el mismo nombre de tool. Al superar el límite, se le devuelve un
-  // resultado de tool que le prohíbe explí
+  // resultado de tool que le prohíbe explícitamente reintentar, y en la
+  // siguiente vuelta se le quitan las tools por completo (forceNoTools),
+  // obligándolo a responder solo con texto.
+  const MAX_CONSECUTIVE_SAME_TOOL = Number(process.env.MAX_CONSECUTIVE_SAME_TOOL || 2);
+  let lastToolName = null;
+  let consecutiveSameTool = 0;
+  let forceNoTools = false;
+
+  for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
+    const data = await callModel(working, !forceNoTools && tools.length ? tools : undefined);
+    const usage = data.usage || {};
+    usageTotal.prompt_tokens += usage.prompt_tokens || 0;
+    usageTotal.completion_tokens += usage.completion_tokens || 0;
+    usageTotal.total_tokens += usage.total_tokens || 0;
+
+    const message = data.choices?.[0]?.message || {};
+
+    if (message.tool_calls && message.tool_calls.length > 0 && !forceNoTools) {
+      working.push({ role: 'assistant', content: message.content || null, tool_calls: message.tool_calls });
+
+      for (const call of message.tool_calls) {
+        const name = call.function?.name;
+        let args = {};
+        try {
+          args = JSON.parse(call.function?.arguments || '{}');
+        } catch {
+          args = {};
+        }
+
+        consecutiveSameTool = name === lastToolName ? consecutiveSameTool + 1 : 1;
+        lastToolName = name;
+
+        if (consecutiveSameTool > MAX_CONSECUTIVE_SAME_TOOL) {
+          // No se ejecuta de nuevo (evita otra llamada real de red/coste si
+          // es busqueda_web u otra tool cara) — se corta aquí mismo con un
+          // resultado explícito, y se desactivan las tools para el resto
+          // del turno.
+          forceNoTools = true;
+          working.push({
+            role: 'tool',
+            tool_call_id: call.id,
+            name,
+            content: JSON.stringify({
+              success: false,
+              error: `Has llamado a "${name}" ${consecutiveSameTool} veces seguidas. Está BLOQUEADA por el resto de este turno. Responde ahora directamente al usuario en texto plano con la mejor respuesta que puedas dar con la información que ya tienes, sin pedir ninguna otra tool.`,
+            }),
+          });
+          continue;
+        }
+
+        const result = await runTool(name, args, { workspacesRoot, workspaceId, allowedTools, context });
+        working.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          name,
+          content: JSON.stringify(result),
+        });
+      }
+      continue; // siguiente vuelta del loop con el resultado ya disponible
+    }
+
+    return { finalMessage: message.content || '', usage: usageTotal };
+  }
+
+  return {
+    finalMessage: 'He ejecutado varias acciones pero necesito más contexto para continuar. ¿Puedes darme más detalles?',
+    usage: usageTotal,
+  };
+}
