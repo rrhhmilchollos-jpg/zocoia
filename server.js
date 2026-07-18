@@ -12,7 +12,7 @@ import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { TOOL_DEFINITIONS, ALL_TOOL_NAMES, runToolLoop, makeWorkspacesRoot } from './tools.js';
 import { runDeterministicAgent, resolveTemplatePrompt, registerBridgeAdminRoutes } from './bridge-marisai.js';
-import { seedOwnerAgentsIfEmpty, DEEPSEEK_SAFE_FORMAT_RULE } from './seed-owner-agents.js';
+import { seedOwnerAgentsIfEmpty, seedBasicAgentsForUser, isOwnerUser, DEEPSEEK_SAFE_FORMAT_RULE, ENTERPRISE_REQUIRED_MESSAGE } from './seed-owner-agents.js';
 import { registerSessionRoutes, validateZocoApiKey } from './zoco-sessions.js';
 import { registerConsoleRoutes, resumeInterruptedBatches, buildEnvironmentContext } from './zoco-console.js';
 
@@ -666,6 +666,12 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
     // mismo formato { choices, usage, model } que espera el resto del flujo,
     // para que Marisai no note la diferencia entre esto y una respuesta de IA.
     if (agenteData.tipo === 'deterministic') {
+      // GATE ENTERPRISE: los ejecutores deterministas (DevOps/Testing/Reparación
+      // con acceso a APIs de despliegue y análisis de código) son exclusivos de
+      // la cuenta propietaria.
+      if (!isOwnerUser(db, authSub)) {
+        const e = new Error(ENTERPRISE_REQUIRED_MESSAGE); e.status = 403; e.code = 'enterprise_required'; throw e;
+      }
       return runDeterministicAgent({ db, uuidv4, userId: authSub, agente, agenteData, userMessage });
     }
 
@@ -752,7 +758,15 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   const agentTools = agentId
     ? (Array.isArray(agenteData.allowedTools) ? agenteData.allowedTools : ALL_TOOL_NAMES)
     : [];
-  const allowedTools = [...new Set([...agentTools, ...skillTools])];
+  let allowedTools = [...new Set([...agentTools, ...skillTools])];
+  // GATE ENTERPRISE: las herramientas del sistema (createFile, createFolder,
+  // executeCode, readFile… — la generación masiva de código del pipeline) son
+  // exclusivas de la cuenta propietaria. A los clientes básicos se les vacía
+  // la lista aunque intenten colárselas vía habilidades o agentes creados a
+  // mano — su chat sigue funcionando, pero sin ejecutar nada en el servidor.
+  if (allowedTools.length > 0 && !isOwnerUser(db, authSub)) {
+    allowedTools = [];
+  }
 
   const callModel = (msgs, tools, toolChoice) =>
     callChatModel({
@@ -957,10 +971,14 @@ app.post('/auth/register', (req, res) => {
 
   const id = uuidv4();
   const passwordHash = bcrypt.hashSync(password, 12);
-  db.prepare(
+    db.prepare(
     'INSERT INTO users (id, email, password_hash, nombre, is_admin, is_support, creditos, activo) VALUES (?, ?, ?, ?, 0, 0, 0, 1)'
   ).run(id, emailLower, passwordHash, nombre.trim());
-
+  // SEGMENTACIÓN COMERCIAL: todo cliente nuevo (que no sea el propietario)
+  // recibe automáticamente su biblioteca de Agentes Básicos (Asistente
+  // General, Traductor Multilingüe, Analista de Datos Básico). La siembra
+  // es idempotente y nunca rompe el registro si algo falla.
+  seedBasicAgentsForUser(db, id);
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
   const token = signToken(user);
   res.status(201).json({ token, user: publicUser(user) });
@@ -1140,7 +1158,17 @@ app.post('/api/resources', authMiddleware, (req, res) => {
   const { type, name, data } = req.body || {};
   if (!RESOURCE_TYPES.includes(type)) return res.status(400).json({ error: 'Tipo de recurso no válido' });
   if (!name || !name.trim()) return res.status(400).json({ error: 'El nombre es obligatorio' });
-
+  // GATE ENTERPRISE (anti-clonación): los clientes básicos no pueden crear
+  // agentes con capacidades del pipeline avanzado — ejecutores deterministas
+  // (railway_api, vercel_api, sandbox…) ni herramientas del sistema.
+  if (type === 'agente' && !isOwnerUser(db, req.auth.sub)) {
+    const d = data || {};
+    const pideAvanzado = d.tipo === 'deterministic' || d.executorType
+      || (Array.isArray(d.allowedTools) && d.allowedTools.length > 0);
+    if (pideAvanzado) {
+      return res.status(403).json({ error: ENTERPRISE_REQUIRED_MESSAGE, code: 'enterprise_required' });
+    }
+  }
   const id = uuidv4();
   db.prepare(
     'INSERT INTO resources (id, user_id, type, name, data) VALUES (?, ?, ?, ?, ?)'
@@ -1153,8 +1181,17 @@ app.post('/api/resources', authMiddleware, (req, res) => {
 app.put('/api/resources/:id', authMiddleware, (req, res) => {
   const row = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
   if (!row) return res.status(404).json({ error: 'Recurso no encontrado' });
-
   const { name, data } = req.body || {};
+  // GATE ENTERPRISE (anti-escalada): tampoco por edición se puede convertir
+  // un agente básico en uno avanzado (executor determinista o tools del sistema).
+  if (row.type === 'agente' && data !== undefined && !isOwnerUser(db, req.auth.sub)) {
+    const d = data || {};
+    const pideAvanzado = d.tipo === 'deterministic' || d.executorType
+      || (Array.isArray(d.allowedTools) && d.allowedTools.length > 0);
+    if (pideAvanzado) {
+      return res.status(403).json({ error: ENTERPRISE_REQUIRED_MESSAGE, code: 'enterprise_required' });
+    }
+  }
   const newName = (name && name.trim()) || row.name;
   const newData = data !== undefined ? JSON.stringify(data) : row.data;
 
