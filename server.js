@@ -295,7 +295,6 @@ function seedAdminAccount() {
     console.log(`✅ Cuenta admin/soporte creada para ${email}`);
   }
 }
-seedAdminAccount();
 
 // Catálogo de los 11 agentes por defecto de Zoco IA. Se recrean automáticamente
 // al arrancar el servidor SI el usuario admin no tiene todavía ningún agente
@@ -374,8 +373,35 @@ function seedDefaultAgents() {
     console.log(`ℹ️  Los ${DEFAULT_AGENTS.length} agentes por defecto ya existen para ${email}; no se crea ninguno nuevo.`);
   }
 }
-seedOwnerAgentsIfEmpty(db); // siembra los 11 agentes reales (prompts extraídos de Marisai) si la cuenta owner existe y aún no tiene ninguno
-seedDefaultAgents(); // red de seguridad: solo actúa si ADMIN_EMAIL no coincide con el owner, o si por lo que sea la siembra real no pudo ejecutarse
+
+// ── Siembra inicial (admin + agentes) ──────────────────────────────────────
+// Cada paso va envuelto en su propio try/catch: si CUALQUIERA de estas
+// funciones lanza una excepción (tabla inesperada, bloqueo de SQLite,
+// columna que falta, etc.), el error se registra pero el proceso sigue
+// vivo y continúa hasta app.listen(). Antes, un fallo aquí mataba el
+// proceso ANTES de abrir el puerto, y Railway no tenía nada a lo que
+// hacer ping en el healthcheck.
+try {
+  seedAdminAccount();
+} catch (error) {
+  console.error('[SEED ERROR] Falló seedAdminAccount, pero el servidor sigue vivo:', error);
+}
+
+try {
+  // siembra los 11 agentes reales (prompts extraídos de Marisai) si la
+  // cuenta owner existe y aún no tiene ninguno
+  seedOwnerAgentsIfEmpty(db);
+} catch (error) {
+  console.error('[SEED ERROR] Falló la siembra de agentes owner, pero el servidor sigue vivo:', error);
+}
+
+try {
+  // red de seguridad: solo actúa si ADMIN_EMAIL no coincide con el owner,
+  // o si por lo que sea la siembra real no pudo ejecutarse
+  seedDefaultAgents();
+} catch (error) {
+  console.error('[SEED ERROR] Falló seedDefaultAgents, pero el servidor sigue vivo:', error);
+}
 
 app.use(cors());
 app.use(express.json());
@@ -474,7 +500,11 @@ function firstOfMonthISO() {
   return new Date(d.getFullYear(), d.getMonth(), 1).toISOString();
 }
 
-app.get('/health', (req, res) => {
+// Ruta de salud: registrada muy pronto y ANTES de cualquier lógica pesada
+// de negocio, respondiendo tanto en /health como en /salud (el path que usa
+// el healthcheck de Railway). No depende de la base de datos ni de la
+// siembra, así que responde 200 en cuanto Express empieza a escuchar.
+app.get(['/health', '/salud'], (req, res) => {
   res.json({ status: 'ok', message: 'Zoco IA conectado con éxito' });
 });
 
@@ -1337,7 +1367,7 @@ async function resolveAgentIdBySlug(slug, userId) {
 const publicDir = path.join(__dirname, 'public');
 if (fs.existsSync(publicDir)) {
   app.use(express.static(publicDir));
-  app.get(/^(?!\/(auth|v1|admin|health|api)).*/, (req, res) => {
+  app.get(/^(?!\/(auth|v1|admin|health|salud|api)).*/, (req, res) => {
     res.sendFile(path.join(publicDir, 'index.html'));
   });
 } else {
