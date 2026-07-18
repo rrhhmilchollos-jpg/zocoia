@@ -17,30 +17,46 @@ const execFileAsync = promisify(execFile);
 // ── 1) Tabla de templates maestros ──────────────────────────────────────
 // Se crea de forma aditiva (IF NOT EXISTS) — no toca ninguna tabla de server.js.
 export function ensureBridgeTables(db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS prompt_templates (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      base_prompt TEXT NOT NULL,
-      variables_json TEXT DEFAULT '{}',
-      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
+  // BLINDAJE: esta función se llama de forma SÍNCRONA al arrancar server.js
+  // (línea `registerBridgeAdminRoutes(...)`), fuera de cualquier request.
+  // Si `db.exec`/`run` lanzara (volumen de Railway no listo aún, filesystem
+  // read-only en ese instante, lock de WAL, etc.), antes esa excepción no
+  // se atrapaba en ningún sitio: mataba la carga del módulo server.js
+  // completo y el proceso nunca llegaba a app.listen() -> /health nunca
+  // respondía -> "Healthcheck failed" en Railway. Con este try/catch,
+  // como mucho las tablas/plantillas del puente Marisai no estarán listas
+  // (se reintentará en la siguiente llamada, p.ej. en cada request de
+  // runDeterministicAgent), pero el servidor sigue vivo y /health responde.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS prompt_templates (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        base_prompt TEXT NOT NULL,
+        variables_json TEXT DEFAULT '{}',
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      );
 
-    CREATE TABLE IF NOT EXISTS deterministic_executors (
-      agent_id TEXT PRIMARY KEY,
-      executor_type TEXT NOT NULL,
-      config_json TEXT NOT NULL DEFAULT '{}',
-      action_fee_eur REAL DEFAULT 0
-    );
-  `);
+      CREATE TABLE IF NOT EXISTS deterministic_executors (
+        agent_id TEXT PRIMARY KEY,
+        executor_type TEXT NOT NULL,
+        config_json TEXT NOT NULL DEFAULT '{}',
+        action_fee_eur REAL DEFAULT 0
+      );
+    `);
+  } catch (err) {
+    console.error('⚠️  [bridge-marisai] No se pudieron crear/verificar las tablas del puente:', err.message);
+    return; // no seguimos con el seed si ni siquiera existen las tablas
+  }
 
-  const seedTemplates = db.prepare(`
-    INSERT INTO prompt_templates (id, name, base_prompt, variables_json)
-    VALUES (@id, @name, @base_prompt, @variables_json)
-    ON CONFLICT(id) DO NOTHING
-  `);
+  try {
+    const seedTemplates = db.prepare(`
+      INSERT INTO prompt_templates (id, name, base_prompt, variables_json)
+      VALUES (@id, @name, @base_prompt, @variables_json)
+      ON CONFLICT(id) DO NOTHING
+    `);
 
-  seedTemplates.run({
+    seedTemplates.run({
     id: 'tpl_frontend_master',
     name: 'Frontend Master Prompt',
     base_prompt: `Eres el agente Frontend dentro de un pipeline de desarrollo autónomo multi-agente (Zoco IA / Marisai). Recibes especificaciones ya validadas por el Arquitecto y el Diseñador, y tu única responsabilidad es traducirlas en código de interfaz funcional, coherente con el stack indicado en {framework} y el sistema de diseño {design_system}.
@@ -72,8 +88,13 @@ REGLAS DE OPERACIÓN:
 
 FORMATO DE SALIDA (obligatorio, JSON estricto):
 {"status":"ok"|"error","migration_sql":"string","schema_summary":"string","notes":"string"}`,
-    variables_json: JSON.stringify({ db_engine: 'sqlite' }),
-  });
+      variables_json: JSON.stringify({ db_engine: 'sqlite' }),
+    });
+  } catch (err) {
+    console.error('⚠️  [bridge-marisai] No se pudieron sembrar los templates maestros:', err.message);
+    // No relanzamos: las tablas ya existen (o no se llegó a esta parte),
+    // el servidor sigue arrancando con normalidad.
+  }
 }
 
 // Resuelve el system prompt final de un agente "generic_prompted"
@@ -94,9 +115,16 @@ export function resolveTemplatePrompt({ db, templateId, overrideVars }) {
 // que processChatCompletion(), para que /v1/messages y /api/chat no tengan
 // que distinguir "esto lo respondió un modelo" de "esto lo ejecutó código".
 export async function runDeterministicAgent({ db, uuidv4, userId, agente, agenteData, userMessage }) {
-  ensureBridgeTables(db);
-  const execConfig = db.prepare('SELECT * FROM deterministic_executors WHERE agent_id = ?').get(agente.id);
-  const config = execConfig ? JSON.parse(execConfig.config_json) : {};
+  ensureBridgeTables(db); // ya blindada internamente (ver arriba), no lanza
+
+  let execConfig = null;
+  let config = {};
+  try {
+    execConfig = db.prepare('SELECT * FROM deterministic_executors WHERE agent_id = ?').get(agente.id);
+    config = execConfig ? JSON.parse(execConfig.config_json) : {};
+  } catch (err) {
+    console.error('⚠️  [bridge-marisai] No se pudo leer la config del executor:', err.message);
+  }
   const actionFee = execConfig?.action_fee_eur || 0;
   const contenido = String(userMessage?.content || '');
 
@@ -123,17 +151,23 @@ export async function runDeterministicAgent({ db, uuidv4, userId, agente, agente
   }
 
   // Se guarda en agent_memory igual que una respuesta normal, para que el
-  // historial del agente en el Dashboard sea consistente.
+  // historial del agente en el Dashboard sea consistente. Envuelto en
+  // try/catch: si la escritura en SQLite falla, el usuario debe seguir
+  // recibiendo la respuesta del executor (ya ejecutado) en vez de un 500.
   const textoRespuesta = JSON.stringify(resultado);
-  db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)')
-    .run(uuidv4(), agente.id, userId, 'user', contenido);
-  db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)')
-    .run(uuidv4(), agente.id, userId, 'assistant', textoRespuesta);
+  try {
+    db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)')
+      .run(uuidv4(), agente.id, userId, 'user', contenido);
+    db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)')
+      .run(uuidv4(), agente.id, userId, 'assistant', textoRespuesta);
 
-  if (actionFee > 0) {
-    db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)')
-      .run(uuidv4(), userId, actionFee, 'gasto', `Acción determinista: ${agente.name}`);
-    db.prepare('UPDATE users SET creditos = creditos - ? WHERE id = ?').run(actionFee, userId);
+    if (actionFee > 0) {
+      db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)')
+        .run(uuidv4(), userId, actionFee, 'gasto', `Acción determinista: ${agente.name}`);
+      db.prepare('UPDATE users SET creditos = creditos - ? WHERE id = ?').run(actionFee, userId);
+    }
+  } catch (err) {
+    console.error('⚠️  [bridge-marisai] No se pudo persistir memoria/consumo del executor determinista:', err.message);
   }
 
   return {
