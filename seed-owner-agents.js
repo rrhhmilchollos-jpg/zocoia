@@ -25,6 +25,25 @@ import {
 
 const OWNER_EMAIL = 'rrhh.milchollos@gmail.com';
 
+// REGLA DE FORMATO SEGURO PARA DEEPSEEK-R1 — se añade al FINAL del system
+// prompt de TODOS los agentes sembrados. El motor real detrás de las API
+// Keys de Zoco IA es DeepSeek-R1 (endpoint OpenAI-compatible); sin esta
+// instrucción, los agentes tienden a devolver descripciones de campos o
+// esquemas en vez del código real dentro de los archivos.
+export const DEEPSEEK_SAFE_FORMAT_RULE =
+  '\n\nIMPORTANT: You are running on a DeepSeek-R1/OpenAI compatible endpoint. ' +
+  'Return the absolute raw code inside the file contents. Do not wrap code blocks in metadata definitions. ' +
+  'Never output field descriptions, JSON schemas or placeholders instead of the real code — always emit the complete, working file content. ' +
+  'When asked for JSON, return a single pure JSON object with no markdown fences and no commentary.';
+
+// Añade la regla solo si el prompt no la lleva ya (idempotente ante resiembras).
+const withSafeRule = (prompt) => {
+  if (!prompt) return prompt;
+  return String(prompt).includes('DeepSeek-R1/OpenAI compatible endpoint')
+    ? prompt
+    : prompt + DEEPSEEK_SAFE_FORMAT_RULE;
+};
+
 // Habilidades EXACTAS que pediste para cada agente (estas son decisiones
 // de producto tuyas, no algo extraído del código de Marisai — se guardan
 // tal cual las diste).
@@ -152,7 +171,9 @@ export function seedOwnerAgentsIfEmpty(db) {
 
       const data = {
         tipo: agente.tipo,
-        systemPrompt: agente.systemPrompt,
+        // Todos los prompts se siembran con la regla de formato seguro para
+        // DeepSeek-R1 al final (los agentes deterministas tienen prompt null).
+        systemPrompt: withSafeRule(agente.systemPrompt),
         executorType: agente.executorType || null,
         modelo: 'zoco-plus',
         habilidadesActivas: skillIds,

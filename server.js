@@ -12,7 +12,7 @@ import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { TOOL_DEFINITIONS, ALL_TOOL_NAMES, runToolLoop, makeWorkspacesRoot } from './tools.js';
 import { runDeterministicAgent, resolveTemplatePrompt, registerBridgeAdminRoutes } from './bridge-marisai.js';
-import { seedOwnerAgentsIfEmpty } from './seed-owner-agents.js';
+import { seedOwnerAgentsIfEmpty, DEEPSEEK_SAFE_FORMAT_RULE } from './seed-owner-agents.js';
 import { registerSessionRoutes, validateZocoApiKey } from './zoco-sessions.js';
 
 dotenv.config();
@@ -221,7 +221,9 @@ const OLLAMA_MODEL_MAP = {
 
 const OLLAMA_URL = process.env.OLLAMA_URL;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+// Configurable por entorno: permite apuntar el motor a cualquier endpoint
+// OpenAI-compatible (p.ej. otro despliegue de DeepSeek) sin tocar código.
+const GROQ_API_URL = process.env.GROQ_API_URL || 'https://api.groq.com/openai/v1/chat/completions';
 
 async function webSearch(query) {
   try {
@@ -527,7 +529,22 @@ app.get(['/health', '/salud'], (req, res) => {
   res.json({ status: 'ok', message: 'Zoco IA conectado con éxito' });
 });
 
-async function callChatModel({ usandoOllama, ollamaUrl, ollamaModel, groqModel, messages, maxTokens, temperature, tools, ollamaOptions }) {
+// Compatibilidad DeepSeek-R1: si el modelo detrás del motor emite su
+// razonamiento en <think>...</think>, se elimina SIEMPRE antes de devolver la
+// respuesta a los clientes (Maris AI parsea código/JSON de estas respuestas y
+// el razonamiento lo contaminaría). Cubre bloques completos, aperturas sin
+// cierre (corte por tokens) y cierres huérfanos.
+function stripThink(text) {
+  if (!text) return '';
+  let out = String(text).replace(/<think>[\s\S]*?<\/think>/g, '');
+  const openIdx = out.indexOf('<think>');
+  if (openIdx !== -1 && out.indexOf('</think>', openIdx) === -1) out = out.slice(0, openIdx);
+  const orphanClose = out.indexOf('</think>');
+  if (orphanClose !== -1 && out.lastIndexOf('<think>', orphanClose) === -1) out = out.slice(orphanClose + 8);
+  return out.trim();
+}
+
+async function callChatModel({ usandoOllama, ollamaUrl, ollamaModel, groqModel, messages, maxTokens, temperature, tools, toolChoice, ollamaOptions }) {
   async function doFetch(url, auth, model, extraOllamaOptions) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 30000);
@@ -541,6 +558,9 @@ async function callChatModel({ usandoOllama, ollamaUrl, ollamaModel, groqModel, 
           max_tokens: maxTokens,
           temperature,
           ...(tools && tools.length ? { tools } : {}),
+          // tool_choice en formato OpenAI estándar (passthrough para clientes
+          // como Maris AI que piden tool calling explícito: 'auto'|'required').
+          ...(tools && tools.length && toolChoice ? { tool_choice: toolChoice } : {}),
           // 'options' es una extensión propia de Ollama (num_ctx, num_predict, etc.)
           // sobre el endpoint compatible con OpenAI. Groq la ignora si se le llegara
           // a enviar, así que solo se añade cuando se llama de verdad a Ollama.
@@ -590,7 +610,7 @@ async function callChatModel({ usandoOllama, ollamaUrl, ollamaModel, groqModel, 
  * como Railway, dejando el chat "parado" sin motivo aparente).
  * Lanza errores con `.status` adjunto (mismo patrón que ya usaba esta ruta).
  */
-async function processChatCompletion(authSub, { agentId, messages, model, temperature: temperatureInput, max_tokens: maxTokensInput, sessionSkills }) {
+async function processChatCompletion(authSub, { agentId, messages, model, temperature: temperatureInput, max_tokens: maxTokensInput, sessionSkills, tools: requestTools, tool_choice: requestToolChoice }) {
   if (!GROQ_API_KEY) {
     const e = new Error('GROQ_API_KEY no configurada en el servidor'); e.status = 503; throw e;
   }
@@ -635,6 +655,12 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
     systemPromptText = agenteData.tipo === 'generic_prompted' && agenteData.templateId
       ? resolveTemplatePrompt({ db, templateId: agenteData.templateId, overrideVars: agenteData.templateVars })
       : (agenteData.systemPrompt || `Eres ${agente.name}, un asistente de IA útil y preciso.`);
+    // Regla de formato seguro DeepSeek-R1 en RUNTIME: cubre también a los
+    // agentes ya sembrados en producción antes de este cambio (la siembra es
+    // idempotente y no los pisa). Se añade solo si el prompt no la lleva ya.
+    if (!String(systemPromptText).includes('DeepSeek-R1/OpenAI compatible endpoint')) {
+      systemPromptText += DEEPSEEK_SAFE_FORMAT_RULE;
+    }
     mensajesParaGroq.push({ role: 'system', content: systemPromptText });
     mensajesParaGroq = mensajesParaGroq.concat(historial);
     if (userMessage) mensajesParaGroq.push({ role: 'user', content: String(userMessage.content) });
@@ -695,7 +721,7 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
     : [];
   const allowedTools = [...new Set([...agentTools, ...skillTools])];
 
-  const callModel = (msgs, tools) =>
+  const callModel = (msgs, tools, toolChoice) =>
     callChatModel({
       usandoOllama,
       ollamaUrl: OLLAMA_URL,
@@ -705,13 +731,31 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
       maxTokens,
       temperature,
       tools,
+      toolChoice,
       ollamaOptions,
     });
 
   let respuesta;
   let usage;
+  let clientToolCalls = null;
 
-  if (allowedTools.length > 0) {
+  // TOOLS DEL CLIENTE (formato OpenAI estándar): cuando la petición trae sus
+  // propias tools (p.ej. el pipeline multi-agente de Maris AI hablando
+  // tools/tool_choice), se hace PASSTHROUGH — el modelo decide si llama a una
+  // herramienta y las tool_calls se devuelven al cliente tal cual, que es
+  // quien las ejecuta en su lado. No se mezclan con el bucle interno de
+  // habilidades para no ejecutar herramientas ajenas en este servidor.
+  const clientTools = Array.isArray(requestTools) && requestTools.length > 0
+    && requestTools.every(t => t && t.type === 'function' && t.function?.name)
+    ? requestTools : null;
+
+  if (clientTools) {
+    const data = await callModel(mensajesParaGroq, clientTools, requestToolChoice || 'auto');
+    const msg = data.choices?.[0]?.message || {};
+    respuesta = stripThink(msg.content || '');
+    if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) clientToolCalls = msg.tool_calls;
+    usage = data.usage || {};
+  } else if (allowedTools.length > 0) {
     const result = await runToolLoop({
       messages: mensajesParaGroq,
       callModel,
@@ -719,11 +763,11 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
       workspacesRoot: WORKSPACES_ROOT,
       workspaceId: agentId,
     });
-    respuesta = result.finalMessage;
+    respuesta = stripThink(result.finalMessage);
     usage = result.usage;
   } else {
     const data = await callModel(mensajesParaGroq, undefined);
-    respuesta = data.choices?.[0]?.message?.content || '';
+    respuesta = stripThink(data.choices?.[0]?.message?.content || '');
     usage = data.usage || {};
   }
 
@@ -749,12 +793,24 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   }
 
   return {
-    choices: [{ message: { role: 'assistant', content: respuesta } }],
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: respuesta,
+        // tool_calls en formato OpenAI estándar cuando el cliente trajo tools
+        // propias y el modelo decidió llamar a una (passthrough completo).
+        ...(clientToolCalls ? { tool_calls: clientToolCalls } : {}),
+      },
+      finish_reason: clientToolCalls ? 'tool_calls' : 'stop',
+    }],
     usage: {
       input_tokens: usage.prompt_tokens || 0,
       output_tokens: usage.completion_tokens || 0,
       total_tokens: totalTokens,
       cache_read_tokens: cacheResult.hit ? cacheResult.cachedTokens : 0,
+      // Alias en formato OpenAI para clientes que leen prompt/completion_tokens.
+      prompt_tokens: usage.prompt_tokens || 0,
+      completion_tokens: usage.completion_tokens || 0,
     },
     model: groqModel,
   };
