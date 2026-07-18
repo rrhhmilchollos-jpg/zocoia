@@ -14,6 +14,7 @@ import { TOOL_DEFINITIONS, ALL_TOOL_NAMES, runToolLoop, makeWorkspacesRoot } fro
 import { runDeterministicAgent, resolveTemplatePrompt, registerBridgeAdminRoutes } from './bridge-marisai.js';
 import { seedOwnerAgentsIfEmpty, DEEPSEEK_SAFE_FORMAT_RULE } from './seed-owner-agents.js';
 import { registerSessionRoutes, validateZocoApiKey } from './zoco-sessions.js';
+import { registerConsoleRoutes, resumeInterruptedBatches, buildEnvironmentContext } from './zoco-console.js';
 
 dotenv.config();
 
@@ -679,6 +680,10 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
     if (!String(systemPromptText).includes('DeepSeek-R1/OpenAI compatible endpoint')) {
       systemPromptText += DEEPSEEK_SAFE_FORMAT_RULE;
     }
+    // ENTORNOS: si el usuario tiene un entorno activo (dev/prod), su contexto
+    // operativo (nombre, tipo y variables no sensibles) viaja en el system
+    // prompt — como seleccionar el environment en la consola de Anthropic.
+    systemPromptText += buildEnvironmentContext(db, authSub);
     mensajesParaGroq.push({ role: 'system', content: systemPromptText });
     mensajesParaGroq = mensajesParaGroq.concat(historial);
     if (userMessage) mensajesParaGroq.push({ role: 'user', content: String(userMessage.content) });
@@ -688,6 +693,15 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
     cacheResult = checkAndUpdatePromptCache(authSub, agentId, systemPromptText);
   } else {
     mensajesParaGroq = Array.isArray(messages) ? messages : [{ role: 'user', content: 'Hola' }];
+    // ENTORNOS también en el chat sin agente: si hay entorno activo y la
+    // conversación no trae ya un system message, se antepone uno con el
+    // contexto operativo (sin secretos).
+    const envCtx = buildEnvironmentContext(db, authSub);
+    if (envCtx && !mensajesParaGroq.some(m => m.role === 'system')) {
+      mensajesParaGroq = [{ role: 'system', content: `Eres Zoco IA, un asistente de IA útil y preciso.${envCtx}` }, ...mensajesParaGroq];
+    } else if (envCtx) {
+      mensajesParaGroq = mensajesParaGroq.map(m => m.role === 'system' ? { ...m, content: m.content + envCtx } : m);
+    }
   }
 
   const lastUserMsg = mensajesParaGroq.filter(m => m.role === 'user').slice(-1)[0]?.content || '';
@@ -1426,6 +1440,11 @@ registerBridgeAdminRoutes({ app, db, authMiddleware, requireAdmin, uuidv4 });
 // contexto y habilidades activables por chat, más el Almacén de credenciales
 // que valida y guarda cifrada la API Key de Zoco IA para los agentes.
 registerSessionRoutes({ app, db, authMiddleware, uuidv4, serverSecret: JWT_SECRET, processChatCompletion });
+// Consola estilo Anthropic: Lotes (cola contra Ollama), Implementaciones
+// (Railway/Vercel), Entornos (variables aplicadas al chat) y búsqueda en
+// los Almacenes de memoria.
+registerConsoleRoutes({ app, db, authMiddleware, uuidv4, processChatCompletion });
+resumeInterruptedBatches(db, processChatCompletion);
 
 // ── Endpoint compatible con el formato Anthropic Messages API ─────────────
 // Permite que Marisai (u otro cliente que use el SDK/formato de Anthropic)

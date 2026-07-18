@@ -122,6 +122,31 @@ export default function Dashboard() {
   const [credStatus, setCredStatus] = useState<'idle'|'validating'|'valid'|'invalid'|'saved'>('idle');
   const [credMessage, setCredMessage] = useState('');
 
+  // ── LOTES (Batches): cola real de peticiones contra el motor ────────────
+  const [lotes, setLotes] = useState<any[]>([]);
+  const [loteDetail, setLoteDetail] = useState<any | null>(null);
+  const [loteName, setLoteName] = useState('');
+  const [loteJsonl, setLoteJsonl] = useState('');
+  const [loteAgentId, setLoteAgentId] = useState('');
+  const [loteCreating, setLoteCreating] = useState(false);
+  // ── ENTORNOS: variables dev/prod aplicadas a las llamadas ───────────────
+  const [entornos, setEntornos] = useState<any[]>([]);
+  const [envName, setEnvName] = useState('');
+  const [envKind, setEnvKind] = useState<'development'|'production'>('development');
+  const [envVarsText, setEnvVarsText] = useState('');
+  const [envEditingId, setEnvEditingId] = useState<string | null>(null);
+  // ── IMPLEMENTACIONES: panel de deploys Railway/Vercel ───────────────────
+  const [deployInfo, setDeployInfo] = useState<any | null>(null);
+  const [railwayProjects, setRailwayProjects] = useState<any[]>([]);
+  const [deployBusy, setDeployBusy] = useState<string | null>(null);
+  const [deployMsg, setDeployMsg] = useState('');
+  // ── ALMACENES DE MEMORIA: búsqueda global ───────────────────────────────
+  const [memStores, setMemStores] = useState<any[]>([]);
+  const [memQuery, setMemQuery] = useState('');
+  const [memAgentFilter, setMemAgentFilter] = useState('');
+  const [memResults, setMemResults] = useState<any | null>(null);
+  const [memSearching, setMemSearching] = useState(false);
+
   // Clave de localStorage para el historial de chat: distinta por usuario y por agente
   // (o 'general' si es el chat sin agente), para que no se mezclen conversaciones.
   const chatStorageKey = `zoco_chat_history:${user?.id || 'anon'}:${activeAgent?.id || 'general'}`;
@@ -199,6 +224,11 @@ export default function Dashboard() {
     if (activeTab !== 'chat') setActiveAgent(null);
     // Sesiones persistentes en servidor (estilo consola de Claude)
     if (activeTab === 'sesion' || activeTab === 'chat') load('/api/sesiones', setSesiones);
+    // Flujos especializados de la consola: lotes, entornos, implementaciones, memoria
+    if (activeTab === 'lote') { load('/api/lotes', setLotes); load('/api/resources?type=agente', setAgentes); }
+    if (activeTab === 'entorno') load('/api/entornos', setEntornos);
+    if (activeTab === 'implementacion') load('/api/implementaciones', setDeployInfo);
+    if (activeTab === 'memoria') { load('/api/memoria/almacenes', setMemStores); load('/api/resources?type=agente', setAgentes); }
     // El chat necesita el catálogo de archivos y habilidades para adjuntar/activar
     if (activeTab === 'chat') {
       load('/api/resources?type=archivo', d => setResourcesByType(p => ({ ...p, archivo: d })));
@@ -507,6 +537,147 @@ export default function Dashboard() {
         load('/api/resources?type=credencial', dd => setResourcesByType(p => ({ ...p, credencial: dd })));
       } else { setCredStatus('invalid'); setCredMessage(d.error || 'No se pudo guardar'); }
     } catch { setCredStatus('invalid'); setCredMessage('Error de conexión al guardar'); }
+  };
+
+  // ── LOTES: crear, ver detalle, cancelar, eliminar y descargar resultados ──
+  const createLote = async () => {
+    if (!loteJsonl.trim() || loteCreating) return;
+    setLoteCreating(true);
+    try {
+      // Acepta JSONL ({"custom_id":"x","prompt":"..."} por línea) o texto plano
+      // (cada línea no-JSON se convierte en una petición de prompt directo).
+      const lines = loteJsonl.split('\n').map(l => l.trim()).filter(Boolean);
+      const looksJsonl = lines.every(l => l.startsWith('{'));
+      const body: any = looksJsonl
+        ? { name: loteName || 'Lote sin nombre', agentId: loteAgentId || undefined, jsonl: loteJsonl }
+        : { name: loteName || 'Lote sin nombre', agentId: loteAgentId || undefined, requests: lines.map((l, i) => ({ custom_id: `req-${i + 1}`, prompt: l })) };
+      const r = await fetch(`${API_BASE}/api/lotes`, { method: 'POST', headers: authHeaders(), body: JSON.stringify(body) });
+      const d = await r.json();
+      if (r.ok) {
+        setLoteName(''); setLoteJsonl(''); setLoteAgentId('');
+        load('/api/lotes', setLotes);
+      } else alert(d.error || 'No se pudo crear el lote');
+    } catch { alert('Error de conexión al crear el lote'); }
+    setLoteCreating(false);
+  };
+
+  const openLote = async (id: string) => {
+    try {
+      const r = await fetch(`${API_BASE}/api/lotes/${id}`, { headers: authHeaders() });
+      if (r.ok) setLoteDetail(await r.json());
+    } catch {}
+  };
+
+  const cancelLote = async (id: string) => {
+    await fetch(`${API_BASE}/api/lotes/${id}/cancelar`, { method: 'POST', headers: authHeaders() }).catch(() => {});
+    load('/api/lotes', setLotes);
+    if (loteDetail?.id === id) openLote(id);
+  };
+
+  const deleteLote = async (id: string) => {
+    if (!confirm('¿Eliminar este lote y sus resultados?')) return;
+    await fetch(`${API_BASE}/api/lotes/${id}`, { method: 'DELETE', headers: authHeaders() }).catch(() => {});
+    if (loteDetail?.id === id) setLoteDetail(null);
+    load('/api/lotes', setLotes);
+  };
+
+  const downloadLoteResults = async (id: string) => {
+    try {
+      const r = await fetch(`${API_BASE}/api/lotes/${id}/resultados`, { headers: authHeaders() });
+      if (!r.ok) return alert('No se pudieron descargar los resultados');
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = `lote-${id.slice(0, 8)}-resultados.jsonl`; a.click();
+      URL.revokeObjectURL(url);
+    } catch { alert('Error al descargar'); }
+  };
+
+  // Refresco automático mientras haya lotes en proceso (polling suave cada 4s)
+  useEffect(() => {
+    if (activeTab !== 'lote') return;
+    const anyActive = (lotes || []).some((l: any) => l.status === 'processing' || l.status === 'queued');
+    if (!anyActive && !(loteDetail && (loteDetail.status === 'processing' || loteDetail.status === 'queued'))) return;
+    const t = setInterval(() => {
+      load('/api/lotes', setLotes);
+      if (loteDetail) openLote(loteDetail.id);
+    }, 4000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, lotes, loteDetail?.id, loteDetail?.status]);
+
+  // ── ENTORNOS: crear/editar con variables KEY=VALUE, activar, eliminar ────
+  const parseVarsText = (text: string) => {
+    const vars: Record<string, string> = {};
+    text.split('\n').map(l => l.trim()).filter(Boolean).forEach(line => {
+      const eq = line.indexOf('=');
+      if (eq > 0) vars[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+    });
+    return vars;
+  };
+
+  const saveEntorno = async () => {
+    if (!envName.trim()) return alert('El nombre del entorno es obligatorio');
+    const body = { name: envName.trim(), kind: envKind, variables: parseVarsText(envVarsText) };
+    const url = envEditingId ? `${API_BASE}/api/entornos/${envEditingId}` : `${API_BASE}/api/entornos`;
+    const r = await fetch(url, { method: envEditingId ? 'PUT' : 'POST', headers: authHeaders(), body: JSON.stringify(body) }).catch(() => null);
+    if (r?.ok) {
+      setEnvName(''); setEnvVarsText(''); setEnvKind('development'); setEnvEditingId(null);
+      load('/api/entornos', setEntornos);
+    } else alert('No se pudo guardar el entorno');
+  };
+
+  const editEntorno = (env: any) => {
+    setEnvEditingId(env.id); setEnvName(env.name); setEnvKind(env.kind);
+    setEnvVarsText(Object.entries(env.variables || {}).map(([k, v]) => `${k}=${v}`).join('\n'));
+  };
+
+  const activateEntorno = async (env: any) => {
+    await fetch(`${API_BASE}/api/entornos/${env.id}`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ active: !env.active }) }).catch(() => {});
+    load('/api/entornos', setEntornos);
+  };
+
+  const deleteEntorno = async (id: string) => {
+    if (!confirm('¿Eliminar este entorno y sus variables?')) return;
+    await fetch(`${API_BASE}/api/entornos/${id}`, { method: 'DELETE', headers: authHeaders() }).catch(() => {});
+    load('/api/entornos', setEntornos);
+  };
+
+  // ── IMPLEMENTACIONES: listar servicios Railway y redesplegar ────────────
+  const loadRailwayServices = async () => {
+    setDeployBusy('list'); setDeployMsg('');
+    try {
+      const r = await fetch(`${API_BASE}/api/implementaciones/railway/servicios`, { headers: authHeaders() });
+      const d = await r.json();
+      if (r.ok) setRailwayProjects(d.projects || []);
+      else setDeployMsg(d.error || 'No se pudieron listar los servicios');
+    } catch { setDeployMsg('Error de conexión con el backend'); }
+    setDeployBusy(null);
+  };
+
+  const redeployService = async (provider: string, targetId: string, label: string) => {
+    if (!confirm(`¿Redesplegar "${label}" en ${provider}?`)) return;
+    setDeployBusy(targetId); setDeployMsg('');
+    try {
+      const r = await fetch(`${API_BASE}/api/implementaciones/accion`, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ provider, action: 'redeploy', targetId }) });
+      const d = await r.json();
+      setDeployMsg(r.ok ? `✓ Redeploy lanzado para "${label}"` : `✗ ${d.error || 'El redeploy falló'}`);
+      load('/api/implementaciones', setDeployInfo);
+    } catch { setDeployMsg('Error de conexión al lanzar el redeploy'); }
+    setDeployBusy(null);
+  };
+
+  // ── MEMORIA: búsqueda global sobre los almacenes ───────────────────────
+  const searchMemoria = async () => {
+    if (!memQuery.trim() || memSearching) return;
+    setMemSearching(true);
+    try {
+      const params = new URLSearchParams({ q: memQuery.trim() });
+      if (memAgentFilter) params.set('agenteId', memAgentFilter);
+      const r = await fetch(`${API_BASE}/api/memoria/buscar?${params}`, { headers: authHeaders() });
+      if (r.ok) setMemResults(await r.json());
+    } catch {}
+    setMemSearching(false);
   };
 
   const sendChat = async () => {
@@ -1122,31 +1293,170 @@ export default function Dashboard() {
             </div>
           )}
 
-          {(RESOURCE_SECTIONS || []).filter(s => !['memoria','entorno','implementacion'].includes(s.key) ? false : s.key === activeTab).map(s => (
-            <div key={s.key} className="max-w-4xl">
-              <div className="flex justify-between items-center mb-6">
-                <h1 className="text-2xl font-bold text-white">{s.label}</h1>
-                <button onClick={() => openCreateModal(s.key)} className="bg-white text-black px-4 py-2 rounded-lg text-xs font-medium">+ Nuevo</button>
+          {/* ── ENTORNOS — variables dev/prod aplicadas a las llamadas del motor ── */}
+          {activeTab === 'entorno' && (
+            <div className="max-w-4xl">
+              <div className="mb-6">
+                <h1 className="text-2xl font-bold text-white">Entornos</h1>
+                <p className="text-gray-500 text-xs mt-1">Define variables por entorno (desarrollo/producción). El entorno activo inyecta su contexto en cada llamada de chat y provee los tokens a Implementaciones.</p>
               </div>
-              {(resourcesByType[s.key] || []).length === 0 ? (
-                <div className="bg-[#1a1a1a] border border-dashed border-[#333] rounded-xl p-12 text-center">
-                  <div className="text-4xl mb-3">{s.icon}</div>
-                  <p className="text-gray-600 text-sm">Sin elementos en "{s.label}".</p>
+              <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-5 mb-6">
+                <h2 className="font-bold text-white text-sm mb-3">{envEditingId ? 'Editar entorno' : 'Nuevo entorno'}</h2>
+                <div className="flex space-x-2 mb-3">
+                  <input value={envName} onChange={e => setEnvName(e.target.value)} placeholder="Nombre (ej: Producción Zoco IA)"
+                    className="flex-1 bg-[#111] border border-[#333] text-gray-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-purple-500 placeholder-gray-700" />
+                  <select value={envKind} onChange={e => setEnvKind(e.target.value as any)}
+                    className="bg-[#111] border border-[#333] text-gray-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-purple-500">
+                    <option value="development">Desarrollo</option>
+                    <option value="production">Producción</option>
+                  </select>
                 </div>
-              ) : (resourcesByType[s.key] || []).map(r => (
-                <div key={r.id} className="bg-[#1a1a1a] border border-[#2a2a2a] p-4 rounded-xl flex justify-between mb-2 hover:border-[#333]">
-                  <div className="flex items-center space-x-3">
-                    <span className="text-xl">{s.icon}</span>
-                    <div><p className="font-bold text-white text-sm">{r.name}</p><p className="text-xs text-gray-600">{fmtDate(r.createdAt)}</p></div>
+                <textarea value={envVarsText} onChange={e => setEnvVarsText(e.target.value)} rows={4}
+                  placeholder={'Variables, una por línea KEY=VALUE:\nAPP_URL=https://miapp.up.railway.app\nRAILWAY_TOKEN=xxxx (solo para deploys, nunca viaja al modelo)'}
+                  className="w-full bg-[#111] border border-[#333] text-gray-200 rounded-lg px-3 py-2.5 text-xs font-mono focus:outline-none focus:border-purple-500 placeholder-gray-700 mb-3" />
+                <div className="flex space-x-2">
+                  <button onClick={saveEntorno} className="bg-purple-600 text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-purple-500">{envEditingId ? 'Guardar cambios' : '+ Crear entorno'}</button>
+                  {envEditingId && <button onClick={() => { setEnvEditingId(null); setEnvName(''); setEnvVarsText(''); setEnvKind('development'); }} className="border border-[#333] text-gray-400 px-4 py-2 rounded-lg text-xs hover:bg-[#222]">Cancelar</button>}
+                </div>
+              </div>
+              {(entornos || []).length === 0 ? (
+                <div className="bg-[#1a1a1a] border border-dashed border-[#333] rounded-xl p-12 text-center">
+                  <div className="text-4xl mb-3">🌐</div><p className="text-gray-600 text-sm">Sin entornos. Crea el primero arriba.</p>
+                </div>
+              ) : (entornos || []).map((env: any) => (
+                <div key={env.id} className={`bg-[#1a1a1a] border p-4 rounded-xl flex justify-between mb-2 ${env.active ? 'border-green-700/50' : 'border-[#2a2a2a] hover:border-[#333]'}`}>
+                  <div className="flex items-center space-x-3 min-w-0">
+                    <span className="text-xl">🌐</span>
+                    <div className="min-w-0">
+                      <p className="font-bold text-white text-sm">{env.name}
+                        {env.active && <span className="ml-2 text-[10px] bg-green-900/40 text-green-400 px-1.5 py-0.5 rounded border border-green-800/40">● activo</span>}
+                        <span className={`ml-2 text-[10px] px-1.5 py-0.5 rounded border ${env.kind === 'production' ? 'bg-red-900/20 text-red-400 border-red-800/30' : 'bg-blue-900/20 text-blue-400 border-blue-800/30'}`}>{env.kind === 'production' ? 'producción' : 'desarrollo'}</span>
+                      </p>
+                      <p className="text-xs text-gray-600 truncate">{Object.keys(env.variables || {}).length} variable(s): {Object.keys(env.variables || {}).join(', ') || 'ninguna'}</p>
+                    </div>
                   </div>
-                  <div className="flex items-center space-x-2">
-                    <IconAction title="Editar" onClick={() => openEditModal(r)}>✏️</IconAction>
-                    <IconAction title="Eliminar" danger onClick={() => handleDeleteResource(r.id, s.key)}>🗑</IconAction>
+                  <div className="flex items-center space-x-2 shrink-0">
+                    <button onClick={() => activateEntorno(env)} className={`text-[10px] px-2.5 py-1.5 rounded-lg border transition-colors ${env.active ? 'border-green-800/40 text-green-500 hover:bg-green-900/20' : 'border-[#333] text-gray-400 hover:bg-[#222]'}`}>{env.active ? 'Desactivar' : 'Activar'}</button>
+                    <IconAction title="Editar" onClick={() => editEntorno(env)}>✏️</IconAction>
+                    <IconAction title="Eliminar" danger onClick={() => deleteEntorno(env.id)}>🗑</IconAction>
                   </div>
                 </div>
               ))}
             </div>
-          ))}
+          )}
+
+          {/* ── IMPLEMENTACIONES — panel de deploys Railway/Vercel ── */}
+          {activeTab === 'implementacion' && (
+            <div className="max-w-4xl">
+              <div className="mb-6">
+                <h1 className="text-2xl font-bold text-white">Implementaciones</h1>
+                <p className="text-gray-500 text-xs mt-1">Despliegues reales vía API de Railway y Vercel. Configura RAILWAY_TOKEN o VERCEL_TOKEN como variable en tu entorno activo.</p>
+              </div>
+              <div className="grid grid-cols-2 gap-3 mb-6">
+                <div className={`bg-[#1a1a1a] border rounded-xl p-4 ${deployInfo?.railwayConfigured ? 'border-green-700/40' : 'border-[#2a2a2a]'}`}>
+                  <p className="font-bold text-white text-sm">🚂 Railway</p>
+                  <p className={`text-xs mt-1 ${deployInfo?.railwayConfigured ? 'text-green-400' : 'text-gray-600'}`}>{deployInfo?.railwayConfigured ? '● Token configurado' : '○ Sin token (añade RAILWAY_TOKEN en tu entorno activo)'}</p>
+                </div>
+                <div className={`bg-[#1a1a1a] border rounded-xl p-4 ${deployInfo?.vercelConfigured ? 'border-green-700/40' : 'border-[#2a2a2a]'}`}>
+                  <p className="font-bold text-white text-sm">▲ Vercel</p>
+                  <p className={`text-xs mt-1 ${deployInfo?.vercelConfigured ? 'text-green-400' : 'text-gray-600'}`}>{deployInfo?.vercelConfigured ? '● Token configurado' : '○ Sin token (añade VERCEL_TOKEN en tu entorno activo)'}</p>
+                </div>
+              </div>
+              <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-5 mb-6">
+                <div className="flex justify-between items-center mb-3">
+                  <h2 className="font-bold text-white text-sm">Servicios de Railway</h2>
+                  <button onClick={loadRailwayServices} disabled={deployBusy === 'list' || !deployInfo?.railwayConfigured}
+                    className="border border-purple-700/50 text-purple-300 px-3 py-1.5 rounded-lg text-xs hover:bg-purple-600/10 disabled:opacity-40">{deployBusy === 'list' ? 'Cargando…' : '⟳ Listar servicios'}</button>
+                </div>
+                {deployMsg && <p className={`text-xs mb-3 ${deployMsg.startsWith('✓') ? 'text-green-400' : deployMsg.startsWith('✗') ? 'text-red-400' : 'text-gray-500'}`}>{deployMsg}</p>}
+                {(railwayProjects || []).length === 0
+                  ? <p className="text-xs text-gray-600">Pulsa "Listar servicios" para ver tus proyectos de Railway y redesplegarlos con un clic.</p>
+                  : (railwayProjects || []).map((p: any) => (
+                    <div key={p.id} className="mb-3">
+                      <p className="text-xs font-bold text-gray-400 uppercase mb-1.5">📦 {p.name}</p>
+                      {(p.services || []).map((s: any) => (
+                        <div key={s.id} className="flex justify-between items-center bg-[#111] border border-[#222] rounded-lg px-3 py-2 mb-1.5">
+                          <span className="text-sm text-gray-300">{s.name}</span>
+                          <button onClick={() => redeployService('railway', s.id, s.name)} disabled={deployBusy === s.id}
+                            className="bg-purple-600 text-white px-3 py-1 rounded-lg text-[10px] font-medium hover:bg-purple-500 disabled:opacity-40">{deployBusy === s.id ? 'Desplegando…' : '↻ Redeploy'}</button>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+              </div>
+              <h2 className="text-base font-bold text-white mb-3">Historial de despliegues</h2>
+              {((deployInfo?.logs) || []).length === 0 ? (
+                <div className="bg-[#1a1a1a] border border-dashed border-[#333] rounded-xl p-10 text-center">
+                  <div className="text-4xl mb-3">🚀</div><p className="text-gray-600 text-sm">Sin despliegues todavía.</p>
+                </div>
+              ) : (deployInfo.logs || []).map((l: any) => (
+                <div key={l.id} className="bg-[#1a1a1a] border border-[#2a2a2a] p-3.5 rounded-xl flex justify-between mb-2">
+                  <div className="flex items-center space-x-3">
+                    <span className="text-lg">{l.provider === 'railway' ? '🚂' : '▲'}</span>
+                    <div>
+                      <p className="text-sm text-white font-medium">{l.action} · <code className="text-xs text-gray-500">{String(l.target_id || '').slice(0, 18)}</code></p>
+                      <p className="text-[10px] text-gray-600">{new Date(l.created_at).toLocaleString('es-ES')}</p>
+                    </div>
+                  </div>
+                  <span className={`text-[10px] self-center px-2 py-1 rounded border ${l.status === 'ok' ? 'bg-green-900/30 text-green-400 border-green-800/30' : 'bg-red-900/30 text-red-400 border-red-800/30'}`}>{l.status === 'ok' ? '✓ ok' : '✗ error'}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* ── ALMACENES DE MEMORIA — búsqueda global sobre la memoria de los agentes ── */}
+          {activeTab === 'memoria' && (
+            <div className="max-w-4xl">
+              <div className="mb-6">
+                <h1 className="text-2xl font-bold text-white">Almacenes de memoria</h1>
+                <p className="text-gray-500 text-xs mt-1">Memoria persistente de tus agentes: busca en todos los recuerdos por contenido y relevancia.</p>
+              </div>
+              <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-5 mb-6">
+                <div className="flex space-x-2">
+                  <input value={memQuery} onChange={e => setMemQuery(e.target.value)} onKeyDown={e => e.key === 'Enter' && searchMemoria()}
+                    placeholder="Buscar en la memoria de los agentes…"
+                    className="flex-1 bg-[#111] border border-[#333] text-gray-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-purple-500 placeholder-gray-700" />
+                  <select value={memAgentFilter} onChange={e => setMemAgentFilter(e.target.value)}
+                    className="bg-[#111] border border-[#333] text-gray-300 rounded-lg px-3 py-2.5 text-xs focus:outline-none focus:border-purple-500 max-w-[180px]">
+                    <option value="">Todos los agentes</option>
+                    {(agentes || []).map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                  </select>
+                  <button onClick={searchMemoria} disabled={memSearching || !memQuery.trim()}
+                    className="bg-purple-600 text-white px-4 py-2.5 rounded-lg text-xs font-medium hover:bg-purple-500 disabled:opacity-40">{memSearching ? 'Buscando…' : '🔍 Buscar'}</button>
+                </div>
+                {memResults && (
+                  <div className="mt-4">
+                    <p className="text-xs text-gray-500 mb-2">{memResults.total} recuerdo(s) encontrado(s){memResults.total > 50 ? ' · mostrando los 50 más relevantes' : ''}</p>
+                    {(memResults.results || []).map((r: any) => (
+                      <div key={r.id} className="bg-[#111] border border-[#222] rounded-lg p-3 mb-2">
+                        <div className="flex justify-between items-center mb-1">
+                          <span className="text-[10px] bg-purple-900/30 text-purple-400 px-1.5 py-0.5 rounded border border-purple-800/30">🤖 {r.agente} · {r.role === 'assistant' ? 'IA' : 'Tú'}</span>
+                          <span className="text-[10px] text-gray-700">relevancia {r.score} · {new Date(r.created_at).toLocaleDateString('es-ES')}</span>
+                        </div>
+                        <p className="text-xs text-gray-400">{r.snippet}</p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <h2 className="text-base font-bold text-white mb-3">Almacenes por agente</h2>
+              {(memStores || []).length === 0 ? (
+                <div className="bg-[#1a1a1a] border border-dashed border-[#333] rounded-xl p-10 text-center">
+                  <div className="text-4xl mb-3">🧠</div><p className="text-gray-600 text-sm">Sin almacenes de memoria todavía.</p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-3">
+                  {(memStores || []).map((m: any) => (
+                    <div key={m.agente_id} className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-4 hover:border-[#333]">
+                      <p className="font-bold text-white text-sm truncate">🧠 {m.agente}</p>
+                      <p className="text-xs text-gray-600 mt-1">{m.recuerdos} recuerdo(s){m.ultimo ? ` · último: ${new Date(m.ultimo).toLocaleDateString('es-ES')}` : ''}</p>
+                      <button onClick={() => { setMemAgentFilter(m.agente_id); setMemQuery(''); setMemResults(null); }} className="text-purple-400 text-[10px] hover:underline mt-2">Filtrar búsqueda por este agente →</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* ── SESIONES — historial de conversaciones estilo consola de Claude ── */}
           {activeTab === 'sesion' && (
@@ -1259,7 +1569,87 @@ export default function Dashboard() {
             </div>
           )}
 
-          {['archivo','habilidad','lote'].includes(activeTab) && (() => {
+          {/* ── LOTES — procesamiento por lotes real contra el motor Ollama ── */}
+          {activeTab === 'lote' && (
+            <div className="max-w-4xl">
+              <div className="mb-6">
+                <h1 className="text-2xl font-bold text-white">Lotes</h1>
+                <p className="text-gray-500 text-xs mt-1">Envía múltiples peticiones en un lote: se procesan en cola contra el motor y descargas los resultados en JSONL, como los Message Batches.</p>
+              </div>
+              <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-5 mb-6">
+                <h2 className="font-bold text-white text-sm mb-3">Nuevo lote</h2>
+                <div className="flex space-x-2 mb-3">
+                  <input value={loteName} onChange={e => setLoteName(e.target.value)} placeholder="Nombre del lote (ej: Clasificar 50 correos)"
+                    className="flex-1 bg-[#111] border border-[#333] text-gray-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-purple-500 placeholder-gray-700" />
+                  <select value={loteAgentId} onChange={e => setLoteAgentId(e.target.value)}
+                    className="bg-[#111] border border-[#333] text-gray-300 rounded-lg px-3 py-2.5 text-xs focus:outline-none focus:border-purple-500 max-w-[190px]">
+                    <option value="">Sin agente (modelo directo)</option>
+                    {(agentes || []).map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                  </select>
+                </div>
+                <textarea value={loteJsonl} onChange={e => setLoteJsonl(e.target.value)} rows={5}
+                  placeholder={'Una petición por línea. Texto plano:\nResume las ventajas de Ollama\nTraduce "hello world" al español\n\n…o JSONL:\n{"custom_id":"req-1","prompt":"Resume las ventajas de Ollama"}'}
+                  className="w-full bg-[#111] border border-[#333] text-gray-200 rounded-lg px-3 py-2.5 text-xs font-mono focus:outline-none focus:border-purple-500 placeholder-gray-700 mb-3" />
+                <button onClick={createLote} disabled={loteCreating || !loteJsonl.trim()}
+                  className="bg-purple-600 text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-purple-500 disabled:opacity-40">{loteCreating ? 'Creando…' : '▶ Crear y procesar lote'}</button>
+              </div>
+              {(lotes || []).length === 0 ? (
+                <div className="bg-[#1a1a1a] border border-dashed border-[#333] rounded-xl p-12 text-center">
+                  <div className="text-4xl mb-3">📦</div><p className="text-gray-600 text-sm">Sin lotes todavía. Crea el primero arriba.</p>
+                </div>
+              ) : (lotes || []).map((l: any) => (
+                <div key={l.id} className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl mb-2 hover:border-[#333]">
+                  <div className="p-4 flex justify-between items-center cursor-pointer" onClick={() => loteDetail?.id === l.id ? setLoteDetail(null) : openLote(l.id)}>
+                    <div className="flex items-center space-x-3 min-w-0">
+                      <span className="text-xl">📦</span>
+                      <div className="min-w-0">
+                        <p className="font-bold text-white text-sm truncate">{l.name}
+                          <span className={`ml-2 text-[10px] px-1.5 py-0.5 rounded border ${
+                            l.status === 'completed' ? 'bg-green-900/30 text-green-400 border-green-800/30'
+                            : l.status === 'processing' ? 'bg-blue-900/30 text-blue-400 border-blue-800/30'
+                            : l.status === 'cancelled' ? 'bg-red-900/30 text-red-400 border-red-800/30'
+                            : 'bg-[#222] text-gray-500 border-[#333]'}`}>
+                            {l.status === 'completed' ? '✓ completado' : l.status === 'processing' ? '● procesando' : l.status === 'cancelled' ? 'cancelado' : 'en cola'}
+                          </span>
+                        </p>
+                        <p className="text-xs text-gray-600">{l.completed}/{l.total} completadas{l.failed > 0 ? ` · ${l.failed} fallidas` : ''} · {new Date(l.created_at).toLocaleString('es-ES')}</p>
+                        {l.status === 'processing' && (
+                          <div className="w-48 h-1 bg-[#222] rounded-full mt-1.5 overflow-hidden">
+                            <div className="h-full bg-blue-500 rounded-full transition-all" style={{ width: `${l.total ? Math.round(((l.completed + l.failed) / l.total) * 100) : 0}%` }} />
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex items-center space-x-2 shrink-0" onClick={e => e.stopPropagation()}>
+                      {l.status === 'completed' && <button onClick={() => downloadLoteResults(l.id)} className="text-[10px] border border-green-800/40 text-green-400 px-2.5 py-1.5 rounded-lg hover:bg-green-900/20">⬇ JSONL</button>}
+                      {(l.status === 'processing' || l.status === 'queued') && <button onClick={() => cancelLote(l.id)} className="text-[10px] border border-[#333] text-gray-400 px-2.5 py-1.5 rounded-lg hover:bg-[#222]">Cancelar</button>}
+                      <IconAction title="Eliminar" danger onClick={() => deleteLote(l.id)}>🗑</IconAction>
+                    </div>
+                  </div>
+                  {loteDetail?.id === l.id && (
+                    <div className="border-t border-[#222] bg-[#161616] p-4" onClick={e => e.stopPropagation()}>
+                      <p className="text-[11px] font-bold text-gray-500 uppercase mb-2">Peticiones del lote</p>
+                      <div className="space-y-2 max-h-64 overflow-y-auto">
+                        {(loteDetail.requests || []).map((rq: any) => (
+                          <div key={rq.id} className="bg-[#111] border border-[#222] rounded-lg p-2.5 text-xs">
+                            <div className="flex justify-between mb-1">
+                              <code className="text-purple-400 text-[10px]">{rq.custom_id}</code>
+                              <span className={`text-[10px] ${rq.status === 'completed' ? 'text-green-500' : rq.status === 'failed' ? 'text-red-500' : 'text-gray-600'}`}>{rq.status === 'completed' ? '✓' : rq.status === 'failed' ? '✗' : '…'} {rq.status}</span>
+                            </div>
+                            <p className="text-gray-500 truncate">{rq.prompt}</p>
+                            {rq.result && <p className="text-gray-300 mt-1 line-clamp-3 whitespace-pre-wrap">{rq.result}</p>}
+                            {rq.error && <p className="text-red-400 mt-1">{rq.error}</p>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {['archivo','habilidad'].includes(activeTab) && (() => {
             const s = (RESOURCE_SECTIONS || []).find(x => x.key === activeTab)!;
             return (
               <div className="max-w-4xl">
