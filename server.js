@@ -549,19 +549,10 @@ function firstOfMonthISO() {
   return new Date(d.getFullYear(), d.getMonth(), 1).toISOString();
 }
 
-// Timeout del cliente HTTP hacia Ollama. Los prompts grandes (sistema +
-// historial largo) tardan más en el primer forward-pass sobre infraestructura
-// local sin GPU dedicada; 30s cortaba la petición antes de que Ollama
-// terminara de procesar el prompt inicial. Configurable por env var para
-// no tener que tocar código si hace falta ajustar más adelante.
-const OLLAMA_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS || 120000);
-// Nº de reintentos ante timeout de Ollama antes de rendirse (sin caer a Groq).
-const OLLAMA_MAX_RETRIES = Number(process.env.OLLAMA_MAX_RETRIES || 1);
-
 async function callChatModel({ usandoOllama, ollamaUrl, ollamaModel, groqModel, messages, maxTokens, temperature, tools, ollamaOptions }) {
-  async function doFetch(url, auth, model, extraOllamaOptions, timeoutMs = 30000) {
+  async function doFetch(url, auth, model, extraOllamaOptions) {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
     try {
       const resp = await fetch(url, {
         method: 'POST',
@@ -591,36 +582,25 @@ async function callChatModel({ usandoOllama, ollamaUrl, ollamaModel, groqModel, 
     }
   }
 
-  // Zoco IA corre 100% sobre tu Ollama local: si usandoOllama es true, NO
-  // hay salto a Groq bajo ningún concepto (ni por timeout, ni por error de
-  // conexión). Ante timeout se reintenta (OLLAMA_MAX_RETRIES veces) con el
-  // mismo timeout ampliado; si sigue fallando, se devuelve 504 al cliente
-  // en vez de derivar la petición a una API de terceros.
   if (usandoOllama) {
-    const url = `${ollamaUrl.replace(/\/+$/, '')}/v1/chat/completions`;
-    let lastErr;
-    for (let intento = 0; intento <= OLLAMA_MAX_RETRIES; intento++) {
-      try {
-        return await doFetch(url, 'Bearer ollama', ollamaModel, ollamaOptions, OLLAMA_TIMEOUT_MS);
-      } catch (err) {
-        lastErr = err;
-        if (err.name === 'AbortError') {
-          console.warn(`Ollama timeout (${OLLAMA_TIMEOUT_MS}ms) en intento ${intento + 1}/${OLLAMA_MAX_RETRIES + 1}`);
-          continue; // reintenta contra Ollama, nunca contra Groq
-        }
-        break; // error que no es de timeout: no tiene sentido reintentar igual
+    try {
+      return await doFetch(`${ollamaUrl.replace(/\/+$/, '')}/v1/chat/completions`, 'Bearer ollama', ollamaModel, ollamaOptions);
+    } catch (err) {
+      if (err.name === 'AbortError' && GROQ_API_KEY) {
+        console.warn('Ollama timeout — usando Groq como fallback');
+        return await doFetch(GROQ_API_URL, `Bearer ${GROQ_API_KEY}`, groqModel);
       }
-    }
-    if (lastErr?.name === 'AbortError') {
-      const e = new Error(`Timeout: Ollama tardó más de ${OLLAMA_TIMEOUT_MS}ms en responder tras ${OLLAMA_MAX_RETRIES + 1} intento(s)`);
-      e.status = 504;
+      if (err.name === 'AbortError') {
+        const e = new Error('Timeout: el modelo tardó demasiado en responder');
+        e.status = 504;
+        throw e;
+      }
+      const e = new Error('Error de conexión con el modelo de IA');
+      e.status = 502;
       throw e;
     }
-    const e = new Error('Error de conexión con Ollama');
-    e.status = 502;
-    throw e;
   }
-  return await doFetch(GROQ_API_URL, `Bearer ${GROQ_API_KEY}`, groqModel, undefined, 30000);
+  return await doFetch(GROQ_API_URL, `Bearer ${GROQ_API_KEY}`, groqModel);
 }
 
 /**
