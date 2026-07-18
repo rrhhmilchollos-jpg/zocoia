@@ -27,6 +27,15 @@ COPY server.js tools.js bridge-marisai.js ./
 ENV NODE_ENV=production
 ENV PORT=8080
 
+# BLINDAJE DE DATOS: declara /data como volumen — documenta la intención de
+# persistencia a nivel de imagen. NOTA IMPORTANTE: esto por sí solo NO basta
+# en Railway; sigue siendo obligatorio adjuntar un Volume real desde el
+# dashboard de Railway (Command Palette ⌘K → "Create Volume", montado en
+# /data) para que RAILWAY_VOLUME_MOUNT_PATH exista y la base de datos
+# sobreviva a los redeploys.
+RUN mkdir -p /data
+VOLUME ["/data"]
+
 EXPOSE 8080
 
 CMD ["node", "server.js"]
