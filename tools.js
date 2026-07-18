@@ -294,4 +294,11 @@ export async function runToolLoop({ messages, callModel, allowedTools, workspace
       continue; // siguiente vuelta del loop con el resultado ya disponible
     }
 
-    return 
+    return { finalMessage: message.content || '', usage: usageTotal };
+  }
+
+  return {
+    finalMessage: 'He ejecutado varias acciones pero necesito más contexto para continuar. ¿Puedes darme más detalles?',
+    usage: usageTotal,
+  };
+}
