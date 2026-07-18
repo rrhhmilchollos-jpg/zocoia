@@ -150,11 +150,16 @@ async function executeCode(workspaceDir, { language, code }) {
     execFile(
       command,
       [tmpFile],
-      { cwd: workspaceDir, timeout: 8000, maxBuffer: 1024 * 1024, env: {} },
+      {
+        cwd: workspaceDir,
+        timeout: Number(process.env.EXEC_CODE_TIMEOUT_MS || 60000),
+        maxBuffer: Number(process.env.EXEC_CODE_MAX_BUFFER || 10 * 1024 * 1024),
+        env: {},
+      },
       async (error, stdout, stderr) => {
         await fs.unlink(tmpFile).catch(() => {});
         if (error && error.killed) {
-          resolve({ success: false, error: 'Timeout: la ejecución superó 8 segundos' });
+          resolve({ success: false, error: `Timeout: la ejecución superó ${Number(process.env.EXEC_CODE_TIMEOUT_MS || 60000) / 1000}s` });
         } else if (error) {
           resolve({ success: false, error: stderr || error.message });
         } else {
@@ -244,7 +249,7 @@ export async function runTool(name, args, { workspacesRoot, workspaceId, allowed
   }
 }
 
-const MAX_TOOL_ITERATIONS = 5;
+const MAX_TOOL_ITERATIONS = Number(process.env.MAX_TOOL_ITERATIONS || 25);
 
 /**
  * Bucle de function-calling: llama al modelo, si pide tools las ejecuta,
@@ -289,11 +294,4 @@ export async function runToolLoop({ messages, callModel, allowedTools, workspace
       continue; // siguiente vuelta del loop con el resultado ya disponible
     }
 
-    return { finalMessage: message.content || '', usage: usageTotal };
-  }
-
-  return {
-    finalMessage: 'He ejecutado varias acciones pero necesito más contexto para continuar. ¿Puedes darme más detalles?',
-    usage: usageTotal,
-  };
-}
+    return 
