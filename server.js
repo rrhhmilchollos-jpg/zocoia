@@ -13,6 +13,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { TOOL_DEFINITIONS, ALL_TOOL_NAMES, runToolLoop, makeWorkspacesRoot } from './tools.js';
 import { runDeterministicAgent, resolveTemplatePrompt, registerBridgeAdminRoutes } from './bridge-marisai.js';
 import { seedOwnerAgentsIfEmpty } from './seed-owner-agents.js';
+import { registerSessionRoutes, validateZocoApiKey } from './zoco-sessions.js';
 
 dotenv.config();
 
@@ -469,6 +470,24 @@ function authMiddleware(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'No autenticado' });
+
+  // API Keys de Zoco IA (sk-zoco-...): permiten que Maris AI y cualquier
+  // cliente externo (SDK de Anthropic/OpenAI apuntando a esta base URL) se
+  // autentique con la clave de la organización en vez de un JWT de sesión.
+  // La clave se valida contra su hash sha256 en la tabla api_keys, se marca
+  // el last_used_at, y la petición actúa en nombre del dueño de la clave.
+  if (token.startsWith('sk-zoco-')) {
+    const check = validateZocoApiKey(db, token);
+    if (!check.valid) return res.status(401).json({ error: `API Key inválida: ${check.reason}` });
+    try {
+      db.prepare('UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(check.keyId);
+    } catch {}
+    const owner = db.prepare('SELECT id, is_admin, is_support FROM users WHERE id = ?').get(check.ownerId);
+    if (!owner) return res.status(401).json({ error: 'La cuenta propietaria de la clave no existe' });
+    req.auth = { sub: owner.id, isAdmin: !!owner.is_admin, isSupport: !!owner.is_support, viaApiKey: true, apiKeyId: check.keyId };
+    return next();
+  }
+
   try {
     req.auth = jwt.verify(token, JWT_SECRET);
     next();
@@ -571,7 +590,7 @@ async function callChatModel({ usandoOllama, ollamaUrl, ollamaModel, groqModel, 
  * como Railway, dejando el chat "parado" sin motivo aparente).
  * Lanza errores con `.status` adjunto (mismo patrón que ya usaba esta ruta).
  */
-async function processChatCompletion(authSub, { agentId, messages, model, temperature: temperatureInput, max_tokens: maxTokensInput }) {
+async function processChatCompletion(authSub, { agentId, messages, model, temperature: temperatureInput, max_tokens: maxTokensInput, sessionSkills }) {
   if (!GROQ_API_KEY) {
     const e = new Error('GROQ_API_KEY no configurada en el servidor'); e.status = 503; throw e;
   }
@@ -628,7 +647,10 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   }
 
   const lastUserMsg = mensajesParaGroq.filter(m => m.role === 'user').slice(-1)[0]?.content || '';
-  if (needsWebSearch(lastUserMsg)) {
+  // Las habilidades activas de la sesión pueden forzar la búsqueda web aunque
+  // el heurístico de palabras clave no la detecte (activación dinámica por chat).
+  const skillForcesWeb = !!(sessionSkills && sessionSkills.busquedaWeb);
+  if (skillForcesWeb || needsWebSearch(lastUserMsg)) {
     const searchResults = await webSearch(lastUserMsg);
     if (searchResults) {
       const webCtx = `\n\n[CONTEXTO WEB - ${new Date().toLocaleDateString('es-ES')}]\n${searchResults}\n[FIN CONTEXTO WEB]\nUsa este contexto para responder con información actualizada.`;
@@ -663,9 +685,15 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   // options nativas de Ollama; solo tienen efecto cuando usandoOllama = true
   const ollamaOptions = { num_predict: numPredict, num_ctx: numCtx };
 
-  const allowedTools = agentId
+  // Tools permitidas: las del agente (si hay agente) + las aportadas por las
+  // habilidades activas de la sesión (activación dinámica estilo claude.ai).
+  const skillTools = Array.isArray(sessionSkills?.allowedTools)
+    ? sessionSkills.allowedTools.filter(t => ALL_TOOL_NAMES.includes(t))
+    : [];
+  const agentTools = agentId
     ? (Array.isArray(agenteData.allowedTools) ? agenteData.allowedTools : ALL_TOOL_NAMES)
     : [];
+  const allowedTools = [...new Set([...agentTools, ...skillTools])];
 
   const callModel = (msgs, tools) =>
     callChatModel({
@@ -971,6 +999,35 @@ app.delete('/api/keys/:id', authMiddleware, (req, res) => {
   const key = db.prepare('SELECT * FROM api_keys WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
   if (!key) return res.status(404).json({ error: 'Clave no encontrada' });
   db.prepare('DELETE FROM api_keys WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// Renombrar una API key (el Dashboard llama a PUT /api/keys/:id al editar).
+app.put('/api/keys/:id', authMiddleware, (req, res) => {
+  const key = db.prepare('SELECT * FROM api_keys WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
+  if (!key) return res.status(404).json({ error: 'Clave no encontrada' });
+  const { name } = req.body || {};
+  if (!name || !name.trim()) return res.status(400).json({ error: 'El nombre es obligatorio' });
+  db.prepare('UPDATE api_keys SET name = ? WHERE id = ?').run(name.trim(), key.id);
+  res.json({ ok: true, id: key.id, name: name.trim() });
+});
+
+// Alias de memoria que usa el Dashboard: /api/resources/:id/memory → misma
+// lógica que /api/agentes/:id/memoria (GET) y su DELETE. Se añaden para que
+// el botón "🧠 Memoria" de las tarjetas de agentes funcione de verdad.
+app.get('/api/resources/:id/memory', authMiddleware, (req, res) => {
+  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(req.params.id, req.auth.sub, 'agente');
+  if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
+  const mensajes = db.prepare('SELECT id, role, content, created_at FROM agent_memory WHERE agente_id = ? ORDER BY created_at ASC').all(req.params.id);
+  const cacheActiva = db.prepare('SELECT COUNT(*) as count FROM prompt_cache WHERE agente_id = ? AND expires_at > ?').get(req.params.id, Date.now()).count;
+  res.json({ mensajes, cacheActiva: cacheActiva > 0 });
+});
+
+app.delete('/api/resources/:id/memory', authMiddleware, (req, res) => {
+  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(req.params.id, req.auth.sub, 'agente');
+  if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
+  db.prepare('DELETE FROM agent_memory WHERE agente_id = ?').run(req.params.id);
+  db.prepare('DELETE FROM prompt_cache WHERE agente_id = ?').run(req.params.id);
   res.json({ ok: true });
 });
 
@@ -1288,6 +1345,12 @@ app.put('/admin/clientes/:id', authMiddleware, requireAdmin, (req, res) => {
 // templates maestros, config de executors deterministas). Todas viven bajo
 // /admin/bridge/* y reutilizan authMiddleware + requireAdmin ya existentes.
 registerBridgeAdminRoutes({ app, db, authMiddleware, requireAdmin, uuidv4 });
+
+// ── Sesiones estilo consola de Claude + Archivos + Credenciales Zoco IA ────
+// Conversaciones persistentes en servidor con adjuntos de archivos de
+// contexto y habilidades activables por chat, más el Almacén de credenciales
+// que valida y guarda cifrada la API Key de Zoco IA para los agentes.
+registerSessionRoutes({ app, db, authMiddleware, uuidv4, serverSecret: JWT_SECRET, processChatCompletion });
 
 // ── Endpoint compatible con el formato Anthropic Messages API ─────────────
 // Permite que Marisai (u otro cliente que use el SDK/formato de Anthropic)

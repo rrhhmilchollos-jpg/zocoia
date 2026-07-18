@@ -1,15 +1,27 @@
-import { ai as gemini } from "@workspace/integrations-gemini-ai";
+// CONEXIÓN EXCLUSIVA A ZOCO IA: se eliminó el import del SDK nativo de Gemini
+// (no se usaba). El cliente `anthropic` apunta al endpoint de Zoco IA vía
+// ZOCOIA_API_URL/ZOCOIA_API_KEY (ver repo maris-ai → lib/integrations-anthropic-ai).
 import { anthropic } from "@workspace/integrations-anthropic-ai";
 import { MarisPnpmOrchestrator, CoreOrchestrator } from "@workspace/services";
 import OpenAI from "openai";
 
-// Lazy OpenAI client — evita crash al arrancar si la API key no está configurada
+// Cliente OpenAI-compatible — CONEXIÓN EXCLUSIVA A ZOCO IA.
+// Ya no apunta a api.openai.com: usa el endpoint /v1/chat/completions del
+// backend de Zoco IA firmado con la API Key de la organización (sk-zoco-...).
 let _openaiApps: OpenAI | null = null;
 function getOpenAIApps(): OpenAI {
   if (!_openaiApps) {
+    const zocoKey = process.env.ZOCOIA_API_KEY;
+    const zocoUrl = process.env.ZOCOIA_API_URL;
+    if (!zocoKey || !zocoKey.startsWith("sk-zoco-") || !zocoUrl) {
+      throw new Error(
+        "Conexión a Zoco IA no configurada: define ZOCOIA_API_URL y ZOCOIA_API_KEY (sk-zoco-...). " +
+          "Las claves nativas de OpenAI ya no se aceptan: todo el tráfico viaja por Zoco IA.",
+      );
+    }
     _openaiApps = new OpenAI({
-      baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
-      apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY || "dummy",
+      baseURL: `${zocoUrl.replace(/\/+$/, "")}/v1`,
+      apiKey: zocoKey,
     });
   }
   return _openaiApps;

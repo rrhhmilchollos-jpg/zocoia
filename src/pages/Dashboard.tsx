@@ -8,7 +8,8 @@ interface BillingSummary { creditos: number; gastoEsteMes: number; recursos: Rec
 interface MemoriaMensaje { id: string; role: string; content: string; created_at: string; }
 interface Payment { id: string; amount: number; credits: number; status: string; created_at: string; }
 interface CreditPack { id: string; euros: number; credits: number; label: string; }
-interface ChatMsg { role: string; content: string; }
+interface ChatMsg { role: string; content: string; attachments?: string[]; }
+interface SesionChat { id: string; title: string; agentId: string | null; model: string; attachedFileIds: string[]; activeSkillIds: string[]; preview?: string; messageCount?: number; createdAt: string; updatedAt: string; }
 
 function fmtEUR(n: number) { return `${(n || 0).toFixed(2)} €`; }
 function fmtDate(s: string) { return new Date(s).toLocaleDateString('es-ES'); }
@@ -107,6 +108,20 @@ export default function Dashboard() {
   const [activeAgent, setActiveAgent] = useState<Recurso | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
+  // ── Sesiones persistentes estilo consola de Claude ──────────────────────
+  const [sesiones, setSesiones] = useState<SesionChat[]>([]);
+  const [activeSession, setActiveSession] = useState<SesionChat | null>(null);
+  // Adjuntos (archivos de contexto) y habilidades activas de la conversación actual
+  const [chatAttachments, setChatAttachments] = useState<string[]>([]);
+  const [chatSkills, setChatSkills] = useState<string[]>([]);
+  const [attachMenuOpen, setAttachMenuOpen] = useState(false);
+  const [skillsMenuOpen, setSkillsMenuOpen] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  // Almacén de credenciales: flujo de validación de la API Key de Zoco IA
+  const [credKeyInput, setCredKeyInput] = useState('');
+  const [credStatus, setCredStatus] = useState<'idle'|'validating'|'valid'|'invalid'|'saved'>('idle');
+  const [credMessage, setCredMessage] = useState('');
+
   // Clave de localStorage para el historial de chat: distinta por usuario y por agente
   // (o 'general' si es el chat sin agente), para que no se mezclen conversaciones.
   const chatStorageKey = `zoco_chat_history:${user?.id || 'anon'}:${activeAgent?.id || 'general'}`;
@@ -182,6 +197,13 @@ export default function Dashboard() {
     if (activeTab === 'billing') { load('/api/payments/history', setPayments); load('/api/billing/summary', setBilling); }
     if (activeTab === 'admin') { load('/admin/clientes', setAdminUsuarios); load('/admin/stats', setAdminStats); }
     if (activeTab !== 'chat') setActiveAgent(null);
+    // Sesiones persistentes en servidor (estilo consola de Claude)
+    if (activeTab === 'sesion' || activeTab === 'chat') load('/api/sesiones', setSesiones);
+    // El chat necesita el catálogo de archivos y habilidades para adjuntar/activar
+    if (activeTab === 'chat') {
+      load('/api/resources?type=archivo', d => setResourcesByType(p => ({ ...p, archivo: d })));
+      load('/api/resources?type=habilidad', d => setResourcesByType(p => ({ ...p, habilidad: d })));
+    }
     const rs = RESOURCE_SECTIONS.find(s => s.key === activeTab);
     if (rs) load(`/api/resources?type=${rs.key}`, d => setResourcesByType(p => ({ ...p, [rs.key]: d })));
   }, [activeTab, load]);
@@ -387,26 +409,146 @@ export default function Dashboard() {
     if (r.ok) load('/admin/clientes', setAdminUsuarios);
   };
 
+  // ── Sesiones persistentes (estilo consola de Claude) ────────────────────
+  const openSession = async (s: SesionChat) => {
+    try {
+      const r = await fetch(`${API_BASE}/api/sesiones/${s.id}`, { headers: authHeaders() });
+      if (!r.ok) return;
+      const d = await r.json();
+      setActiveSession(d);
+      setChatAttachments(d.attachedFileIds || []);
+      setChatSkills(d.activeSkillIds || []);
+      setChatMessages((d.mensajes || []).map((m: any) => ({ role: m.role, content: m.content, attachments: m.attachments })));
+      const agente = (agentes || []).find(a => a.id === d.agentId) || null;
+      setActiveAgent(agente);
+      if (d.model) setSelectedModel(d.model);
+      setActiveTab('chat');
+    } catch {}
+  };
+
+  const newSession = () => {
+    // Empezar conversación nueva: la sesión real se crea en el servidor al
+    // enviar el primer mensaje (igual que claude.ai).
+    setActiveSession(null);
+    setChatMessages([]);
+    setChatAttachments([]);
+    setChatSkills([]);
+    setActiveTab('chat');
+  };
+
+  const deleteSession = async (id: string) => {
+    if (!confirm('¿Eliminar esta conversación?')) return;
+    const r = await fetch(`${API_BASE}/api/sesiones/${id}`, { method: 'DELETE', headers: authHeaders() });
+    if (r.ok) {
+      setSesiones(p => p.filter(s => s.id !== id));
+      if (activeSession?.id === id) newSession();
+    }
+  };
+
+  const renameSession = async (s: SesionChat) => {
+    const title = prompt('Nuevo título de la conversación:', s.title);
+    if (!title || !title.trim()) return;
+    const r = await fetch(`${API_BASE}/api/sesiones/${s.id}`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ title }) });
+    if (r.ok) {
+      setSesiones(p => p.map(x => x.id === s.id ? { ...x, title: title.trim() } : x));
+      if (activeSession?.id === s.id) setActiveSession(p => p ? { ...p, title: title.trim() } : p);
+    }
+  };
+
+  // Subida de archivos de contexto (desde el clip del chat o la sección Archivos)
+  const handleFileUpload = async (file: File, attachToChat: boolean) => {
+    try {
+      const text = await file.text();
+      const r = await fetch(`${API_BASE}/api/archivos/upload`, {
+        method: 'POST', headers: authHeaders(),
+        body: JSON.stringify({ name: file.name, content: text, mimeType: file.type || 'text/plain' }),
+      });
+      if (r.ok) {
+        const d = await r.json();
+        load('/api/resources?type=archivo', dd => setResourcesByType(p => ({ ...p, archivo: dd })));
+        if (attachToChat) setChatAttachments(p => [...new Set([...p, d.id])]);
+        load('/api/billing/summary', setBilling);
+        return d;
+      } else {
+        const e = await r.json().catch(() => ({}));
+        alert(e.error || 'No se pudo subir el archivo');
+      }
+    } catch { alert('No se pudo leer el archivo (solo se admiten archivos de texto)'); }
+    return null;
+  };
+
+  const toggleChatAttachment = (fileId: string) => {
+    setChatAttachments(p => p.includes(fileId) ? p.filter(x => x !== fileId) : [...p, fileId]);
+  };
+  const toggleChatSkill = (skillId: string) => {
+    setChatSkills(p => p.includes(skillId) ? p.filter(x => x !== skillId) : [...p, skillId]);
+  };
+
+  // Almacén de credenciales: validar y guardar la API Key de Zoco IA
+  const handleValidateCred = async () => {
+    if (!credKeyInput.trim()) return;
+    setCredStatus('validating'); setCredMessage('');
+    try {
+      const r = await fetch(`${API_BASE}/api/credenciales/validar`, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ apiKey: credKeyInput.trim() }) });
+      const d = await r.json();
+      if (d.valid) { setCredStatus('valid'); setCredMessage(`Clave válida${d.keyName ? ` (${d.keyName})` : ''}. Puedes guardarla de forma segura.`); }
+      else { setCredStatus('invalid'); setCredMessage(d.reason || 'Clave no válida'); }
+    } catch { setCredStatus('invalid'); setCredMessage('Error de conexión al validar'); }
+  };
+
+  const handleSaveCred = async () => {
+    setCredStatus('validating');
+    try {
+      const r = await fetch(`${API_BASE}/api/credenciales/zoco`, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ apiKey: credKeyInput.trim() }) });
+      const d = await r.json();
+      if (r.ok) {
+        setCredStatus('saved'); setCredMessage(`Credencial guardada cifrada (${d.display}). Los agentes ya pueden usarla.`);
+        setCredKeyInput('');
+        load('/api/resources?type=credencial', dd => setResourcesByType(p => ({ ...p, credencial: dd })));
+      } else { setCredStatus('invalid'); setCredMessage(d.error || 'No se pudo guardar'); }
+    } catch { setCredStatus('invalid'); setCredMessage('Error de conexión al guardar'); }
+  };
+
   const sendChat = async () => {
     if (!chatInput.trim() || chatLoading) return;
-    const userMsg = { role: 'user', content: chatInput };
+    const texto = chatInput;
+    const userMsg = { role: 'user', content: chatInput, attachments: chatAttachments.length ? [...chatAttachments] : undefined };
     setChatMessages(p => [...p, userMsg]);
     setChatInput('');
     setChatLoading(true);
     try {
-      const r = await fetch(`${API_BASE}/api/chat`, {
-        method: 'POST',
-        headers: authHeaders(),
-        body: JSON.stringify({
-          message: chatInput,
-          agentId: activeAgent?.id,
-          model: selectedModel,
-          history: chatMessages
-        })
-      });
-      if (r.ok) {
-        const d = await r.json();
-        setChatMessages(p => [...p, { role: 'assistant', content: d.response }]);
+      // 1) Asegurar sesión persistente en servidor (se crea al primer mensaje)
+      let session = activeSession;
+      if (!session) {
+        const rs = await fetch(`${API_BASE}/api/sesiones`, {
+          method: 'POST', headers: authHeaders(),
+          body: JSON.stringify({ agentId: activeAgent?.id || null, model: selectedModel, attachedFileIds: chatAttachments, activeSkillIds: chatSkills }),
+        });
+        if (rs.ok) { session = await rs.json(); setActiveSession(session); }
+      }
+
+      if (session) {
+        // 2) Enviar el mensaje dentro de la sesión (persistencia + adjuntos + habilidades)
+        const r = await fetch(`${API_BASE}/api/sesiones/${session.id}/mensajes`, {
+          method: 'POST', headers: authHeaders(),
+          body: JSON.stringify({ message: texto, attachments: chatAttachments, skills: chatSkills }),
+        });
+        if (r.ok) {
+          const d = await r.json();
+          setChatMessages(p => [...p, { role: 'assistant', content: d.response }]);
+          load('/api/sesiones', setSesiones);
+          load('/api/billing/summary', setBilling);
+        } else {
+          const e = await r.json().catch(() => ({}));
+          setChatMessages(p => [...p, { role: 'assistant', content: `⚠️ ${e.error || 'Error al procesar el mensaje'}` }]);
+        }
+      } else {
+        // Fallback al endpoint clásico si la sesión no se pudo crear
+        const r = await fetch(`${API_BASE}/api/chat`, {
+          method: 'POST', headers: authHeaders(),
+          body: JSON.stringify({ message: texto, agentId: activeAgent?.id, model: selectedModel, history: chatMessages }),
+        });
+        if (r.ok) { const d = await r.json(); setChatMessages(p => [...p, { role: 'assistant', content: d.response }]); }
       }
     } finally { setChatLoading(false); }
   };
@@ -661,18 +803,24 @@ export default function Dashboard() {
               <div className="flex items-center justify-between mb-4">
                 <div>
                   <h1 className="text-xl font-bold text-white">
-                    {activeAgent ? `Chat con ${activeAgent.name}` : 'Chat con Zoco IA'}
+                    {activeSession?.title || (activeAgent ? `Chat con ${activeAgent.name}` : 'Chat con Zoco IA')}
                   </h1>
-                  {activeAgent && (
-                    <button
-                      onClick={() => { setActiveAgent(null); setChatMessages([]); }}
-                      className="text-xs text-purple-400 hover:underline mt-0.5"
-                    >
-                      ← Volver al chat general
-                    </button>
-                  )}
+                  <div className="flex items-center space-x-3 mt-0.5">
+                    {activeAgent && (
+                      <button
+                        onClick={() => { setActiveAgent(null); newSession(); }}
+                        className="text-xs text-purple-400 hover:underline"
+                      >
+                        ← Volver al chat general
+                      </button>
+                    )}
+                    {activeSession && (
+                      <span className="text-[10px] text-gray-600">Sesión guardada · {activeSession.id.slice(0, 8)}…</span>
+                    )}
+                  </div>
                 </div>
                 <div className="flex items-center space-x-2">
+                  <button onClick={newSession} className="text-purple-300 hover:text-white text-xs border border-purple-700/40 bg-purple-600/10 px-2.5 py-1 rounded-lg transition-colors">+ Nueva conversación</button>
                   <span className="text-xs text-gray-500">Modelo:</span>
                   <select value={selectedModel} onChange={e => handleSelectModel(e.target.value)}
                     className="bg-[#1a1a1a] border border-[#333] text-gray-300 text-xs px-2 py-1 rounded-lg">
@@ -687,10 +835,11 @@ export default function Dashboard() {
                     <div className="text-5xl mb-4">{activeAgent ? activeAgent.name.charAt(0).toUpperCase() : 'Z'}</div>
                     <p className="text-gray-400 font-medium">{activeAgent ? `${activeAgent.name} listo` : 'Zoco IA listo'}</p>
                     <p className="text-xs mt-1 text-gray-600">Modelo: {(MODELOS || []).find(m => m.backend === selectedModel)?.nombre || selectedModel}</p>
-                    <p className="text-xs mt-0.5 text-gray-700 font-mono">Ollama: {(MODELOS || []).find(m => m.backend === selectedModel)?.ollamaModel || 'llama3.2'} · Groq fallback: llama-3.3-70b</p>
+                    <p className="text-xs mt-0.5 text-gray-700 font-mono">Motor Zoco IA · {(MODELOS || []).find(m => m.backend === selectedModel)?.ollamaModel || 'Zoco-Plus'}</p>
                     {activeAgent
                       ? <p className="text-xs mt-1 text-gray-600">🧠 Memoria persistente de este agente activada</p>
                       : <p className="text-xs mt-1 text-gray-600">🌐 Búsqueda web automática activada</p>}
+                    <p className="text-xs mt-3 text-gray-700">📎 Adjunta archivos de contexto y activa ⚡ habilidades desde la barra inferior</p>
                   </div>
                 )}
                 {(chatMessages || []).map((m, i) => (
@@ -717,7 +866,89 @@ export default function Dashboard() {
                 )}
                 <div ref={chatEndRef} />
               </div>
+              {/* Chips de contexto activo (archivos adjuntos + habilidades), estilo claude.ai */}
+              {(chatAttachments.length > 0 || chatSkills.length > 0) && (
+                <div className="flex flex-wrap gap-1.5 mb-2">
+                  {chatAttachments.map(id => {
+                    const f = (resourcesByType['archivo'] || []).find(x => x.id === id);
+                    return (
+                      <span key={id} className="inline-flex items-center space-x-1 bg-[#1a1a1a] border border-[#333] text-gray-300 text-[11px] px-2 py-1 rounded-lg">
+                        <span>📎 {f?.name || id.slice(0, 8)}</span>
+                        <button onClick={() => toggleChatAttachment(id)} className="text-gray-600 hover:text-red-400 ml-1">×</button>
+                      </span>
+                    );
+                  })}
+                  {chatSkills.map(id => {
+                    const h = (resourcesByType['habilidad'] || []).find(x => x.id === id);
+                    return (
+                      <span key={id} className="inline-flex items-center space-x-1 bg-purple-900/20 border border-purple-700/40 text-purple-300 text-[11px] px-2 py-1 rounded-lg">
+                        <span>⚡ {h?.name || id.slice(0, 8)}</span>
+                        <button onClick={() => toggleChatSkill(id)} className="text-purple-500 hover:text-red-400 ml-1">×</button>
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Menú de adjuntar archivos de contexto */}
+              {attachMenuOpen && (
+                <div className="mb-2 bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-3">
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">Adjuntar archivos de contexto</p>
+                    <button onClick={() => fileInputRef.current?.click()} className="text-purple-400 text-xs hover:underline">⬆ Subir nuevo archivo</button>
+                  </div>
+                  {(resourcesByType['archivo'] || []).length === 0 ? (
+                    <p className="text-xs text-gray-600 italic">No hay archivos. Sube uno o créalo en la sección Archivos.</p>
+                  ) : (
+                    <div className="space-y-1 max-h-32 overflow-y-auto">
+                      {(resourcesByType['archivo'] || []).map(f => (
+                        <div key={f.id} onClick={() => toggleChatAttachment(f.id)} className="flex items-center space-x-2 cursor-pointer group py-0.5">
+                          <div className={`w-3.5 h-3.5 rounded border flex items-center justify-center text-[10px] transition-colors ${chatAttachments.includes(f.id) ? 'bg-purple-600 border-purple-600 text-white' : 'border-gray-700 group-hover:border-gray-500'}`}>
+                            {chatAttachments.includes(f.id) && '✓'}
+                          </div>
+                          <span className="text-xs text-gray-400 group-hover:text-gray-200">📄 {f.name}</span>
+                          {f.data?.sizeBytes ? <span className="text-[10px] text-gray-700">{Math.ceil(f.data.sizeBytes / 1024)} KB</span> : null}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Menú de habilidades activables en esta conversación */}
+              {skillsMenuOpen && (
+                <div className="mb-2 bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-3">
+                  <p className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-2">Habilidades activas en esta conversación</p>
+                  {(resourcesByType['habilidad'] || []).length === 0 ? (
+                    <p className="text-xs text-gray-600 italic">No hay habilidades. Créalas en la sección Habilidades.</p>
+                  ) : (
+                    <div className="space-y-1 max-h-32 overflow-y-auto">
+                      {(resourcesByType['habilidad'] || []).map(h => (
+                        <div key={h.id} onClick={() => toggleChatSkill(h.id)} className="flex items-center space-x-2 cursor-pointer group py-0.5">
+                          <div className={`w-3.5 h-3.5 rounded border flex items-center justify-center text-[10px] transition-colors ${chatSkills.includes(h.id) ? 'bg-purple-600 border-purple-600 text-white' : 'border-gray-700 group-hover:border-gray-500'}`}>
+                            {chatSkills.includes(h.id) && '✓'}
+                          </div>
+                          <span className="text-xs text-gray-400 group-hover:text-gray-200">⚡ {h.name}</span>
+                          {h.data?.descripcion && <span className="text-[10px] text-gray-700 truncate max-w-[200px]">{h.data.descripcion}</span>}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <input ref={fileInputRef} type="file" accept=".txt,.md,.csv,.json,.js,.ts,.tsx,.jsx,.py,.html,.css,.xml,.yml,.yaml,.log" className="hidden"
+                onChange={async e => { const f = e.target.files?.[0]; if (f) { await handleFileUpload(f, true); } e.target.value = ''; }} />
+
               <div className="flex space-x-2">
+                <button onClick={() => { setAttachMenuOpen(o => !o); setSkillsMenuOpen(false); }} title="Adjuntar archivos de contexto"
+                  className={`px-3 py-3 rounded-xl border text-sm transition-colors ${attachMenuOpen || chatAttachments.length > 0 ? 'border-purple-500/60 bg-purple-600/10 text-purple-300' : 'border-[#333] bg-[#1a1a1a] text-gray-500 hover:text-gray-300'}`}>
+                  📎{chatAttachments.length > 0 && <span className="ml-1 text-[10px]">{chatAttachments.length}</span>}
+                </button>
+                <button onClick={() => { setSkillsMenuOpen(o => !o); setAttachMenuOpen(false); }} title="Activar habilidades en esta conversación"
+                  className={`px-3 py-3 rounded-xl border text-sm transition-colors ${skillsMenuOpen || chatSkills.length > 0 ? 'border-purple-500/60 bg-purple-600/10 text-purple-300' : 'border-[#333] bg-[#1a1a1a] text-gray-500 hover:text-gray-300'}`}>
+                  ⚡{chatSkills.length > 0 && <span className="ml-1 text-[10px]">{chatSkills.length}</span>}
+                </button>
                 <input type="text" value={chatInput} onChange={e => setChatInput(e.target.value)}
                   onKeyDown={e => e.key === 'Enter' && !e.shiftKey && sendChat()}
                   placeholder="Escribe un mensaje... (Intro para enviar)" disabled={chatLoading}
@@ -891,7 +1122,7 @@ export default function Dashboard() {
             </div>
           )}
 
-          {(RESOURCE_SECTIONS || []).filter(s => !['sesion','memoria','credencial','entorno','implementacion'].includes(s.key) ? false : s.key === activeTab).map(s => (
+          {(RESOURCE_SECTIONS || []).filter(s => !['memoria','entorno','implementacion'].includes(s.key) ? false : s.key === activeTab).map(s => (
             <div key={s.key} className="max-w-4xl">
               <div className="flex justify-between items-center mb-6">
                 <h1 className="text-2xl font-bold text-white">{s.label}</h1>
@@ -917,13 +1148,129 @@ export default function Dashboard() {
             </div>
           ))}
 
+          {/* ── SESIONES — historial de conversaciones estilo consola de Claude ── */}
+          {activeTab === 'sesion' && (
+            <div className="max-w-4xl">
+              <div className="flex justify-between items-center mb-6">
+                <div>
+                  <h1 className="text-2xl font-bold text-white">Sesiones</h1>
+                  <p className="text-gray-500 text-xs mt-1">Historial de conversaciones guardadas en el servidor · haz clic para retomar cualquier chat</p>
+                </div>
+                <button onClick={newSession} className="bg-white text-black px-4 py-2 rounded-lg text-xs font-medium hover:bg-gray-200">+ Nueva conversación</button>
+              </div>
+              {(sesiones || []).length === 0 ? (
+                <div className="bg-[#1a1a1a] border border-dashed border-[#333] rounded-xl p-16 text-center">
+                  <div className="text-5xl mb-4">💬</div>
+                  <p className="text-gray-500 text-sm">No tienes conversaciones guardadas todavía.</p>
+                  <button onClick={newSession} className="mt-4 text-purple-400 text-xs hover:underline">Empezar la primera →</button>
+                </div>
+              ) : (sesiones || []).map(s => {
+                const agente = (agentes || []).find(a => a.id === s.agentId);
+                return (
+                  <div key={s.id} onClick={() => openSession(s)}
+                    className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-4 mb-2 cursor-pointer hover:border-purple-600/50 transition-colors flex items-center justify-between">
+                    <div className="flex items-center space-x-3 min-w-0">
+                      <div className="w-9 h-9 bg-gradient-to-br from-purple-600 to-blue-700 rounded-xl flex items-center justify-center text-white text-sm shrink-0">💬</div>
+                      <div className="min-w-0">
+                        <p className="font-bold text-white text-sm truncate">{s.title || 'Conversación sin título'}</p>
+                        <p className="text-xs text-gray-600 truncate">{s.preview || 'Sin mensajes'}</p>
+                        <div className="flex items-center space-x-2 mt-1">
+                          <span className="text-[10px] text-gray-700">{fmtDate(s.updatedAt || s.createdAt)}</span>
+                          {agente && <span className="text-[10px] bg-purple-900/30 text-purple-400 px-1.5 py-0.5 rounded border border-purple-800/30">🤖 {agente.name}</span>}
+                          {(s.attachedFileIds || []).length > 0 && <span className="text-[10px] text-gray-600">📎 {s.attachedFileIds.length}</span>}
+                          {(s.activeSkillIds || []).length > 0 && <span className="text-[10px] text-gray-600">⚡ {s.activeSkillIds.length}</span>}
+                          {typeof s.messageCount === 'number' && <span className="text-[10px] text-gray-700">{s.messageCount} mensajes</span>}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex items-center space-x-2 shrink-0">
+                      <IconAction title="Renombrar" onClick={() => renameSession(s)}>✏️</IconAction>
+                      <IconAction title="Eliminar" danger onClick={() => deleteSession(s.id)}>🗑</IconAction>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* ── ALMACÉN DE CREDENCIALES — API Key de Zoco IA validada y cifrada ── */}
+          {activeTab === 'credencial' && (
+            <div className="max-w-4xl">
+              <div className="flex justify-between items-center mb-6">
+                <div>
+                  <h1 className="text-2xl font-bold text-white">Almacén de credenciales</h1>
+                  <p className="text-gray-500 text-xs mt-1">Valida y guarda de forma cifrada la API Key de Zoco IA que usarán tus agentes</p>
+                </div>
+                <button onClick={() => openCreateModal('credencial')} className="bg-white text-black px-4 py-2 rounded-lg text-xs font-medium hover:bg-gray-200">+ Otra credencial</button>
+              </div>
+
+              <div className="bg-[#1a1a1a] border border-purple-800/40 rounded-xl p-5 mb-6">
+                <div className="flex items-center space-x-2 mb-1">
+                  <span className="text-lg">🔐</span>
+                  <h2 className="font-bold text-white text-sm">API Key de Zoco IA</h2>
+                  <span className="bg-purple-900/50 text-purple-300 text-[9px] px-1.5 py-0.5 rounded border border-purple-700/40">Proveedor exclusivo</span>
+                </div>
+                <p className="text-gray-500 text-xs mb-4">Todo el pipeline multi-agente (Researcher, Architect, Designer, Frontend, Backend, QA, Patcher…) viaja firmado con esta clave. Se guarda cifrada con AES-256-GCM y nunca se muestra completa.</p>
+                <div className="flex space-x-2">
+                  <input type="password" value={credKeyInput} onChange={e => { setCredKeyInput(e.target.value); setCredStatus('idle'); setCredMessage(''); }}
+                    placeholder="sk-zoco-..." autoComplete="off"
+                    className="flex-1 bg-[#111] border border-[#333] text-gray-200 rounded-lg px-3 py-2.5 text-sm font-mono focus:outline-none focus:border-purple-500 placeholder-gray-700" />
+                  <button onClick={handleValidateCred} disabled={credStatus === 'validating' || !credKeyInput.trim()}
+                    className="border border-purple-700/50 text-purple-300 px-4 py-2.5 rounded-lg text-xs font-medium hover:bg-purple-600/10 disabled:opacity-40 transition-colors">
+                    {credStatus === 'validating' ? 'Validando…' : 'Validar'}
+                  </button>
+                  <button onClick={handleSaveCred} disabled={credStatus !== 'valid'}
+                    className="bg-purple-600 text-white px-4 py-2.5 rounded-lg text-xs font-medium hover:bg-purple-500 disabled:opacity-40 transition-colors">
+                    Guardar cifrada
+                  </button>
+                </div>
+                {credMessage && (
+                  <p className={`text-xs mt-3 ${credStatus === 'valid' || credStatus === 'saved' ? 'text-green-400' : credStatus === 'invalid' ? 'text-red-400' : 'text-gray-500'}`}>
+                    {credStatus === 'valid' && '✓ '}{credStatus === 'saved' && '🔒 '}{credStatus === 'invalid' && '✗ '}{credMessage}
+                  </p>
+                )}
+                <p className="text-[10px] text-gray-700 mt-3">¿No tienes clave? Genera una en la sección <button onClick={() => setActiveTab('keys')} className="text-purple-400 hover:underline">API Keys</button> y pégala aquí.</p>
+              </div>
+
+              <h2 className="text-base font-bold text-white mb-3">Credenciales guardadas</h2>
+              {(resourcesByType['credencial'] || []).length === 0 ? (
+                <div className="bg-[#1a1a1a] border border-dashed border-[#333] rounded-xl p-10 text-center">
+                  <div className="text-4xl mb-3">🔒</div>
+                  <p className="text-gray-600 text-sm">Sin credenciales guardadas.</p>
+                </div>
+              ) : (resourcesByType['credencial'] || []).map(r => (
+                <div key={r.id} className="bg-[#1a1a1a] border border-[#2a2a2a] p-4 rounded-xl flex justify-between mb-2 hover:border-[#333]">
+                  <div className="flex items-center space-x-3">
+                    <span className="text-xl">{r.data?.provider === 'zocoia' ? '🔐' : '🔒'}</span>
+                    <div>
+                      <p className="font-bold text-white text-sm">{r.name}</p>
+                      <p className="text-xs text-gray-600">
+                        {r.data?.display ? <code className="font-mono">{r.data.display}</code> : fmtDate(r.createdAt)}
+                        {r.data?.provider === 'zocoia' && <span className="ml-2 text-green-500">● validada · cifrada</span>}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <IconAction title="Editar" onClick={() => openEditModal(r)}>✏️</IconAction>
+                    <IconAction title="Eliminar" danger onClick={() => handleDeleteResource(r.id, 'credencial')}>🗑</IconAction>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
           {['archivo','habilidad','lote'].includes(activeTab) && (() => {
             const s = (RESOURCE_SECTIONS || []).find(x => x.key === activeTab)!;
             return (
               <div className="max-w-4xl">
                 <div className="flex justify-between items-center mb-6">
                   <h1 className="text-2xl font-bold text-white">{s.label}</h1>
-                  <button onClick={() => openCreateModal(s.key)} className="bg-white text-black px-4 py-2 rounded-lg text-xs font-medium">+ Nuevo</button>
+                  <div className="flex items-center space-x-2">
+                    {s.key === 'archivo' && (
+                      <button onClick={() => fileInputRef.current?.click()} className="border border-purple-700/50 text-purple-300 px-4 py-2 rounded-lg text-xs font-medium hover:bg-purple-600/10 transition-colors">⬆ Subir archivo</button>
+                    )}
+                    <button onClick={() => openCreateModal(s.key)} className="bg-white text-black px-4 py-2 rounded-lg text-xs font-medium">+ Nuevo</button>
+                  </div>
                 </div>
                 {(resourcesByType[s.key] || []).length === 0 ? (
                   <div className="bg-[#1a1a1a] border border-dashed border-[#333] rounded-xl p-12 text-center">
