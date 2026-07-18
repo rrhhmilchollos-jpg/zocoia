@@ -1215,7 +1215,16 @@ export default function Dashboard() {
                   <label className="mb-2 block text-xs font-bold uppercase text-gray-400 tracking-wider">Habilidades disponibles</label>
                   <div className="space-y-1 max-h-32 overflow-y-auto p-2 bg-[#1a1a1e] rounded border border-gray-800">
                     {(resourcesByType['habilidad'] || []).length === 0 ? (
-                      <p className="text-[10px] text-gray-600 italic">No hay habilidades creadas.</p>
+                      <p className="text-[10px] text-gray-600 italic">
+                        No hay habilidades creadas.{' '}
+                        <button
+                          type="button"
+                          onClick={() => setActiveTab('habilidad')}
+                          className="text-[#996dff] underline not-italic hover:text-[#b18fff]"
+                        >
+                          Crear una habilidad
+                        </button>
+                      </p>
                     ) : (resourcesByType['habilidad'] || []).map(h => (
                       <div key={h.id} onClick={() => toggleHabilidadForm(h.id)} className="flex items-center space-x-2 cursor-pointer group">
                         <div className={`w-3.5 h-3.5 rounded border flex items-center justify-center transition-colors ${formHabilidadesActivas.includes(h.id) ? 'bg-[#996dff] border-[#996dff]' : 'border-gray-700 group-hover:border-gray-500'}`}>
