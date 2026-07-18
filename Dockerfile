@@ -27,14 +27,16 @@ COPY server.js tools.js bridge-marisai.js ./
 ENV NODE_ENV=production
 ENV PORT=8080
 
-# BLINDAJE DE DATOS: declara /data como volumen — documenta la intención de
-# persistencia a nivel de imagen. NOTA IMPORTANTE: esto por sí solo NO basta
-# en Railway; sigue siendo obligatorio adjuntar un Volume real desde el
-# dashboard de Railway (Command Palette ⌘K → "Create Volume", montado en
-# /data) para que RAILWAY_VOLUME_MOUNT_PATH exista y la base de datos
-# sobreviva a los redeploys.
+# BLINDAJE DE DATOS: la persistencia real NO se declara aquí. Railway
+# RECHAZA explícitamente la directiva `VOLUME` de Docker ("dockerfile
+# invalid: docker VOLUME ... is not supported, use Railway Volumes") —
+# tuvo que quitarse de este Dockerfile porque directamente rompía el deploy.
+# El único paso que hace persistente /data es 100% de configuración, fuera
+# de este archivo: Railway dashboard → este servicio → Command Palette ⌘K
+# → "Create Volume" → móntalo en /data. En cuanto exista, Railway inyecta
+# RAILWAY_VOLUME_MOUNT_PATH=/data automáticamente y server.js ya lo detecta
+# y lo usa sin tocar nada más (ver DB_PATH en server.js).
 RUN mkdir -p /data
-VOLUME ["/data"]
 
 EXPOSE 8080
 
