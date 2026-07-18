@@ -11,6 +11,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { TOOL_DEFINITIONS, ALL_TOOL_NAMES, runToolLoop, makeWorkspacesRoot } from './tools.js';
+import { runDeterministicAgent, resolveTemplatePrompt, registerBridgeAdminRoutes } from './bridge-marisai.js';
 
 dotenv.config();
 
@@ -154,6 +155,13 @@ if (!userColumns.includes('modelo_activo')) {
 
 const RESOURCE_TYPES = ['agente', 'archivo', 'habilidad', 'lote', 'sesion', 'implementacion', 'entorno', 'credencial', 'memoria'];
 
+// Umbral de saldo negativo tolerado antes de bloquear peticiones nuevas,
+// igual que la consola real de Anthropic (-$0.83). Por debajo de esto,
+// processChatCompletion() rechaza con 402 aunque `activo` siga en 1 —
+// así se distingue "sin saldo" (bloqueo automático por deuda) de
+// "cuenta desactivada por el admin" (bloqueo manual, activo=0).
+const BALANCE_BLOCK_THRESHOLD = Number(process.env.BALANCE_BLOCK_THRESHOLD_USD || -0.83);
+
 const MODELOS_VALIDOS = [
   'zoco-flash', 'zoco-plus', 'zoco-max', 'zoco-lab',
   'maris-velox', 'maris-core', 'maris-pro', 'maris-beta',
@@ -266,18 +274,25 @@ seedAdminAccount();
 // Las Habilidades/Entornos/Implementaciones específicas de tu operación no
 // estaban detalladas, así que no se inventan valores (API keys, URLs, etc.);
 // puedes añadirlos desde el panel una vez creados los agentes.
+// `tipo` clasifica cada agente para el puente con Marisai (ver bridge-marisai.js):
+//   'prompted'          -> prompt dedicado, se guarda As-Is desde Marisai
+//   'generic_prompted'  -> reutiliza un system prompt maestro parametrizable
+//   'deterministic'      -> no pasa por ningún modelo, ejecuta código real
+// Los `systemPrompt` de abajo son placeholders de Zoco IA por defecto; usa
+// POST /admin/agentes/:id/import-marisai (bridge-marisai.js) para sobrescribir
+// cada uno con el prompt EXACTO migrado de Marisai, sin tocar esta siembra.
 const DEFAULT_AGENTS = [
-  { name: 'Agente de Investigación (Researcher)', systemPrompt: 'Eres el Agente de Investigación de Zoco IA. Tu trabajo es buscar información actualizada en internet, analizarla y sintetizarla en briefs técnicos claros, con fuentes cuando sea posible.' },
-  { name: 'Agente Arquitecto', systemPrompt: 'Eres el Agente Arquitecto de Zoco IA. Diseñas arquitecturas de software (backend, frontend, infraestructura) y tomas decisiones técnicas de alto nivel, explicando trade-offs.' },
-  { name: 'Agente de Diseño (Diseñador)', systemPrompt: 'Eres el Agente de Diseño de Zoco IA. Ayudas con UX/UI, sistemas de diseño, wireframes y decisiones visuales, priorizando claridad y usabilidad.' },
-  { name: 'Agente de Interfaz', systemPrompt: 'Eres el Agente de Interfaz de Zoco IA. Te especializas en implementar componentes de frontend (React/TypeScript), maquetación y experiencia de usuario en código real.' },
-  { name: 'Agente de Backend', systemPrompt: 'Eres el Agente de Backend de Zoco IA. Implementas APIs, lógica de servidor, autenticación e integración con bases de datos, priorizando seguridad y buenas prácticas.' },
-  { name: 'Agente de Base de Datos', systemPrompt: 'Eres el Agente de Base de Datos de Zoco IA. Diseñas esquemas, escribes consultas eficientes y asesoras sobre migraciones, índices y modelado de datos.' },
-  { name: 'Agente de Integraciones', systemPrompt: 'Eres el Agente de Integraciones de Zoco IA. Conectas servicios de terceros (pagos, email, APIs externas) y resuelves problemas de autenticación/webhooks entre sistemas.' },
-  { name: 'Agente de Control de Calidad (QA)', systemPrompt: 'Eres el Agente de QA de Zoco IA. Revisas código y funcionalidades en busca de bugs, casos límite y regresiones, y propones planes de prueba.' },
-  { name: 'Agente DevOps', systemPrompt: 'Eres el Agente DevOps de Zoco IA. Te ocupas de despliegues, CI/CD, variables de entorno, contenedores y la fiabilidad de la infraestructura (incluyendo Railway).' },
-  { name: 'Agente de Pruebas (Testing)', systemPrompt: 'Eres el Agente de Pruebas de Zoco IA. Escribes y ejecutas tests unitarios, de integración y end-to-end, e informas resultados de forma clara.' },
-  { name: 'Agente de Reparación', systemPrompt: 'Eres el Agente de Reparación de Zoco IA. Diagnosticas errores a partir de logs/stack traces y propones o aplicas el fix más seguro y mínimo posible.' },
+  { name: 'Agente de Investigación (Researcher)', tipo: 'prompted', systemPrompt: 'Eres el Agente de Investigación de Zoco IA. Tu trabajo es buscar información actualizada en internet, analizarla y sintetizarla en briefs técnicos claros, con fuentes cuando sea posible.' },
+  { name: 'Agente Arquitecto', tipo: 'prompted', systemPrompt: 'Eres el Agente Arquitecto de Zoco IA. Diseñas arquitecturas de software (backend, frontend, infraestructura) y tomas decisiones técnicas de alto nivel, explicando trade-offs.' },
+  { name: 'Agente de Diseño (Diseñador)', tipo: 'prompted', systemPrompt: 'Eres el Agente de Diseño de Zoco IA. Ayudas con UX/UI, sistemas de diseño, wireframes y decisiones visuales, priorizando claridad y usabilidad.' },
+  { name: 'Agente de Interfaz', tipo: 'generic_prompted', templateId: 'tpl_frontend_master', systemPrompt: 'Eres el Agente de Interfaz de Zoco IA. Te especializas en implementar componentes de frontend (React/TypeScript), maquetación y experiencia de usuario en código real.' },
+  { name: 'Agente de Backend', tipo: 'prompted', systemPrompt: 'Eres el Agente de Backend de Zoco IA. Implementas APIs, lógica de servidor, autenticación e integración con bases de datos, priorizando seguridad y buenas prácticas.' },
+  { name: 'Agente de Base de Datos', tipo: 'generic_prompted', templateId: 'tpl_database_master', systemPrompt: 'Eres el Agente de Base de Datos de Zoco IA. Diseñas esquemas, escribes consultas eficientes y asesoras sobre migraciones, índices y modelado de datos.' },
+  { name: 'Agente de Integraciones', tipo: 'prompted', systemPrompt: 'Eres el Agente de Integraciones de Zoco IA. Conectas servicios de terceros (pagos, email, APIs externas) y resuelves problemas de autenticación/webhooks entre sistemas.' },
+  { name: 'Agente de Control de Calidad (QA)', tipo: 'prompted', systemPrompt: 'Eres el Agente de QA de Zoco IA. Revisas código y funcionalidades en busca de bugs, casos límite y regresiones, y propones planes de prueba.' },
+  { name: 'Agente DevOps', tipo: 'deterministic', executorType: 'railway_api', systemPrompt: null },
+  { name: 'Agente de Pruebas (Testing)', tipo: 'deterministic', executorType: 'static_code_analysis', systemPrompt: null },
+  { name: 'Agente de Reparación', tipo: 'deterministic', executorType: 'sandbox_repair', systemPrompt: null },
 ];
 
 function seedDefaultAgents() {
@@ -297,7 +312,10 @@ function seedDefaultAgents() {
   for (const agente of DEFAULT_AGENTS) {
     if (nombresExistentes.has(agente.name)) continue; // ya existe: no duplicar
     insert.run(uuidv4(), user.id, 'agente', agente.name, JSON.stringify({
+      tipo: agente.tipo || 'prompted',
       systemPrompt: agente.systemPrompt,
+      templateId: agente.templateId || null,
+      executorType: agente.executorType || null,
       modelo: 'zoco-plus',
       habilidadesActivas: [],
       allowedTools: ALL_TOOL_NAMES,
@@ -489,7 +507,7 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   if (!userCheck || !userCheck.activo) {
     const e = new Error('Cuenta desactivada'); e.status = 403; throw e;
   }
-  if (userCheck.creditos <= 0) {
+  if (userCheck.creditos <= BALANCE_BLOCK_THRESHOLD) {
     const e = new Error('Créditos insuficientes. Recarga tu cuenta en zocoia.es/billing'); e.status = 402; e.code = 'insufficient_credits'; throw e;
   }
 
@@ -511,9 +529,20 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
     if (!agente) { const e = new Error('Agente no encontrado'); e.status = 404; throw e; }
 
     agenteData = agente.data ? JSON.parse(agente.data) : {};
+
+    // Agentes deterministas (DevOps/Testing/Reparación): no pasan por ningún
+    // modelo. Se ejecuta el código real y se devuelve ya empaquetado en el
+    // mismo formato { choices, usage, model } que espera el resto del flujo,
+    // para que Marisai no note la diferencia entre esto y una respuesta de IA.
+    if (agenteData.tipo === 'deterministic') {
+      return runDeterministicAgent({ db, uuidv4, userId: authSub, agente, agenteData, userMessage });
+    }
+
     const historial = db.prepare('SELECT role, content FROM agent_memory WHERE agente_id = ? ORDER BY created_at ASC LIMIT 50').all(agentId);
 
-    systemPromptText = agenteData.systemPrompt || `Eres ${agente.name}, un asistente de IA útil y preciso.`;
+    systemPromptText = agenteData.tipo === 'generic_prompted' && agenteData.templateId
+      ? resolveTemplatePrompt({ db, templateId: agenteData.templateId, overrideVars: agenteData.templateVars })
+      : (agenteData.systemPrompt || `Eres ${agente.name}, un asistente de IA útil y preciso.`);
     mensajesParaGroq.push({ role: 'system', content: systemPromptText });
     mensajesParaGroq = mensajesParaGroq.concat(historial);
     if (userMessage) mensajesParaGroq.push({ role: 'user', content: String(userMessage.content) });
@@ -610,7 +639,11 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   if (costeEuros > 0) {
     db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)')
       .run(uuidv4(), authSub, costeEuros, 'gasto', `Groq ${groqModel}${cacheResult.hit ? ' (caché de prompt)' : ''}`);
-    db.prepare('UPDATE users SET creditos = MAX(0, creditos - ?) WHERE id = ?')
+    // Ya no se fuerza el suelo en 0: se deja bajar hasta BALANCE_BLOCK_THRESHOLD
+    // (-0.83€ por defecto) para replicar el comportamiento real de la consola.
+    // La siguiente petición quedará bloqueada por el check de arriba en cuanto
+    // el saldo cruce ese umbral; esta línea solo actualiza el número.
+    db.prepare('UPDATE users SET creditos = creditos - ? WHERE id = ?')
       .run(costeEuros, authSub);
   }
 
@@ -1177,6 +1210,86 @@ app.put('/admin/clientes/:id', authMiddleware, requireAdmin, (req, res) => {
   const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(target.id);
   res.json(publicUser(updated));
 });
+
+// Rutas admin del puente Marisai (import de prompts As-Is, gestión de
+// templates maestros, config de executors deterministas). Todas viven bajo
+// /admin/bridge/* y reutilizan authMiddleware + requireAdmin ya existentes.
+registerBridgeAdminRoutes({ app, db, authMiddleware, requireAdmin, uuidv4 });
+
+// ── Endpoint compatible con el formato Anthropic Messages API ─────────────
+// Permite que Marisai (u otro cliente que use el SDK/formato de Anthropic)
+// apunte su baseURL a Zoco IA sin cambiar su código, solo la apiKey y la URL.
+// Traduce el payload {system, messages, max_tokens, ...} y reutiliza
+// processChatCompletion() tal cual — cero lógica de créditos/agentes duplicada.
+app.post('/v1/messages', authMiddleware, async (req, res) => {
+  try {
+    const { system, messages, max_tokens, temperature, model, metadata, stream } = req.body || {};
+
+    const mensajesConSystem = system
+      ? [{ role: 'system', content: system }, ...(messages || [])]
+      : (messages || []);
+
+    const result = await processChatCompletion(req.auth.sub, {
+      agentId: metadata?.agent_slug ? await resolveAgentIdBySlug(metadata.agent_slug, req.auth.sub) : undefined,
+      messages: mensajesConSystem,
+      model,
+      temperature,
+      max_tokens,
+    });
+
+    const textoRespuesta = result.choices?.[0]?.message?.content || '';
+
+    if (!stream) {
+      return res.json({
+        id: `msg_${uuidv4().replace(/-/g, '').slice(0, 24)}`,
+        type: 'message',
+        role: 'assistant',
+        model: result.model,
+        content: [{ type: 'text', text: textoRespuesta }],
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+        usage: {
+          input_tokens: result.usage.input_tokens,
+          output_tokens: result.usage.output_tokens,
+        },
+      });
+    }
+
+    // Streaming SSE: como processChatCompletion ya devuelve el texto completo
+    // (no hace streaming token a token desde Ollama/Groq en este backend),
+    // se emite como un único content_block_delta — mantiene el contrato SSE
+    // de Anthropic para clientes que esperan estos eventos, sin reescribir
+    // callChatModel para streaming real (eso sí tocaría la base existente).
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    const msgId = `msg_${uuidv4().replace(/-/g, '').slice(0, 24)}`;
+    const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
+    send('message_start', { type: 'message_start', message: { id: msgId, role: 'assistant', model: result.model, usage: { input_tokens: result.usage.input_tokens, output_tokens: 0 } } });
+    send('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+    send('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: textoRespuesta } });
+    send('content_block_stop', { type: 'content_block_stop', index: 0 });
+    send('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: result.usage.output_tokens } });
+    send('message_stop', { type: 'message_stop' });
+    res.end();
+
+  } catch (err) {
+    console.error('Error en /v1/messages:', err);
+    const status = err.status || 500;
+    const errorType = status === 402 ? 'permission_error' : status === 401 ? 'authentication_error' : status === 404 ? 'invalid_request_error' : 'api_error';
+    res.status(status).json({ type: 'error', error: { type: errorType, message: err.message || 'Error interno' } });
+  }
+});
+
+async function resolveAgentIdBySlug(slug, userId) {
+  // metadata.agent_slug puede venir como el id real del recurso o como un
+  // alias legible; se busca primero por id exacto y si no, por nombre.
+  const porId = db.prepare("SELECT id FROM resources WHERE id = ? AND user_id = ? AND type = 'agente'").get(slug, userId);
+  if (porId) return porId.id;
+  const porNombre = db.prepare("SELECT id FROM resources WHERE user_id = ? AND type = 'agente' AND name = ?").get(userId, slug);
+  return porNombre?.id;
+}
 
 const publicDir = path.join(__dirname, 'public');
 if (fs.existsSync(publicDir)) {
