@@ -28,15 +28,12 @@ ENV NODE_ENV=production
 ENV PORT=8080
 
 # BLINDAJE DE DATOS: la persistencia real NO se declara aquí. Railway
-# RECHAZA explícitamente la directiva `VOLUME` de Docker ("dockerfile
-# invalid: docker VOLUME ... is not supported, use Railway Volumes") —
-# tuvo que quitarse de este Dockerfile porque directamente rompía el deploy.
-# El único paso que hace persistente /data es 100% de configuración, fuera
-# de este archivo: Railway dashboard → este servicio → Command Palette ⌘K
-# → "Create Volume" → móntalo en /data. En cuanto exista, Railway inyecta
-# RAILWAY_VOLUME_MOUNT_PATH=/data automáticamente y server.js ya lo detecta
-# y lo usa sin tocar nada más (ver DB_PATH en server.js).
-RUN mkdir -p /data
+# RECHAZA la directiva `VOLUME` de Docker (rompía el build anterior), y
+# tampoco hace falta `mkdir -p /data` a mano: en cuanto adjuntas un Railway
+# Volume al servicio (dashboard → Command Palette ⌘K → "Create Volume",
+# montado en /data), Railway crea y gestiona ese directorio en tiempo de
+# arranque del contenedor — no en tiempo de build. RAILWAY_VOLUME_MOUNT_PATH
+# se inyecta automáticamente y server.js ya lo usa sin tocar nada más.
 
 EXPOSE 8080
 
