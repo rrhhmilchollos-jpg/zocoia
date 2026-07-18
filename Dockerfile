@@ -1,4 +1,4 @@
-# Cache bust: 2026-07-16T04:37:38.342669
+# Cache bust: 2026-07-18T12:52:00.000000
 # Build stage for the frontend
 FROM node:20-slim AS frontend-builder
 WORKDIR /app
