@@ -201,29 +201,34 @@ const MODELOS_VALIDOS = [
   'maris-velox-1b', 'maris-core-7b', 'maris-pro-32b', 'maris-beta-70b',
 ];
 
-const GROQ_MODEL_MAP = {
-  'zoco-flash': 'llama-3.3-70b-versatile',
-  'zoco-plus':  'llama-3.3-70b-versatile',
-  'zoco-max':   'llama-3.3-70b-versatile',
-  'zoco-lab':   'llama-3.3-70b-versatile',
-  'maris-velox': 'llama-3.3-70b-versatile', 'maris-velox-1b': 'llama-3.3-70b-versatile',
-  'maris-core':  'llama-3.3-70b-versatile', 'maris-core-7b':  'llama-3.3-70b-versatile',
-  'maris-pro':   'llama-3.3-70b-versatile', 'maris-pro-32b':  'llama-3.3-70b-versatile',
-  'maris-beta':  'llama-3.3-70b-versatile', 'maris-beta-70b': 'llama-3.3-70b-versatile',
-};
-
+// ─── MOTOR EXCLUSIVO OLLAMA ────────────────────────────────────────────────────
+// DECISIÓN DE INFRAESTRUCTURA (por orden expresa del propietario): NO se usa
+// Groq ni ninguna API en la nube. TODO el ecosistema trabaja EXCLUSIVAMENTE
+// con los modelos locales corriendo en Ollama. El fallback automático a Groq
+// fue ELIMINADO: el flujo multi-agente nace y muere en el servidor de Ollama.
+//
+// Mapeo de los modelos comerciales de Zoco IA a los modelos REALES creados
+// en el servidor de Ollama (nombres exactos de `ollama list`). Sobreescribible
+// por entorno sin tocar código: OLLAMA_MODEL_FLASH/PLUS/MAX/LAB.
 const OLLAMA_MODEL_MAP = {
-  'zoco-flash': 'Zoco-Flash',
-  'zoco-plus':  'Zoco-Plus',
-  'zoco-max':   'Zoco-Max',
-  'zoco-lab':   'Zoco-Lab'
+  'zoco-flash': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash',
+  'zoco-plus':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',
+  'zoco-max':   process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
+  'zoco-lab':   process.env.OLLAMA_MODEL_LAB   || 'Zoco-Lab',
+  // Alias históricos de Maris AI → mismos modelos locales.
+  'maris-velox': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash', 'maris-velox-1b': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash',
+  'maris-core':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',  'maris-core-7b':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',
+  'maris-pro':   process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',   'maris-pro-32b':  process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
+  'maris-beta':  process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',   'maris-beta-70b': process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
 };
 
-const OLLAMA_URL = process.env.OLLAMA_URL;
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-// Configurable por entorno: permite apuntar el motor a cualquier endpoint
-// OpenAI-compatible (p.ej. otro despliegue de DeepSeek) sin tocar código.
-const GROQ_API_URL = process.env.GROQ_API_URL || 'https://api.groq.com/openai/v1/chat/completions';
+// Endpoint OpenAI-compatible de Ollama. apiKey "ollama" (Ollama acepta
+// cualquier string en su endpoint /v1). 127.0.0.1:11434 es el default local.
+const OLLAMA_URL = process.env.OLLAMA_BASE_URL || process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
+const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || 'ollama';
+// Timeout generoso para modelos locales (la primera carga del modelo en
+// VRAM puede tardar; los modelos locales son más lentos que la nube).
+const OLLAMA_TIMEOUT_MS = parseInt(process.env.OLLAMA_TIMEOUT_MS || '300000', 10);
 
 async function webSearch(query) {
   try {
@@ -544,10 +549,10 @@ function stripThink(text) {
   return out.trim();
 }
 
-async function callChatModel({ usandoOllama, ollamaUrl, ollamaModel, groqModel, messages, maxTokens, temperature, tools, toolChoice, ollamaOptions }) {
+async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temperature, tools, toolChoice, ollamaOptions }) {
   async function doFetch(url, auth, model, extraOllamaOptions) {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    const timeoutId = setTimeout(() => controller.abort(), OLLAMA_TIMEOUT_MS);
     try {
       const resp = await fetch(url, {
         method: 'POST',
@@ -580,25 +585,37 @@ async function callChatModel({ usandoOllama, ollamaUrl, ollamaModel, groqModel, 
     }
   }
 
-  if (usandoOllama) {
+  // FLUJO EXCLUSIVO OLLAMA — sin fallback a Groq/Anthropic/OpenAI. Si Ollama
+  // tarda o falla, se hace UN reintento local (el primer intento puede fallar
+  // mientras el modelo se carga en memoria) y después se devuelve el error
+  // real: la petición nace y muere en el servidor local de Ollama.
+  const endpoint = `${ollamaUrl.replace(/\/+$/, '')}/v1/chat/completions`;
+  const MAX_ATTEMPTS = 2;
+  let lastErr;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
-      return await doFetch(`${ollamaUrl.replace(/\/+$/, '')}/v1/chat/completions`, 'Bearer ollama', ollamaModel, ollamaOptions);
+      return await doFetch(endpoint, `Bearer ${OLLAMA_API_KEY}`, ollamaModel, ollamaOptions);
     } catch (err) {
-      if (err.name === 'AbortError' && GROQ_API_KEY) {
-        console.warn('Ollama timeout — usando Groq como fallback');
-        return await doFetch(GROQ_API_URL, `Bearer ${GROQ_API_KEY}`, groqModel);
-      }
+      lastErr = err;
       if (err.name === 'AbortError') {
-        const e = new Error('Timeout: el modelo tardó demasiado en responder');
+        const e = new Error(`Timeout: el modelo local ${ollamaModel} tardó más de ${Math.round(OLLAMA_TIMEOUT_MS / 1000)}s en responder en Ollama`);
         e.status = 504;
-        throw e;
+        throw e; // un timeout completo no se reintenta: ya esperó el máximo
       }
-      const e = new Error('Error de conexión con el modelo de IA');
+      // Errores de conexión/5xx transitorios: reintento único tras una pausa.
+      const transient = !err.status || err.status >= 500;
+      if (transient && attempt < MAX_ATTEMPTS - 1) {
+        console.warn(`[Ollama] fallo transitorio (${err.message}) — reintentando...`);
+        await new Promise(r => setTimeout(r, 2000));
+        continue;
+      }
+      if (err.status) throw err;
+      const e = new Error(`Error de conexión con el servidor de Ollama (${ollamaUrl}): ${err.message}`);
       e.status = 502;
       throw e;
     }
   }
-  return await doFetch(GROQ_API_URL, `Bearer ${GROQ_API_KEY}`, groqModel);
+  throw lastErr;
 }
 
 /**
@@ -611,8 +628,10 @@ async function callChatModel({ usandoOllama, ollamaUrl, ollamaModel, groqModel, 
  * Lanza errores con `.status` adjunto (mismo patrón que ya usaba esta ruta).
  */
 async function processChatCompletion(authSub, { agentId, messages, model, temperature: temperatureInput, max_tokens: maxTokensInput, sessionSkills, tools: requestTools, tool_choice: requestToolChoice }) {
-  if (!GROQ_API_KEY) {
-    const e = new Error('GROQ_API_KEY no configurada en el servidor'); e.status = 503; throw e;
+  // Motor exclusivo Ollama: no se exige ninguna API key en la nube. OLLAMA_URL
+  // siempre tiene valor (default http://127.0.0.1:11434).
+  if (!OLLAMA_URL) {
+    const e = new Error('OLLAMA_BASE_URL no configurada en el servidor'); e.status = 503; throw e;
   }
 
   const userCheck = db.prepare('SELECT creditos, activo FROM users WHERE id = ?').get(authSub);
@@ -627,7 +646,6 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
 
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(authSub);
   const modeloZocoia = model || user?.modelo_activo || 'zoco-plus';
-  const groqModel = GROQ_MODEL_MAP[modeloZocoia] || GROQ_MODEL_MAP['zoco-plus'];
 
   let agente = null;
   let agenteData = {};
@@ -690,11 +708,12 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
     }
   }
 
-  const usandoOllama = !!OLLAMA_URL;
-  const modeloFinal = usandoOllama
-    ? (OLLAMA_MODEL_MAP[modeloZocoia] || modeloZocoia)
-    : groqModel;
-  console.log(`[IA] ${modeloZocoia} → ${modeloFinal} via ${usandoOllama ? 'Ollama' : 'Groq'}`);
+  // Motor exclusivo Ollama: el modelo comercial (zoco-*) o el id del agente se
+  // traduce SIEMPRE al modelo real creado en el servidor de Ollama. Si el
+  // agente/petición trae directamente un nombre de modelo de Ollama (p.ej.
+  // "deepseek-r1", "qwen2.5-coder"), se usa tal cual.
+  const modeloFinal = OLLAMA_MODEL_MAP[modeloZocoia] || modeloZocoia;
+  console.log(`[IA] ${modeloZocoia} → ${modeloFinal} via Ollama (${OLLAMA_URL})`);
 
   // Parámetros avanzados de IA por agente (num_predict / num_ctx / temperature),
   // con límites de seguridad y valores por defecto si el agente no los define.
@@ -708,7 +727,7 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   const temperature = clamp(temperatureInput ?? agenteData.temperature, 0, 1.2, 0.7);
   const maxTokens = maxTokensInput || numPredict;
 
-  // options nativas de Ollama; solo tienen efecto cuando usandoOllama = true
+  // options nativas de Ollama (num_predict, num_ctx) — viajan en cada llamada
   const ollamaOptions = { num_predict: numPredict, num_ctx: numCtx };
 
   // Tools permitidas: las del agente (si hay agente) + las aportadas por las
@@ -723,10 +742,8 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
 
   const callModel = (msgs, tools, toolChoice) =>
     callChatModel({
-      usandoOllama,
       ollamaUrl: OLLAMA_URL,
       ollamaModel: modeloFinal,
-      groqModel,
       messages: msgs,
       maxTokens,
       temperature,
@@ -783,7 +800,7 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   const costeEuros = tokensConDescuento * 0.000002;
   if (costeEuros > 0) {
     db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)')
-      .run(uuidv4(), authSub, costeEuros, 'gasto', `Groq ${groqModel}${cacheResult.hit ? ' (caché de prompt)' : ''}`);
+      .run(uuidv4(), authSub, costeEuros, 'gasto', `Ollama ${modeloFinal}${cacheResult.hit ? ' (caché de prompt)' : ''}`);
     // Ya no se fuerza el suelo en 0: se deja bajar hasta BALANCE_BLOCK_THRESHOLD
     // (-0.83€ por defecto) para replicar el comportamiento real de la consola.
     // La siguiente petición quedará bloqueada por el check de arriba en cuanto
@@ -812,7 +829,7 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
       prompt_tokens: usage.prompt_tokens || 0,
       completion_tokens: usage.completion_tokens || 0,
     },
-    model: groqModel,
+    model: modeloFinal,
   };
 }
 
@@ -1339,7 +1356,8 @@ app.get('/api/payments/success', authMiddleware, (req, res) => {
 });
 
 app.get('/api/system/ollama', authMiddleware, async (req, res) => {
-  const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
+  // Usa la misma URL unificada del motor (OLLAMA_BASE_URL / OLLAMA_URL).
+  const ollamaUrl = OLLAMA_URL;
   try {
     const resp = await fetch(`${ollamaUrl}/api/tags`, { signal: AbortSignal.timeout(3000) });
     if (!resp.ok) return res.json({ online: false });
@@ -1361,7 +1379,8 @@ app.get('/admin/stats', authMiddleware, requireAdmin, (req, res) => {
     ORDER BY p.created_at DESC LIMIT 50
   `).all();
   const vivaConfigurado = !!(process.env.VIVA_CLIENT_ID && process.env.VIVA_CLIENT_SECRET);
-  const ollamaOnline = !!process.env.OLLAMA_URL;
+  // Motor exclusivo Ollama: siempre configurado (default 127.0.0.1:11434).
+  const ollamaOnline = !!OLLAMA_URL;
 
   res.json({ totalUsuarios, usuariosActivos, ingresosTotal, llamadasHoy, ultimosPagos, vivaConfigurado, ollamaOnline });
 });
