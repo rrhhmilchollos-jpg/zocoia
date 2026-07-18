@@ -12,17 +12,43 @@ import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { TOOL_DEFINITIONS, ALL_TOOL_NAMES, runToolLoop, makeWorkspacesRoot } from './tools.js';
 import { runDeterministicAgent, resolveTemplatePrompt, registerBridgeAdminRoutes } from './bridge-marisai.js';
-import { seedOwnerAgentsIfEmpty, seedBasicAgentsForUser, isOwnerUser, DEEPSEEK_SAFE_FORMAT_RULE, ENTERPRISE_REQUIRED_MESSAGE } from './seed-owner-agents.js';
-import { registerSessionRoutes, validateZocoApiKey } from './zoco-sessions.js';
-import { registerConsoleRoutes, resumeInterruptedBatches, buildEnvironmentContext } from './zoco-console.js';
 
 dotenv.config();
+
+// Red de seguridad adicional para errores asíncronos que puedan ocurrir
+// DESPUÉS de que el servidor ya esté arriba y escuchando (p.ej. una
+// promesa rechazada sin .catch en algún handler). Solo se loguea: nunca
+// tumbamos el proceso por esto, para no perder disponibilidad por un
+// error puntual en una petición aislada.
+process.on('uncaughtException', (err) => {
+  console.error('❌ uncaughtException (el servidor sigue vivo):', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('❌ unhandledRejection (el servidor sigue vivo):', reason);
+});
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const port = process.env.PORT || 8080;
+
+// BLINDAJE: /health se registra AQUÍ, lo primero de todo, antes de tocar
+// ninguna base de datos o filesystem. Así, pase lo que pase más abajo
+// durante el arranque (DB, workspaces, rutas del puente Marisai...), en
+// cuanto el proceso llegue a app.listen() al final del archivo, Railway
+// podrá recibir respuesta de /health. isReady se pone a true solo cuando
+// TODO el arranque terminó sin problemas; si algo falló mientras tanto,
+// /health sigue respondiendo 200 (para no tumbar el deploy) pero avisa
+// del estado degradado en el body, para que se vea en los logs/monitoring.
+let bootIssues = [];
+app.get('/health', (req, res) => {
+  res.json({
+    status: bootIssues.length === 0 ? 'ok' : 'degraded',
+    message: 'Zoco IA conectado con éxito',
+    ...(bootIssues.length ? { warnings: bootIssues } : {}),
+  });
+});
 
 if (!process.env.JWT_SECRET) {
   console.warn('⚠️  JWT_SECRET no está definido. Usando uno temporal generado al vuelo.');
@@ -32,66 +58,86 @@ const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString('he
 const JWT_EXPIRES_IN = '7d';
 const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hora
 
-// Resolución de la ruta de la base de datos, en orden de prioridad:
-//   1. DB_PATH explícito (si lo defines a mano en Railway, gana siempre)
-//   2. RAILWAY_VOLUME_MOUNT_PATH (Railway lo inyecta solo cuando el Volumen
-//      está realmente adjuntado a ESTE servicio y hubo un redeploy después)
-//   3. Fallback defensivo: si /data existe como directorio en el filesystem
-//      del contenedor (típico si el volumen se montó ahí pero por lo que
-//      sea la env var no llegó a inyectarse), se usa igualmente — así el
-//      requisito "SÍ O SÍ en /data" se cumple aunque falle la detección
-//      automática de Railway.
-//   4. Solo si nada de lo anterior existe, cae a ./data/ local (dev/local).
-function resolveDbPath() {
-  if (process.env.DB_PATH) return process.env.DB_PATH;
-  if (process.env.RAILWAY_VOLUME_MOUNT_PATH) return path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'zocoia.db');
-  if (fs.existsSync('/data')) return '/data/zocoia.db';
-  return path.join(__dirname, 'data', 'app.db');
-}
+// Rutas SIEMPRE absolutas: path.join(__dirname, ...) o el volumen que
+// inyecta Railway (RAILWAY_VOLUME_MOUNT_PATH, ya absoluto de por sí).
+// Nunca una ruta relativa tipo './data/app.db', que dependería del cwd
+// con el que Docker/Railway lance el proceso.
+let DB_PATH = process.env.DB_PATH || (process.env.RAILWAY_VOLUME_MOUNT_PATH ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'app.db') : path.join(__dirname, 'data', 'app.db'));
+let dbDir = path.dirname(DB_PATH);
 
-const DB_PATH = resolveDbPath();
-const dbDir = path.dirname(DB_PATH);
-if (dbDir && !fs.existsSync(dbDir)) {
-  console.log(`📁 Creando directorio de base de datos en: ${dbDir}`);
-  fs.mkdirSync(dbDir, { recursive: true });
-}
-
-// Migración de compatibilidad: si existe una BD antigua con el nombre
-// previo (app.db) en el mismo directorio del volumen y todavía NO existe
-// zocoia.db, se renombra en vez de arrancar en blanco — así ningún dato
-// que ya sobrevivió en el volumen se pierde solo por el cambio de nombre.
-const legacyDbPath = path.join(dbDir, 'app.db');
-if (!fs.existsSync(DB_PATH) && fs.existsSync(legacyDbPath)) {
-  console.log(`♻️  Migrando base de datos existente: ${legacyDbPath} → ${DB_PATH}`);
-  fs.renameSync(legacyDbPath, DB_PATH);
-  for (const ext of ['-wal', '-shm']) {
-    if (fs.existsSync(legacyDbPath + ext)) fs.renameSync(legacyDbPath + ext, DB_PATH + ext);
+// BLINDAJE 1/3: crear el directorio de la base de datos. Si el volumen de
+// Railway aún no está montado o no hay permisos de escritura, esto lanzaba
+// antes de forma síncrona y tumbaba TODO el proceso (nunca se llegaba a
+// app.listen(), /health no respondía => "Healthcheck failed"). Ahora, si
+// falla, caemos a una ruta local dentro del propio contenedor
+// (path.join(__dirname, 'data', 'app.db')) para que el servidor arranque
+// igualmente; se deja constancia en bootIssues para verlo en /health.
+try {
+  if (dbDir && !fs.existsSync(dbDir)) {
+    console.log(`📁 Creando directorio de base de datos en: ${dbDir}`);
+    fs.mkdirSync(dbDir, { recursive: true });
+  }
+} catch (err) {
+  console.error(`❌ No se pudo crear el directorio de base de datos (${dbDir}): ${err.message}`);
+  bootIssues.push(`No se pudo crear dbDir (${dbDir}): ${err.message}`);
+  DB_PATH = path.join(__dirname, 'data', 'app.db');
+  dbDir = path.dirname(DB_PATH);
+  try {
+    fs.mkdirSync(dbDir, { recursive: true });
+  } catch (err2) {
+    console.error(`❌ Tampoco se pudo crear el directorio de fallback (${dbDir}): ${err2.message}`);
+    bootIssues.push(`Fallback dbDir también falló: ${err2.message}`);
   }
 }
 
 console.log(`🗄️ Usando base de datos en: ${DB_PATH}`);
 
-// Aviso crítico: si estamos en producción (Railway) y NO hay ningún rastro
-// de volumen persistente (ni env var ni /data existente), todo lo que se
-// guarde en `db` vivirá SOLO dentro del contenedor y desaparecerá en el
-// próximo deploy/reinicio. Esto no se arregla con código: hay que adjuntar
-// un Volumen al servicio desde el dashboard/CLI de Railway (Command Palette
-// ⌘K → "Create Volume", montado en /data) y luego hacer un redeploy — la
-// variable RAILWAY_VOLUME_MOUNT_PATH solo aparece DESPUÉS de ese redeploy.
-if (process.env.NODE_ENV === 'production' && !process.env.RAILWAY_VOLUME_MOUNT_PATH && !process.env.DB_PATH && !fs.existsSync('/data')) {
-  console.warn('⚠️⚠️⚠️  ATENCIÓN: no se detecta ningún volumen persistente de Railway.');
+// Aviso crítico: si estamos en producción (Railway) y NO hay un volumen
+// persistente montado, todo lo que se guarde en `db` (agentes, habilidades,
+// entornos, memoria...) vivirá SOLO dentro del contenedor y desaparecerá en
+// el próximo deploy/reinicio. Esto no se puede arreglar solo con código: hay
+// que adjuntar un Volumen al servicio desde el dashboard/CLI de Railway
+// (Command Palette ⌘K → "Create Volume", montado p. ej. en /data). En cuanto
+// exista, Railway inyecta RAILWAY_VOLUME_MOUNT_PATH automáticamente y esta
+// misma línea de arriba empezará a usarlo sin tocar nada más.
+if (process.env.NODE_ENV === 'production' && !process.env.RAILWAY_VOLUME_MOUNT_PATH && !process.env.DB_PATH) {
+  const noVolumeWarning = 'RIESGO DE PÉRDIDA DE DATOS: no hay volumen persistente de Railway montado (RAILWAY_VOLUME_MOUNT_PATH ausente). La base de datos SQLite vive dentro del contenedor y SE BORRARÁ en el próximo deploy/reinicio. Solución: Railway dashboard → Command Palette ⌘K → "Create Volume", móntalo en /data, redeploy.';
+  console.warn('⚠️⚠️⚠️  ATENCIÓN: no se detecta ningún volumen persistente de Railway (RAILWAY_VOLUME_MOUNT_PATH no está definido).');
   console.warn('⚠️⚠️⚠️  La base de datos SQLite vive dentro del contenedor y SE BORRARÁ en el próximo deploy/reinicio.');
-  console.warn('⚠️⚠️⚠️  Solución: 1) Adjunta un Volumen a ESTE servicio (no a otro) en Railway, móntalo en /data.');
-  console.warn('⚠️⚠️⚠️  2) Haz un redeploy manual DESPUÉS de adjuntarlo — la variable solo se inyecta en el siguiente deploy.');
-  console.warn('⚠️⚠️⚠️  3) Revisa en Settings → Volumes que el volumen aparece "Attached" a este servicio concreto.');
+  console.warn('⚠️⚠️⚠️  Solución: adjunta un Volumen a este servicio en el dashboard de Railway (Command Palette ⌘K → "Create Volume"), móntalo en /data, y haz redeploy.');
+  // BLINDAJE DE DATOS: antes esto solo se veía en logs de consola, que casi
+  // nadie mira en producción — el sistema "sabía" que iba a perder todos los
+  // datos y no lo comunicaba por ningún canal monitoreable. Ahora se
+  // registra también en bootIssues, así que /health devuelve status
+  // "degraded" con este warning explícito hasta que se adjunte el volumen.
+  bootIssues.push(noVolumeWarning);
 }
 
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
+// BLINDAJE 2/3: abrir la base de datos. Si better-sqlite3 no puede abrir
+// el fichero (corrupto, permisos, lock...) caemos a una base de datos en
+// memoria SOLO para que el proceso siga vivo y /health responda; se marca
+// como degradado porque en ese modo no hay persistencia real.
+let db;
+try {
+  db = new Database(DB_PATH);
+  db.pragma('journal_mode = WAL');
+} catch (err) {
+  console.error(`❌ No se pudo abrir la base de datos en ${DB_PATH}: ${err.message}`);
+  bootIssues.push(`No se pudo abrir la base de datos: ${err.message}`);
+  db = new Database(':memory:');
+}
 
+// BLINDAJE 3/3: workspaces de los agentes. Un fallo aquí no debe impedir
+// que el resto del servidor (auth, chat, admin) arranque con normalidad.
 const WORKSPACES_ROOT = makeWorkspacesRoot(dbDir);
-fs.mkdirSync(WORKSPACES_ROOT, { recursive: true });
+try {
+  fs.mkdirSync(WORKSPACES_ROOT, { recursive: true });
+} catch (err) {
+  console.error(`❌ No se pudo crear WORKSPACES_ROOT (${WORKSPACES_ROOT}): ${err.message}`);
+  bootIssues.push(`No se pudo crear WORKSPACES_ROOT: ${err.message}`);
+}
 
+try {
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -181,10 +227,42 @@ db.exec(`
     FOREIGN KEY (user_id) REFERENCES users(id)
   );
 `);
+} catch (err) {
+  console.error('❌ No se pudo crear/verificar el esquema principal de la base de datos:', err.message);
+  bootIssues.push(`Esquema principal falló: ${err.message}`);
+}
 
-const userColumns = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
-if (!userColumns.includes('modelo_activo')) {
-  db.exec("ALTER TABLE users ADD COLUMN modelo_activo TEXT DEFAULT 'zoco-plus'");
+try {
+  const userColumns = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
+  if (!userColumns.includes('modelo_activo')) {
+    db.exec("ALTER TABLE users ADD COLUMN modelo_activo TEXT DEFAULT 'zoco-plus'");
+  }
+} catch (err) {
+  console.error('❌ No se pudo verificar/migrar la columna modelo_activo:', err.message);
+  bootIssues.push(`Migración modelo_activo falló: ${err.message}`);
+}
+
+// BLINDAJE DE DATOS — POLÍTICA DE BORRADO LÓGICO OBLIGATORIA: ningún borrado
+// manual (agentes/recursos, memoria de agente, API keys) debe eliminar la
+// fila físicamente nunca. Se añaden columnas is_deleted/deleted_at/deleted_reason
+// a las tablas afectadas; los endpoints DELETE pasan a hacer UPDATE, y las
+// consultas SELECT existentes se filtran para no mostrar lo archivado.
+try {
+  for (const table of ['resources', 'agent_memory', 'api_keys', 'prompt_cache']) {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+    if (!cols.includes('is_deleted')) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN is_deleted INTEGER DEFAULT 0`);
+    }
+    if (!cols.includes('deleted_at')) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN deleted_at TEXT`);
+    }
+    if (!cols.includes('deleted_reason')) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN deleted_reason TEXT`);
+    }
+  }
+} catch (err) {
+  console.error('❌ No se pudo verificar/migrar las columnas de soft delete:', err.message);
+  bootIssues.push(`Migración soft-delete falló: ${err.message}`);
 }
 
 const RESOURCE_TYPES = ['agente', 'archivo', 'habilidad', 'lote', 'sesion', 'implementacion', 'entorno', 'credencial', 'memoria'];
@@ -202,34 +280,52 @@ const MODELOS_VALIDOS = [
   'maris-velox-1b', 'maris-core-7b', 'maris-pro-32b', 'maris-beta-70b',
 ];
 
-// ─── MOTOR EXCLUSIVO OLLAMA ────────────────────────────────────────────────────
-// DECISIÓN DE INFRAESTRUCTURA (por orden expresa del propietario): NO se usa
-// Groq ni ninguna API en la nube. TODO el ecosistema trabaja EXCLUSIVAMENTE
-// con los modelos locales corriendo en Ollama. El fallback automático a Groq
-// fue ELIMINADO: el flujo multi-agente nace y muere en el servidor de Ollama.
-//
-// Mapeo de los modelos comerciales de Zoco IA a los modelos REALES creados
-// en el servidor de Ollama (nombres exactos de `ollama list`). Sobreescribible
-// por entorno sin tocar código: OLLAMA_MODEL_FLASH/PLUS/MAX/LAB.
-const OLLAMA_MODEL_MAP = {
-  'zoco-flash': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash',
-  'zoco-plus':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',
-  'zoco-max':   process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
-  'zoco-lab':   process.env.OLLAMA_MODEL_LAB   || 'Zoco-Lab',
-  // Alias históricos de Maris AI → mismos modelos locales.
-  'maris-velox': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash', 'maris-velox-1b': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash',
-  'maris-core':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',  'maris-core-7b':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',
-  'maris-pro':   process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',   'maris-pro-32b':  process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
-  'maris-beta':  process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',   'maris-beta-70b': process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
+// NOTA: 'llama-3.3-70b-versatile' es el modelo que ya usaba este mapa antes
+// de la Conmutación Inteligente. Groq anunció su deprecación el 17/06/2026
+// con apagado el 16/08/2026 (recomendando openai/gpt-oss-120b o
+// qwen/qwen3.6-27b como reemplazo) — sigue funcionando hoy, pero se romperá
+// solo en ~4 semanas. No se cambia aquí sin pedirlo explícitamente porque
+// afecta a otras rutas del código, pero es la migración más urgente pendiente.
+const GROQ_MODEL_MAP = {
+  'zoco-flash': 'llama-3.3-70b-versatile',
+  'zoco-plus':  'llama-3.3-70b-versatile',
+  'zoco-max':   'llama-3.3-70b-versatile',
+  'zoco-lab':   'llama-3.3-70b-versatile',
+  'maris-velox': 'llama-3.3-70b-versatile', 'maris-velox-1b': 'llama-3.3-70b-versatile',
+  'maris-core':  'llama-3.3-70b-versatile', 'maris-core-7b':  'llama-3.3-70b-versatile',
+  'maris-pro':   'llama-3.3-70b-versatile', 'maris-pro-32b':  'llama-3.3-70b-versatile',
+  'maris-beta':  'llama-3.3-70b-versatile', 'maris-beta-70b': 'llama-3.3-70b-versatile',
 };
 
-// Endpoint OpenAI-compatible de Ollama. apiKey "ollama" (Ollama acepta
-// cualquier string en su endpoint /v1). 127.0.0.1:11434 es el default local.
+const OLLAMA_MODEL_MAP = {
+  'zoco-flash': 'Zoco-Flash',
+  'zoco-plus':  'Zoco-Plus',
+  'zoco-max':   'Zoco-Max',
+  'zoco-lab':   'Zoco-Lab'
+};
+
+// ── CONMUTACIÓN INTELIGENTE (Fallback Engine) ──────────────────────────────
+// CAMINO A (Groq en la nube) vs CAMINO B (Ollama local): el detector es
+// process.env.GROQ_API_KEY, tal cual se pidió. Hoy (sin GPU local) se pone
+// GROQ_API_KEY en Railway y todo va por Groq; el día que arranque el PC de
+// altas prestaciones, basta con QUITAR esa variable de entorno y el sistema
+// vuelve a Ollama local sin tocar código ni volver a desplegar nada distinto.
+//
+// OLLAMA_BASE_URL es el nombre "de cara al futuro" que se pidió; se admite
+// también OLLAMA_URL por compatibilidad con el resto del código que ya lo
+// usa (líneas de /api/system/ollama más abajo). Si no se define ninguna,
+// el valor por defecto es el puerto estándar real de Ollama en localhost
+// (NO "http://127.0.0", que no es una URL válida y haría fallar todas las
+// peticiones al camino B).
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const OLLAMA_URL = process.env.OLLAMA_BASE_URL || process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
-const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || 'ollama';
-// Timeout generoso para modelos locales (la primera carga del modelo en
-// VRAM puede tardar; los modelos locales son más lentos que la nube).
-const OLLAMA_TIMEOUT_MS = parseInt(process.env.OLLAMA_TIMEOUT_MS || '300000', 10);
+
+// CAMINO A si hay clave de Groq; CAMINO B (Ollama local) si no la hay.
+const usandoGroq = !!GROQ_API_KEY;
+console.log(usandoGroq
+  ? '🌩️  Conmutación Inteligente: CAMINO A — usando Groq en la nube (GROQ_API_KEY detectada)'
+  : `💻 Conmutación Inteligente: CAMINO B — usando Ollama local en ${OLLAMA_URL} (no hay GROQ_API_KEY)`);
 
 async function webSearch(query) {
   try {
@@ -304,6 +400,7 @@ function seedAdminAccount() {
     console.log(`✅ Cuenta admin/soporte creada para ${email}`);
   }
 }
+seedAdminAccount();
 
 // Catálogo de los 11 agentes por defecto de Zoco IA. Se recrean automáticamente
 // al arrancar el servidor SI el usuario admin no tiene todavía ningún agente
@@ -344,17 +441,7 @@ function seedDefaultAgents() {
   const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email.toLowerCase());
   if (!user) return; // No debería pasar justo después de seedAdminAccount(), pero por seguridad.
 
-  const existentes = db.prepare("SELECT name FROM resources WHERE user_id = ? AND type = 'agente'").all(user.id);
-  if (existentes.length > 0) {
-    // Si el usuario ya tiene CUALQUIER agente (típicamente porque
-    // seedOwnerAgentsIfEmpty ya sembró los 11 reales justo antes de esta
-    // llamada), no se rellena con los genéricos de respaldo — evita
-    // mezclar nombres distintos (ej. "Agente de Pruebas (Testing)" de
-    // DEFAULT_AGENTS junto a "Agente Corrector Automatizado (Patcher)"
-    // de la siembra real) y terminar con más de 11 agentes.
-    console.log(`ℹ️  ${email} ya tiene ${existentes.length} agente(s) — no se aplica la siembra genérica de respaldo.`);
-    return;
-  }
+  const existentes = db.prepare("SELECT name FROM resources WHERE user_id = ? AND type = 'agente' AND is_deleted = 0").all(user.id);
   const nombresExistentes = new Set(existentes.map(r => r.name));
 
   const insert = db.prepare('INSERT INTO resources (id, user_id, type, name, data) VALUES (?, ?, ?, ?, ?)');
@@ -378,41 +465,60 @@ function seedDefaultAgents() {
   }
   if (creados > 0) {
     console.log(`✅ Sembrados ${creados} agente(s) por defecto para ${email} (de un total de ${DEFAULT_AGENTS.length} esperados).`);
+    // BLINDAJE DE DATOS: si esto se dispara en producción y NO es el primer
+    // arranque (es decir, ya existía al menos 1 agente, aunque fuera de
+    // otro tipo/nombre), es una señal de que la base de datos acaba de
+    // perder datos que antes existían (ver aviso de volumen persistente más
+    // arriba) y se está enmascarando el hueco con prompts placeholder
+    // genéricos, en vez de con un panel vacío. Se hace visible en /health
+    // para que no pase desapercibido como "los agentes ya estaban así".
+    if (process.env.NODE_ENV === 'production') {
+      const seedAlert = `Se sembraron ${creados} agente(s) por defecto para ${email} en este arranque — si ya tenías agentes personalizados con otros prompts, es probable que la base de datos se haya reiniciado (ver aviso de volumen persistente) y estos placeholders NO son tu configuración real.`;
+      bootIssues.push(seedAlert);
+    }
   } else {
     console.log(`ℹ️  Los ${DEFAULT_AGENTS.length} agentes por defecto ya existen para ${email}; no se crea ninguno nuevo.`);
   }
 }
+seedDefaultAgents();
 
-// ── Siembra inicial (admin + agentes) ──────────────────────────────────────
-// Cada paso va envuelto en su propio try/catch: si CUALQUIERA de estas
-// funciones lanza una excepción (tabla inesperada, bloqueo de SQLite,
-// columna que falta, etc.), el error se registra pero el proceso sigue
-// vivo y continúa hasta app.listen(). Antes, un fallo aquí mataba el
-// proceso ANTES de abrir el puerto, y Railway no tenía nada a lo que
-// hacer ping en el healthcheck.
-try {
-  seedAdminAccount();
-} catch (error) {
-  console.error('[SEED ERROR] Falló seedAdminAccount, pero el servidor sigue vivo:', error);
-}
+// ── CORS ────────────────────────────────────────────────────────────────
+// Lista blanca explícita de orígenes permitidos. Se puede ampliar sin tocar
+// código añadiendo CORS_EXTRA_ORIGINS="https://foo.com,https://bar.com" en
+// las variables de entorno de Railway (separados por comas).
+const DEFAULT_ALLOWED_ORIGINS = [
+  'https://zocoia.es',
+  'https://www.zocoia.es',
+  'https://marisai.es',
+  'https://www.marisai.es',
+  'http://localhost:5173',
+  'http://localhost:3000',
+];
+const EXTRA_ORIGINS = (process.env.CORS_EXTRA_ORIGINS || '')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
+const ALLOWED_ORIGINS = [...DEFAULT_ALLOWED_ORIGINS, ...EXTRA_ORIGINS];
 
-try {
-  // siembra los 11 agentes reales (prompts extraídos de Marisai) si la
-  // cuenta owner existe y aún no tiene ninguno
-  seedOwnerAgentsIfEmpty(db);
-} catch (error) {
-  console.error('[SEED ERROR] Falló la siembra de agentes owner, pero el servidor sigue vivo:', error);
-}
+const corsOptions = {
+  origin(origin, callback) {
+    // Peticiones sin origin (curl, health checks, server-to-server) se permiten.
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    console.warn(`⚠️  CORS bloqueado para origin no permitido: ${origin}`);
+    return callback(new Error(`Origin no permitido por CORS: ${origin}`));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  optionsSuccessStatus: 204,
+};
 
-try {
-  // red de seguridad: solo actúa si ADMIN_EMAIL no coincide con el owner,
-  // o si por lo que sea la siembra real no pudo ejecutarse
-  seedDefaultAgents();
-} catch (error) {
-  console.error('[SEED ERROR] Falló seedDefaultAgents, pero el servidor sigue vivo:', error);
-}
+app.use(cors(corsOptions));
+// Responde explícitamente a las peticiones preflight (OPTIONS) para
+// cualquier ruta, usando las mismas opciones que arriba.
+app.options('*', cors(corsOptions));
 
-app.use(cors());
 app.use(express.json());
 
 function signToken(user) {
@@ -478,24 +584,6 @@ function authMiddleware(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'No autenticado' });
-
-  // API Keys de Zoco IA (sk-zoco-...): permiten que Maris AI y cualquier
-  // cliente externo (SDK de Anthropic/OpenAI apuntando a esta base URL) se
-  // autentique con la clave de la organización en vez de un JWT de sesión.
-  // La clave se valida contra su hash sha256 en la tabla api_keys, se marca
-  // el last_used_at, y la petición actúa en nombre del dueño de la clave.
-  if (token.startsWith('sk-zoco-')) {
-    const check = validateZocoApiKey(db, token);
-    if (!check.valid) return res.status(401).json({ error: `API Key inválida: ${check.reason}` });
-    try {
-      db.prepare('UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(check.keyId);
-    } catch {}
-    const owner = db.prepare('SELECT id, is_admin, is_support FROM users WHERE id = ?').get(check.ownerId);
-    if (!owner) return res.status(401).json({ error: 'La cuenta propietaria de la clave no existe' });
-    req.auth = { sub: owner.id, isAdmin: !!owner.is_admin, isSupport: !!owner.is_support, viaApiKey: true, apiKeyId: check.keyId };
-    return next();
-  }
-
   try {
     req.auth = jwt.verify(token, JWT_SECRET);
     next();
@@ -527,33 +615,10 @@ function firstOfMonthISO() {
   return new Date(d.getFullYear(), d.getMonth(), 1).toISOString();
 }
 
-// Ruta de salud: registrada muy pronto y ANTES de cualquier lógica pesada
-// de negocio, respondiendo tanto en /health como en /salud (el path que usa
-// el healthcheck de Railway). No depende de la base de datos ni de la
-// siembra, así que responde 200 en cuanto Express empieza a escuchar.
-app.get(['/health', '/salud'], (req, res) => {
-  res.json({ status: 'ok', message: 'Zoco IA conectado con éxito' });
-});
-
-// Compatibilidad DeepSeek-R1: si el modelo detrás del motor emite su
-// razonamiento en <think>...</think>, se elimina SIEMPRE antes de devolver la
-// respuesta a los clientes (Maris AI parsea código/JSON de estas respuestas y
-// el razonamiento lo contaminaría). Cubre bloques completos, aperturas sin
-// cierre (corte por tokens) y cierres huérfanos.
-function stripThink(text) {
-  if (!text) return '';
-  let out = String(text).replace(/<think>[\s\S]*?<\/think>/g, '');
-  const openIdx = out.indexOf('<think>');
-  if (openIdx !== -1 && out.indexOf('</think>', openIdx) === -1) out = out.slice(0, openIdx);
-  const orphanClose = out.indexOf('</think>');
-  if (orphanClose !== -1 && out.lastIndexOf('<think>', orphanClose) === -1) out = out.slice(orphanClose + 8);
-  return out.trim();
-}
-
-async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temperature, tools, toolChoice, ollamaOptions }) {
+async function callChatModel({ usandoGroq, ollamaUrl, ollamaModel, groqModel, messages, maxTokens, temperature, tools, ollamaOptions }) {
   async function doFetch(url, auth, model, extraOllamaOptions) {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), OLLAMA_TIMEOUT_MS);
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
     try {
       const resp = await fetch(url, {
         method: 'POST',
@@ -564,9 +629,6 @@ async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temp
           max_tokens: maxTokens,
           temperature,
           ...(tools && tools.length ? { tools } : {}),
-          // tool_choice en formato OpenAI estándar (passthrough para clientes
-          // como Maris AI que piden tool calling explícito: 'auto'|'required').
-          ...(tools && tools.length && toolChoice ? { tool_choice: toolChoice } : {}),
           // 'options' es una extensión propia de Ollama (num_ctx, num_predict, etc.)
           // sobre el endpoint compatible con OpenAI. Groq la ignora si se le llegara
           // a enviar, así que solo se añade cuando se llama de verdad a Ollama.
@@ -586,37 +648,27 @@ async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temp
     }
   }
 
-  // FLUJO EXCLUSIVO OLLAMA — sin fallback a Groq/Anthropic/OpenAI. Si Ollama
-  // tarda o falla, se hace UN reintento local (el primer intento puede fallar
-  // mientras el modelo se carga en memoria) y después se devuelve el error
-  // real: la petición nace y muere en el servidor local de Ollama.
-  const endpoint = `${ollamaUrl.replace(/\/+$/, '')}/v1/chat/completions`;
-  const MAX_ATTEMPTS = 2;
-  let lastErr;
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    try {
-      return await doFetch(endpoint, `Bearer ${OLLAMA_API_KEY}`, ollamaModel, ollamaOptions);
-    } catch (err) {
-      lastErr = err;
-      if (err.name === 'AbortError') {
-        const e = new Error(`Timeout: el modelo local ${ollamaModel} tardó más de ${Math.round(OLLAMA_TIMEOUT_MS / 1000)}s en responder en Ollama`);
-        e.status = 504;
-        throw e; // un timeout completo no se reintenta: ya esperó el máximo
-      }
-      // Errores de conexión/5xx transitorios: reintento único tras una pausa.
-      const transient = !err.status || err.status >= 500;
-      if (transient && attempt < MAX_ATTEMPTS - 1) {
-        console.warn(`[Ollama] fallo transitorio (${err.message}) — reintentando...`);
-        await new Promise(r => setTimeout(r, 2000));
-        continue;
-      }
-      if (err.status) throw err;
-      const e = new Error(`Error de conexión con el servidor de Ollama (${ollamaUrl}): ${err.message}`);
-      e.status = 502;
+  // CAMINO A: hay GROQ_API_KEY → Groq en la nube, directo.
+  if (usandoGroq) {
+    return await doFetch(GROQ_API_URL, `Bearer ${GROQ_API_KEY}`, groqModel);
+  }
+
+  // CAMINO B: no hay GROQ_API_KEY → Ollama local (el PC de altas prestaciones
+  // futuro). Sin fallback a Groq aquí a propósito: si no hay clave, tampoco
+  // hay forma de llamar a Groq — el error debe ser claro ("Ollama no
+  // responde"), no un intento silencioso a un provider sin credenciales.
+  try {
+    return await doFetch(`${ollamaUrl.replace(/\/+$/, '')}/v1/chat/completions`, 'Bearer ollama', ollamaModel, ollamaOptions);
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      const e = new Error(`Timeout: Ollama local (${ollamaUrl}) tardó demasiado en responder. ¿Está encendido y accesible?`);
+      e.status = 504;
       throw e;
     }
+    const e = new Error(`No se pudo conectar con Ollama local en ${ollamaUrl}. ¿Está corriendo? (Camino B activo porque GROQ_API_KEY no está definida)`);
+    e.status = 502;
+    throw e;
   }
-  throw lastErr;
 }
 
 /**
@@ -628,12 +680,13 @@ async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temp
  * como Railway, dejando el chat "parado" sin motivo aparente).
  * Lanza errores con `.status` adjunto (mismo patrón que ya usaba esta ruta).
  */
-async function processChatCompletion(authSub, { agentId, messages, model, temperature: temperatureInput, max_tokens: maxTokensInput, sessionSkills, tools: requestTools, tool_choice: requestToolChoice }) {
-  // Motor exclusivo Ollama: no se exige ninguna API key en la nube. OLLAMA_URL
-  // siempre tiene valor (default http://127.0.0.1:11434).
-  if (!OLLAMA_URL) {
-    const e = new Error('OLLAMA_BASE_URL no configurada en el servidor'); e.status = 503; throw e;
-  }
+async function processChatCompletion(authSub, { agentId, messages, model, temperature: temperatureInput, max_tokens: maxTokensInput }) {
+  // BLINDAJE — CONMUTACIÓN INTELIGENTE: antes esto cortaba con 503 CUALQUIER
+  // chat si no había GROQ_API_KEY, lo cual rompía por completo el Camino B
+  // (Ollama local) — quitar la clave de Groq nunca activaba Ollama, tumbaba
+  // todo el chat. El único caso que de verdad debe fallar aquí es "camino A
+  // Y B ambos sin configurar" (ni Groq ni Ollama disponibles), y eso ya lo
+  // reporta callChatModel() con un error claro cuando Ollama no responde.
 
   const userCheck = db.prepare('SELECT creditos, activo FROM users WHERE id = ?').get(authSub);
   if (!userCheck || !userCheck.activo) {
@@ -647,6 +700,7 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
 
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(authSub);
   const modeloZocoia = model || user?.modelo_activo || 'zoco-plus';
+  const groqModel = GROQ_MODEL_MAP[modeloZocoia] || GROQ_MODEL_MAP['zoco-plus'];
 
   let agente = null;
   let agenteData = {};
@@ -656,7 +710,7 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   let systemPromptText = '';
 
   if (agentId) {
-    agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(agentId, authSub, 'agente');
+    agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ? AND is_deleted = 0').get(agentId, authSub, 'agente');
     if (!agente) { const e = new Error('Agente no encontrado'); e.status = 404; throw e; }
 
     agenteData = agente.data ? JSON.parse(agente.data) : {};
@@ -666,30 +720,14 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
     // mismo formato { choices, usage, model } que espera el resto del flujo,
     // para que Marisai no note la diferencia entre esto y una respuesta de IA.
     if (agenteData.tipo === 'deterministic') {
-      // GATE ENTERPRISE: los ejecutores deterministas (DevOps/Testing/Reparación
-      // con acceso a APIs de despliegue y análisis de código) son exclusivos de
-      // la cuenta propietaria.
-      if (!isOwnerUser(db, authSub)) {
-        const e = new Error(ENTERPRISE_REQUIRED_MESSAGE); e.status = 403; e.code = 'enterprise_required'; throw e;
-      }
       return runDeterministicAgent({ db, uuidv4, userId: authSub, agente, agenteData, userMessage });
     }
 
-    const historial = db.prepare('SELECT role, content FROM agent_memory WHERE agente_id = ? ORDER BY created_at ASC LIMIT 50').all(agentId);
+    const historial = db.prepare('SELECT role, content FROM agent_memory WHERE agente_id = ? AND is_deleted = 0 ORDER BY created_at ASC LIMIT 50').all(agentId);
 
     systemPromptText = agenteData.tipo === 'generic_prompted' && agenteData.templateId
       ? resolveTemplatePrompt({ db, templateId: agenteData.templateId, overrideVars: agenteData.templateVars })
       : (agenteData.systemPrompt || `Eres ${agente.name}, un asistente de IA útil y preciso.`);
-    // Regla de formato seguro DeepSeek-R1 en RUNTIME: cubre también a los
-    // agentes ya sembrados en producción antes de este cambio (la siembra es
-    // idempotente y no los pisa). Se añade solo si el prompt no la lleva ya.
-    if (!String(systemPromptText).includes('DeepSeek-R1/OpenAI compatible endpoint')) {
-      systemPromptText += DEEPSEEK_SAFE_FORMAT_RULE;
-    }
-    // ENTORNOS: si el usuario tiene un entorno activo (dev/prod), su contexto
-    // operativo (nombre, tipo y variables no sensibles) viaja en el system
-    // prompt — como seleccionar el environment en la consola de Anthropic.
-    systemPromptText += buildEnvironmentContext(db, authSub);
     mensajesParaGroq.push({ role: 'system', content: systemPromptText });
     mensajesParaGroq = mensajesParaGroq.concat(historial);
     if (userMessage) mensajesParaGroq.push({ role: 'user', content: String(userMessage.content) });
@@ -699,22 +737,10 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
     cacheResult = checkAndUpdatePromptCache(authSub, agentId, systemPromptText);
   } else {
     mensajesParaGroq = Array.isArray(messages) ? messages : [{ role: 'user', content: 'Hola' }];
-    // ENTORNOS también en el chat sin agente: si hay entorno activo y la
-    // conversación no trae ya un system message, se antepone uno con el
-    // contexto operativo (sin secretos).
-    const envCtx = buildEnvironmentContext(db, authSub);
-    if (envCtx && !mensajesParaGroq.some(m => m.role === 'system')) {
-      mensajesParaGroq = [{ role: 'system', content: `Eres Zoco IA, un asistente de IA útil y preciso.${envCtx}` }, ...mensajesParaGroq];
-    } else if (envCtx) {
-      mensajesParaGroq = mensajesParaGroq.map(m => m.role === 'system' ? { ...m, content: m.content + envCtx } : m);
-    }
   }
 
   const lastUserMsg = mensajesParaGroq.filter(m => m.role === 'user').slice(-1)[0]?.content || '';
-  // Las habilidades activas de la sesión pueden forzar la búsqueda web aunque
-  // el heurístico de palabras clave no la detecte (activación dinámica por chat).
-  const skillForcesWeb = !!(sessionSkills && sessionSkills.busquedaWeb);
-  if (skillForcesWeb || needsWebSearch(lastUserMsg)) {
+  if (needsWebSearch(lastUserMsg)) {
     const searchResults = await webSearch(lastUserMsg);
     if (searchResults) {
       const webCtx = `\n\n[CONTEXTO WEB - ${new Date().toLocaleDateString('es-ES')}]\n${searchResults}\n[FIN CONTEXTO WEB]\nUsa este contexto para responder con información actualizada.`;
@@ -728,12 +754,10 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
     }
   }
 
-  // Motor exclusivo Ollama: el modelo comercial (zoco-*) o el id del agente se
-  // traduce SIEMPRE al modelo real creado en el servidor de Ollama. Si el
-  // agente/petición trae directamente un nombre de modelo de Ollama (p.ej.
-  // "deepseek-r1", "qwen2.5-coder"), se usa tal cual.
-  const modeloFinal = OLLAMA_MODEL_MAP[modeloZocoia] || modeloZocoia;
-  console.log(`[IA] ${modeloZocoia} → ${modeloFinal} via Ollama (${OLLAMA_URL})`);
+  const modeloFinal = usandoGroq
+    ? groqModel
+    : (OLLAMA_MODEL_MAP[modeloZocoia] || modeloZocoia);
+  console.log(`[IA] ${modeloZocoia} → ${modeloFinal} via ${usandoGroq ? 'Groq (Camino A)' : `Ollama local ${OLLAMA_URL} (Camino B)`}`);
 
   // Parámetros avanzados de IA por agente (num_predict / num_ctx / temperature),
   // con límites de seguridad y valores por defecto si el agente no los define.
@@ -747,60 +771,30 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   const temperature = clamp(temperatureInput ?? agenteData.temperature, 0, 1.2, 0.7);
   const maxTokens = maxTokensInput || numPredict;
 
-  // options nativas de Ollama (num_predict, num_ctx) — viajan en cada llamada
+  // options nativas de Ollama; solo tienen efecto en el Camino B (usandoGroq = false)
   const ollamaOptions = { num_predict: numPredict, num_ctx: numCtx };
 
-  // Tools permitidas: las del agente (si hay agente) + las aportadas por las
-  // habilidades activas de la sesión (activación dinámica estilo claude.ai).
-  const skillTools = Array.isArray(sessionSkills?.allowedTools)
-    ? sessionSkills.allowedTools.filter(t => ALL_TOOL_NAMES.includes(t))
-    : [];
-  const agentTools = agentId
+  const allowedTools = agentId
     ? (Array.isArray(agenteData.allowedTools) ? agenteData.allowedTools : ALL_TOOL_NAMES)
     : [];
-  let allowedTools = [...new Set([...agentTools, ...skillTools])];
-  // GATE ENTERPRISE: las herramientas del sistema (createFile, createFolder,
-  // executeCode, readFile… — la generación masiva de código del pipeline) son
-  // exclusivas de la cuenta propietaria. A los clientes básicos se les vacía
-  // la lista aunque intenten colárselas vía habilidades o agentes creados a
-  // mano — su chat sigue funcionando, pero sin ejecutar nada en el servidor.
-  if (allowedTools.length > 0 && !isOwnerUser(db, authSub)) {
-    allowedTools = [];
-  }
 
-  const callModel = (msgs, tools, toolChoice) =>
+  const callModel = (msgs, tools) =>
     callChatModel({
+      usandoGroq,
       ollamaUrl: OLLAMA_URL,
       ollamaModel: modeloFinal,
+      groqModel,
       messages: msgs,
       maxTokens,
       temperature,
       tools,
-      toolChoice,
       ollamaOptions,
     });
 
   let respuesta;
   let usage;
-  let clientToolCalls = null;
 
-  // TOOLS DEL CLIENTE (formato OpenAI estándar): cuando la petición trae sus
-  // propias tools (p.ej. el pipeline multi-agente de Maris AI hablando
-  // tools/tool_choice), se hace PASSTHROUGH — el modelo decide si llama a una
-  // herramienta y las tool_calls se devuelven al cliente tal cual, que es
-  // quien las ejecuta en su lado. No se mezclan con el bucle interno de
-  // habilidades para no ejecutar herramientas ajenas en este servidor.
-  const clientTools = Array.isArray(requestTools) && requestTools.length > 0
-    && requestTools.every(t => t && t.type === 'function' && t.function?.name)
-    ? requestTools : null;
-
-  if (clientTools) {
-    const data = await callModel(mensajesParaGroq, clientTools, requestToolChoice || 'auto');
-    const msg = data.choices?.[0]?.message || {};
-    respuesta = stripThink(msg.content || '');
-    if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) clientToolCalls = msg.tool_calls;
-    usage = data.usage || {};
-  } else if (allowedTools.length > 0) {
+  if (allowedTools.length > 0) {
     const result = await runToolLoop({
       messages: mensajesParaGroq,
       callModel,
@@ -808,11 +802,11 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
       workspacesRoot: WORKSPACES_ROOT,
       workspaceId: agentId,
     });
-    respuesta = stripThink(result.finalMessage);
+    respuesta = result.finalMessage;
     usage = result.usage;
   } else {
     const data = await callModel(mensajesParaGroq, undefined);
-    respuesta = stripThink(data.choices?.[0]?.message?.content || '');
+    respuesta = data.choices?.[0]?.message?.content || '';
     usage = data.usage || {};
   }
 
@@ -828,7 +822,7 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   const costeEuros = tokensConDescuento * 0.000002;
   if (costeEuros > 0) {
     db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)')
-      .run(uuidv4(), authSub, costeEuros, 'gasto', `Ollama ${modeloFinal}${cacheResult.hit ? ' (caché de prompt)' : ''}`);
+      .run(uuidv4(), authSub, costeEuros, 'gasto', `Groq ${groqModel}${cacheResult.hit ? ' (caché de prompt)' : ''}`);
     // Ya no se fuerza el suelo en 0: se deja bajar hasta BALANCE_BLOCK_THRESHOLD
     // (-0.83€ por defecto) para replicar el comportamiento real de la consola.
     // La siguiente petición quedará bloqueada por el check de arriba en cuanto
@@ -838,26 +832,14 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   }
 
   return {
-    choices: [{
-      message: {
-        role: 'assistant',
-        content: respuesta,
-        // tool_calls en formato OpenAI estándar cuando el cliente trajo tools
-        // propias y el modelo decidió llamar a una (passthrough completo).
-        ...(clientToolCalls ? { tool_calls: clientToolCalls } : {}),
-      },
-      finish_reason: clientToolCalls ? 'tool_calls' : 'stop',
-    }],
+    choices: [{ message: { role: 'assistant', content: respuesta } }],
     usage: {
       input_tokens: usage.prompt_tokens || 0,
       output_tokens: usage.completion_tokens || 0,
       total_tokens: totalTokens,
       cache_read_tokens: cacheResult.hit ? cacheResult.cachedTokens : 0,
-      // Alias en formato OpenAI para clientes que leen prompt/completion_tokens.
-      prompt_tokens: usage.prompt_tokens || 0,
-      completion_tokens: usage.completion_tokens || 0,
     },
-    model: modeloFinal,
+    model: groqModel,
   };
 }
 
@@ -927,17 +909,17 @@ app.put('/api/user/modelo', authMiddleware, (req, res) => {
 });
 
 app.get('/api/agentes/:id/memoria', authMiddleware, (req, res) => {
-  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(req.params.id, req.auth.sub, 'agente');
+  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ? AND is_deleted = 0').get(req.params.id, req.auth.sub, 'agente');
   if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
 
-  const mensajes = db.prepare('SELECT id, role, content, created_at FROM agent_memory WHERE agente_id = ? ORDER BY created_at ASC').all(req.params.id);
-  const cacheActiva = db.prepare('SELECT COUNT(*) as count FROM prompt_cache WHERE agente_id = ? AND expires_at > ?').get(req.params.id, Date.now()).count;
+  const mensajes = db.prepare('SELECT id, role, content, created_at FROM agent_memory WHERE agente_id = ? AND is_deleted = 0 ORDER BY created_at ASC').all(req.params.id);
+  const cacheActiva = db.prepare('SELECT COUNT(*) as count FROM prompt_cache WHERE agente_id = ? AND is_deleted = 0 AND expires_at > ?').get(req.params.id, Date.now()).count;
 
   res.json({ mensajes, cacheActiva: cacheActiva > 0 });
 });
 
 app.post('/api/agentes/:id/memoria', authMiddleware, (req, res) => {
-  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(req.params.id, req.auth.sub, 'agente');
+  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ? AND is_deleted = 0').get(req.params.id, req.auth.sub, 'agente');
   if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
 
   const { role, content } = req.body || {};
@@ -951,11 +933,13 @@ app.post('/api/agentes/:id/memoria', authMiddleware, (req, res) => {
 });
 
 app.delete('/api/agentes/:id/memoria', authMiddleware, (req, res) => {
-  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(req.params.id, req.auth.sub, 'agente');
+  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ? AND is_deleted = 0').get(req.params.id, req.auth.sub, 'agente');
   if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
 
-  db.prepare('DELETE FROM agent_memory WHERE agente_id = ?').run(req.params.id);
-  db.prepare('DELETE FROM prompt_cache WHERE agente_id = ?').run(req.params.id);
+  console.warn(`⚠️ [audit] soft-delete manual: memoria del agente ${req.params.id} por usuario ${req.auth.sub} (ruta DELETE /api/agentes/:id/memoria)`);
+  const now = new Date().toISOString();
+  db.prepare('UPDATE agent_memory SET is_deleted = 1, deleted_at = ?, deleted_reason = ? WHERE agente_id = ? AND is_deleted = 0').run(now, 'manual-delete', req.params.id);
+  db.prepare('UPDATE prompt_cache SET is_deleted = 1, deleted_at = ?, deleted_reason = ? WHERE agente_id = ? AND is_deleted = 0').run(now, 'manual-delete', req.params.id);
   res.json({ ok: true });
 });
 
@@ -971,14 +955,10 @@ app.post('/auth/register', (req, res) => {
 
   const id = uuidv4();
   const passwordHash = bcrypt.hashSync(password, 12);
-    db.prepare(
+  db.prepare(
     'INSERT INTO users (id, email, password_hash, nombre, is_admin, is_support, creditos, activo) VALUES (?, ?, ?, ?, 0, 0, 0, 1)'
   ).run(id, emailLower, passwordHash, nombre.trim());
-  // SEGMENTACIÓN COMERCIAL: todo cliente nuevo (que no sea el propietario)
-  // recibe automáticamente su biblioteca de Agentes Básicos (Asistente
-  // General, Traductor Multilingüe, Analista de Datos Básico). La siembra
-  // es idempotente y nunca rompe el registro si algo falla.
-  seedBasicAgentsForUser(db, id);
+
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
   const token = signToken(user);
   res.status(201).json({ token, user: publicUser(user) });
@@ -1071,7 +1051,7 @@ async function sendPasswordResetEmail(toEmail, resetLink) {
 
 app.get('/api/keys', authMiddleware, (req, res) => {
   const rows = db.prepare(
-    'SELECT id, name, key_prefix, last_used_at, revoked, created_at FROM api_keys WHERE user_id = ? ORDER BY created_at DESC'
+    'SELECT id, name, key_prefix, last_used_at, revoked, created_at FROM api_keys WHERE user_id = ? AND is_deleted = 0 ORDER BY created_at DESC'
   ).all(req.auth.sub);
   res.json(rows.map(r => ({
     id: r.id,
@@ -1101,38 +1081,10 @@ app.post('/api/keys', authMiddleware, (req, res) => {
 });
 
 app.delete('/api/keys/:id', authMiddleware, (req, res) => {
-  const key = db.prepare('SELECT * FROM api_keys WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
+  const key = db.prepare('SELECT * FROM api_keys WHERE id = ? AND user_id = ? AND is_deleted = 0').get(req.params.id, req.auth.sub);
   if (!key) return res.status(404).json({ error: 'Clave no encontrada' });
-  db.prepare('DELETE FROM api_keys WHERE id = ?').run(req.params.id);
-  res.json({ ok: true });
-});
-
-// Renombrar una API key (el Dashboard llama a PUT /api/keys/:id al editar).
-app.put('/api/keys/:id', authMiddleware, (req, res) => {
-  const key = db.prepare('SELECT * FROM api_keys WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
-  if (!key) return res.status(404).json({ error: 'Clave no encontrada' });
-  const { name } = req.body || {};
-  if (!name || !name.trim()) return res.status(400).json({ error: 'El nombre es obligatorio' });
-  db.prepare('UPDATE api_keys SET name = ? WHERE id = ?').run(name.trim(), key.id);
-  res.json({ ok: true, id: key.id, name: name.trim() });
-});
-
-// Alias de memoria que usa el Dashboard: /api/resources/:id/memory → misma
-// lógica que /api/agentes/:id/memoria (GET) y su DELETE. Se añaden para que
-// el botón "🧠 Memoria" de las tarjetas de agentes funcione de verdad.
-app.get('/api/resources/:id/memory', authMiddleware, (req, res) => {
-  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(req.params.id, req.auth.sub, 'agente');
-  if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
-  const mensajes = db.prepare('SELECT id, role, content, created_at FROM agent_memory WHERE agente_id = ? ORDER BY created_at ASC').all(req.params.id);
-  const cacheActiva = db.prepare('SELECT COUNT(*) as count FROM prompt_cache WHERE agente_id = ? AND expires_at > ?').get(req.params.id, Date.now()).count;
-  res.json({ mensajes, cacheActiva: cacheActiva > 0 });
-});
-
-app.delete('/api/resources/:id/memory', authMiddleware, (req, res) => {
-  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(req.params.id, req.auth.sub, 'agente');
-  if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
-  db.prepare('DELETE FROM agent_memory WHERE agente_id = ?').run(req.params.id);
-  db.prepare('DELETE FROM prompt_cache WHERE agente_id = ?').run(req.params.id);
+  console.warn(`⚠️ [audit] soft-delete manual: api_key ${req.params.id} por usuario ${req.auth.sub} (ruta DELETE /api/keys/:id)`);
+  db.prepare('UPDATE api_keys SET revoked = 1, is_deleted = 1, deleted_at = ?, deleted_reason = ? WHERE id = ?').run(new Date().toISOString(), 'manual-delete', req.params.id);
   res.json({ ok: true });
 });
 
@@ -1141,8 +1093,8 @@ app.get('/api/resources', authMiddleware, (req, res) => {
   if (type && !RESOURCE_TYPES.includes(type)) return res.status(400).json({ error: 'Tipo de recurso no válido' });
 
   const rows = type
-    ? db.prepare('SELECT * FROM resources WHERE user_id = ? AND type = ? ORDER BY created_at DESC').all(req.auth.sub, type)
-    : db.prepare('SELECT * FROM resources WHERE user_id = ? ORDER BY created_at DESC').all(req.auth.sub);
+    ? db.prepare('SELECT * FROM resources WHERE user_id = ? AND type = ? AND is_deleted = 0 ORDER BY created_at DESC').all(req.auth.sub, type)
+    : db.prepare('SELECT * FROM resources WHERE user_id = ? AND is_deleted = 0 ORDER BY created_at DESC').all(req.auth.sub);
 
   res.json(rows.map(r => ({
     id: r.id,
@@ -1158,17 +1110,7 @@ app.post('/api/resources', authMiddleware, (req, res) => {
   const { type, name, data } = req.body || {};
   if (!RESOURCE_TYPES.includes(type)) return res.status(400).json({ error: 'Tipo de recurso no válido' });
   if (!name || !name.trim()) return res.status(400).json({ error: 'El nombre es obligatorio' });
-  // GATE ENTERPRISE (anti-clonación): los clientes básicos no pueden crear
-  // agentes con capacidades del pipeline avanzado — ejecutores deterministas
-  // (railway_api, vercel_api, sandbox…) ni herramientas del sistema.
-  if (type === 'agente' && !isOwnerUser(db, req.auth.sub)) {
-    const d = data || {};
-    const pideAvanzado = d.tipo === 'deterministic' || d.executorType
-      || (Array.isArray(d.allowedTools) && d.allowedTools.length > 0);
-    if (pideAvanzado) {
-      return res.status(403).json({ error: ENTERPRISE_REQUIRED_MESSAGE, code: 'enterprise_required' });
-    }
-  }
+
   const id = uuidv4();
   db.prepare(
     'INSERT INTO resources (id, user_id, type, name, data) VALUES (?, ?, ?, ?, ?)'
@@ -1179,19 +1121,10 @@ app.post('/api/resources', authMiddleware, (req, res) => {
 });
 
 app.put('/api/resources/:id', authMiddleware, (req, res) => {
-  const row = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
+  const row = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND is_deleted = 0').get(req.params.id, req.auth.sub);
   if (!row) return res.status(404).json({ error: 'Recurso no encontrado' });
+
   const { name, data } = req.body || {};
-  // GATE ENTERPRISE (anti-escalada): tampoco por edición se puede convertir
-  // un agente básico en uno avanzado (executor determinista o tools del sistema).
-  if (row.type === 'agente' && data !== undefined && !isOwnerUser(db, req.auth.sub)) {
-    const d = data || {};
-    const pideAvanzado = d.tipo === 'deterministic' || d.executorType
-      || (Array.isArray(d.allowedTools) && d.allowedTools.length > 0);
-    if (pideAvanzado) {
-      return res.status(403).json({ error: ENTERPRISE_REQUIRED_MESSAGE, code: 'enterprise_required' });
-    }
-  }
   const newName = (name && name.trim()) || row.name;
   const newData = data !== undefined ? JSON.stringify(data) : row.data;
 
@@ -1201,12 +1134,14 @@ app.put('/api/resources/:id', authMiddleware, (req, res) => {
 });
 
 app.delete('/api/resources/:id', authMiddleware, (req, res) => {
-  const row = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
+  const row = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND is_deleted = 0').get(req.params.id, req.auth.sub);
   if (!row) return res.status(404).json({ error: 'Recurso no encontrado' });
-  db.prepare('DELETE FROM resources WHERE id = ?').run(row.id);
+  console.warn(`⚠️ [audit] soft-delete manual: resource ${row.id} (type=${row.type}) por usuario ${req.auth.sub} (ruta DELETE /api/resources/:id)`);
+  const now = new Date().toISOString();
+  db.prepare('UPDATE resources SET is_deleted = 1, deleted_at = ?, deleted_reason = ? WHERE id = ?').run(now, 'manual-delete', row.id);
   if (row.type === 'agente') {
-    db.prepare('DELETE FROM agent_memory WHERE agente_id = ?').run(row.id);
-    db.prepare('DELETE FROM prompt_cache WHERE agente_id = ?').run(row.id);
+    db.prepare('UPDATE agent_memory SET is_deleted = 1, deleted_at = ?, deleted_reason = ? WHERE agente_id = ? AND is_deleted = 0').run(now, 'manual-delete', row.id);
+    db.prepare('UPDATE prompt_cache SET is_deleted = 1, deleted_at = ?, deleted_reason = ? WHERE agente_id = ? AND is_deleted = 0').run(now, 'manual-delete', row.id);
   }
   res.json({ ok: true });
 });
@@ -1221,14 +1156,14 @@ app.get('/api/billing/summary', authMiddleware, (req, res) => {
   ).get(user.id, monthStart);
 
   const resourceCounts = db.prepare(
-    'SELECT type, COUNT(*) as count FROM resources WHERE user_id = ? GROUP BY type'
+    'SELECT type, COUNT(*) as count FROM resources WHERE user_id = ? AND is_deleted = 0 GROUP BY type'
   ).all(user.id);
 
   const countsByType = {};
   RESOURCE_TYPES.forEach(t => { countsByType[t] = 0; });
   resourceCounts.forEach(r => { countsByType[r.type] = r.count; });
 
-  const keysCount = db.prepare('SELECT COUNT(*) as count FROM api_keys WHERE user_id = ? AND revoked = 0').get(user.id).count;
+  const keysCount = db.prepare('SELECT COUNT(*) as count FROM api_keys WHERE user_id = ? AND revoked = 0 AND is_deleted = 0').get(user.id).count;
 
   res.json({
     creditos: user.creditos,
@@ -1407,7 +1342,6 @@ app.get('/api/payments/success', authMiddleware, (req, res) => {
 });
 
 app.get('/api/system/ollama', authMiddleware, async (req, res) => {
-  // Usa la misma URL unificada del motor (OLLAMA_BASE_URL / OLLAMA_URL).
   const ollamaUrl = OLLAMA_URL;
   try {
     const resp = await fetch(`${ollamaUrl}/api/tags`, { signal: AbortSignal.timeout(3000) });
@@ -1430,10 +1364,12 @@ app.get('/admin/stats', authMiddleware, requireAdmin, (req, res) => {
     ORDER BY p.created_at DESC LIMIT 50
   `).all();
   const vivaConfigurado = !!(process.env.VIVA_CLIENT_ID && process.env.VIVA_CLIENT_SECRET);
-  // Motor exclusivo Ollama: siempre configurado (default 127.0.0.1:11434).
-  const ollamaOnline = !!OLLAMA_URL;
+  // Refleja el camino activo real de la Conmutación Inteligente, no solo si
+  // hay una URL de Ollama configurada (antes decía "false" incluso cuando
+  // Ollama era el único provider activo, si no había vuelto a leer la env var).
+  const ollamaOnline = !usandoGroq;
 
-  res.json({ totalUsuarios, usuariosActivos, ingresosTotal, llamadasHoy, ultimosPagos, vivaConfigurado, ollamaOnline });
+  res.json({ totalUsuarios, usuariosActivos, ingresosTotal, llamadasHoy, ultimosPagos, vivaConfigurado, ollamaOnline, activeProvider: usandoGroq ? 'groq' : 'ollama' });
 });
 
 app.get('/admin/logs', authMiddleware, requireAdmin, (req, res) => {
@@ -1470,18 +1406,19 @@ app.put('/admin/clientes/:id', authMiddleware, requireAdmin, (req, res) => {
 // Rutas admin del puente Marisai (import de prompts As-Is, gestión de
 // templates maestros, config de executors deterministas). Todas viven bajo
 // /admin/bridge/* y reutilizan authMiddleware + requireAdmin ya existentes.
-registerBridgeAdminRoutes({ app, db, authMiddleware, requireAdmin, uuidv4 });
-
-// ── Sesiones estilo consola de Claude + Archivos + Credenciales Zoco IA ────
-// Conversaciones persistentes en servidor con adjuntos de archivos de
-// contexto y habilidades activables por chat, más el Almacén de credenciales
-// que valida y guarda cifrada la API Key de Zoco IA para los agentes.
-registerSessionRoutes({ app, db, authMiddleware, uuidv4, serverSecret: JWT_SECRET, processChatCompletion });
-// Consola estilo Anthropic: Lotes (cola contra Ollama), Implementaciones
-// (Railway/Vercel), Entornos (variables aplicadas al chat) y búsqueda en
-// los Almacenes de memoria.
-registerConsoleRoutes({ app, db, authMiddleware, uuidv4, processChatCompletion });
-resumeInterruptedBatches(db, processChatCompletion);
+//
+// BLINDAJE: esta llamada es SÍNCRONA y se ejecuta durante la carga del
+// módulo (no dentro de una request). Internamente dispara
+// ensureBridgeTables(db), que ya está blindada con try/catch propio (ver
+// bridge-marisai.js), pero se envuelve también aquí como defensa en
+// profundidad: si algo inesperado lanzara de todos modos, el servidor debe
+// seguir arrancando y /health debe seguir respondiendo en vez de morir.
+try {
+  registerBridgeAdminRoutes({ app, db, authMiddleware, requireAdmin, uuidv4 });
+} catch (err) {
+  console.error('❌ No se pudieron registrar las rutas admin del puente Marisai:', err.message);
+  bootIssues.push(`Rutas /admin/bridge/* no disponibles: ${err.message}`);
+}
 
 // ── Endpoint compatible con el formato Anthropic Messages API ─────────────
 // Permite que Marisai (u otro cliente que use el SDK/formato de Anthropic)
@@ -1552,16 +1489,16 @@ app.post('/v1/messages', authMiddleware, async (req, res) => {
 async function resolveAgentIdBySlug(slug, userId) {
   // metadata.agent_slug puede venir como el id real del recurso o como un
   // alias legible; se busca primero por id exacto y si no, por nombre.
-  const porId = db.prepare("SELECT id FROM resources WHERE id = ? AND user_id = ? AND type = 'agente'").get(slug, userId);
+  const porId = db.prepare("SELECT id FROM resources WHERE id = ? AND user_id = ? AND type = 'agente' AND is_deleted = 0").get(slug, userId);
   if (porId) return porId.id;
-  const porNombre = db.prepare("SELECT id FROM resources WHERE user_id = ? AND type = 'agente' AND name = ?").get(userId, slug);
+  const porNombre = db.prepare("SELECT id FROM resources WHERE user_id = ? AND type = 'agente' AND name = ? AND is_deleted = 0").get(userId, slug);
   return porNombre?.id;
 }
 
 const publicDir = path.join(__dirname, 'public');
 if (fs.existsSync(publicDir)) {
   app.use(express.static(publicDir));
-  app.get(/^(?!\/(auth|v1|admin|health|salud|api)).*/, (req, res) => {
+  app.get(/^(?!\/(auth|v1|admin|health|api)).*/, (req, res) => {
     res.sendFile(path.join(publicDir, 'index.html'));
   });
 } else {
