@@ -15,11 +15,40 @@ import { runDeterministicAgent, resolveTemplatePrompt, registerBridgeAdminRoutes
 
 dotenv.config();
 
+// Red de seguridad adicional para errores asíncronos que puedan ocurrir
+// DESPUÉS de que el servidor ya esté arriba y escuchando (p.ej. una
+// promesa rechazada sin .catch en algún handler). Solo se loguea: nunca
+// tumbamos el proceso por esto, para no perder disponibilidad por un
+// error puntual en una petición aislada.
+process.on('uncaughtException', (err) => {
+  console.error('❌ uncaughtException (el servidor sigue vivo):', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('❌ unhandledRejection (el servidor sigue vivo):', reason);
+});
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const port = process.env.PORT || 8080;
+
+// BLINDAJE: /health se registra AQUÍ, lo primero de todo, antes de tocar
+// ninguna base de datos o filesystem. Así, pase lo que pase más abajo
+// durante el arranque (DB, workspaces, rutas del puente Marisai...), en
+// cuanto el proceso llegue a app.listen() al final del archivo, Railway
+// podrá recibir respuesta de /health. isReady se pone a true solo cuando
+// TODO el arranque terminó sin problemas; si algo falló mientras tanto,
+// /health sigue respondiendo 200 (para no tumbar el deploy) pero avisa
+// del estado degradado en el body, para que se vea en los logs/monitoring.
+let bootIssues = [];
+app.get('/health', (req, res) => {
+  res.json({
+    status: bootIssues.length === 0 ? 'ok' : 'degraded',
+    message: 'Zoco IA conectado con éxito',
+    ...(bootIssues.length ? { warnings: bootIssues } : {}),
+  });
+});
 
 if (!process.env.JWT_SECRET) {
   console.warn('⚠️  JWT_SECRET no está definido. Usando uno temporal generado al vuelo.');
@@ -29,11 +58,36 @@ const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString('he
 const JWT_EXPIRES_IN = '7d';
 const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hora
 
-const DB_PATH = process.env.DB_PATH || (process.env.RAILWAY_VOLUME_MOUNT_PATH ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'app.db') : path.join(__dirname, 'data', 'app.db'));
-const dbDir = path.dirname(DB_PATH);
-if (dbDir && !fs.existsSync(dbDir)) {
-  console.log(`📁 Creando directorio de base de datos en: ${dbDir}`);
-  fs.mkdirSync(dbDir, { recursive: true });
+// Rutas SIEMPRE absolutas: path.join(__dirname, ...) o el volumen que
+// inyecta Railway (RAILWAY_VOLUME_MOUNT_PATH, ya absoluto de por sí).
+// Nunca una ruta relativa tipo './data/app.db', que dependería del cwd
+// con el que Docker/Railway lance el proceso.
+let DB_PATH = process.env.DB_PATH || (process.env.RAILWAY_VOLUME_MOUNT_PATH ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'app.db') : path.join(__dirname, 'data', 'app.db'));
+let dbDir = path.dirname(DB_PATH);
+
+// BLINDAJE 1/3: crear el directorio de la base de datos. Si el volumen de
+// Railway aún no está montado o no hay permisos de escritura, esto lanzaba
+// antes de forma síncrona y tumbaba TODO el proceso (nunca se llegaba a
+// app.listen(), /health no respondía => "Healthcheck failed"). Ahora, si
+// falla, caemos a una ruta local dentro del propio contenedor
+// (path.join(__dirname, 'data', 'app.db')) para que el servidor arranque
+// igualmente; se deja constancia en bootIssues para verlo en /health.
+try {
+  if (dbDir && !fs.existsSync(dbDir)) {
+    console.log(`📁 Creando directorio de base de datos en: ${dbDir}`);
+    fs.mkdirSync(dbDir, { recursive: true });
+  }
+} catch (err) {
+  console.error(`❌ No se pudo crear el directorio de base de datos (${dbDir}): ${err.message}`);
+  bootIssues.push(`No se pudo crear dbDir (${dbDir}): ${err.message}`);
+  DB_PATH = path.join(__dirname, 'data', 'app.db');
+  dbDir = path.dirname(DB_PATH);
+  try {
+    fs.mkdirSync(dbDir, { recursive: true });
+  } catch (err2) {
+    console.error(`❌ Tampoco se pudo crear el directorio de fallback (${dbDir}): ${err2.message}`);
+    bootIssues.push(`Fallback dbDir también falló: ${err2.message}`);
+  }
 }
 
 console.log(`🗄️ Usando base de datos en: ${DB_PATH}`);
@@ -52,12 +106,31 @@ if (process.env.NODE_ENV === 'production' && !process.env.RAILWAY_VOLUME_MOUNT_P
   console.warn('⚠️⚠️⚠️  Solución: adjunta un Volumen a este servicio en el dashboard de Railway (Command Palette ⌘K → "Create Volume"), móntalo en /data, y haz redeploy.');
 }
 
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
+// BLINDAJE 2/3: abrir la base de datos. Si better-sqlite3 no puede abrir
+// el fichero (corrupto, permisos, lock...) caemos a una base de datos en
+// memoria SOLO para que el proceso siga vivo y /health responda; se marca
+// como degradado porque en ese modo no hay persistencia real.
+let db;
+try {
+  db = new Database(DB_PATH);
+  db.pragma('journal_mode = WAL');
+} catch (err) {
+  console.error(`❌ No se pudo abrir la base de datos en ${DB_PATH}: ${err.message}`);
+  bootIssues.push(`No se pudo abrir la base de datos: ${err.message}`);
+  db = new Database(':memory:');
+}
 
+// BLINDAJE 3/3: workspaces de los agentes. Un fallo aquí no debe impedir
+// que el resto del servidor (auth, chat, admin) arranque con normalidad.
 const WORKSPACES_ROOT = makeWorkspacesRoot(dbDir);
-fs.mkdirSync(WORKSPACES_ROOT, { recursive: true });
+try {
+  fs.mkdirSync(WORKSPACES_ROOT, { recursive: true });
+} catch (err) {
+  console.error(`❌ No se pudo crear WORKSPACES_ROOT (${WORKSPACES_ROOT}): ${err.message}`);
+  bootIssues.push(`No se pudo crear WORKSPACES_ROOT: ${err.message}`);
+}
 
+try {
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -147,10 +220,19 @@ db.exec(`
     FOREIGN KEY (user_id) REFERENCES users(id)
   );
 `);
+} catch (err) {
+  console.error('❌ No se pudo crear/verificar el esquema principal de la base de datos:', err.message);
+  bootIssues.push(`Esquema principal falló: ${err.message}`);
+}
 
-const userColumns = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
-if (!userColumns.includes('modelo_activo')) {
-  db.exec("ALTER TABLE users ADD COLUMN modelo_activo TEXT DEFAULT 'zoco-plus'");
+try {
+  const userColumns = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
+  if (!userColumns.includes('modelo_activo')) {
+    db.exec("ALTER TABLE users ADD COLUMN modelo_activo TEXT DEFAULT 'zoco-plus'");
+  }
+} catch (err) {
+  console.error('❌ No se pudo verificar/migrar la columna modelo_activo:', err.message);
+  bootIssues.push(`Migración modelo_activo falló: ${err.message}`);
 }
 
 const RESOURCE_TYPES = ['agente', 'archivo', 'habilidad', 'lote', 'sesion', 'implementacion', 'entorno', 'credencial', 'memoria'];
@@ -466,10 +548,6 @@ function firstOfMonthISO() {
   const d = new Date();
   return new Date(d.getFullYear(), d.getMonth(), 1).toISOString();
 }
-
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', message: 'Zoco IA conectado con éxito' });
-});
 
 async function callChatModel({ usandoOllama, ollamaUrl, ollamaModel, groqModel, messages, maxTokens, temperature, tools, ollamaOptions }) {
   async function doFetch(url, auth, model, extraOllamaOptions) {
@@ -1250,7 +1328,19 @@ app.put('/admin/clientes/:id', authMiddleware, requireAdmin, (req, res) => {
 // Rutas admin del puente Marisai (import de prompts As-Is, gestión de
 // templates maestros, config de executors deterministas). Todas viven bajo
 // /admin/bridge/* y reutilizan authMiddleware + requireAdmin ya existentes.
-registerBridgeAdminRoutes({ app, db, authMiddleware, requireAdmin, uuidv4 });
+//
+// BLINDAJE: esta llamada es SÍNCRONA y se ejecuta durante la carga del
+// módulo (no dentro de una request). Internamente dispara
+// ensureBridgeTables(db), que ya está blindada con try/catch propio (ver
+// bridge-marisai.js), pero se envuelve también aquí como defensa en
+// profundidad: si algo inesperado lanzara de todos modos, el servidor debe
+// seguir arrancando y /health debe seguir respondiendo en vez de morir.
+try {
+  registerBridgeAdminRoutes({ app, db, authMiddleware, requireAdmin, uuidv4 });
+} catch (err) {
+  console.error('❌ No se pudieron registrar las rutas admin del puente Marisai:', err.message);
+  bootIssues.push(`Rutas /admin/bridge/* no disponibles: ${err.message}`);
+}
 
 // ── Endpoint compatible con el formato Anthropic Messages API ─────────────
 // Permite que Marisai (u otro cliente que use el SDK/formato de Anthropic)
