@@ -15,40 +15,11 @@ import { runDeterministicAgent, resolveTemplatePrompt, registerBridgeAdminRoutes
 
 dotenv.config();
 
-// Red de seguridad adicional para errores asíncronos que puedan ocurrir
-// DESPUÉS de que el servidor ya esté arriba y escuchando (p.ej. una
-// promesa rechazada sin .catch en algún handler). Solo se loguea: nunca
-// tumbamos el proceso por esto, para no perder disponibilidad por un
-// error puntual en una petición aislada.
-process.on('uncaughtException', (err) => {
-  console.error('❌ uncaughtException (el servidor sigue vivo):', err);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('❌ unhandledRejection (el servidor sigue vivo):', reason);
-});
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const port = process.env.PORT || 8080;
-
-// BLINDAJE: /health se registra AQUÍ, lo primero de todo, antes de tocar
-// ninguna base de datos o filesystem. Así, pase lo que pase más abajo
-// durante el arranque (DB, workspaces, rutas del puente Marisai...), en
-// cuanto el proceso llegue a app.listen() al final del archivo, Railway
-// podrá recibir respuesta de /health. isReady se pone a true solo cuando
-// TODO el arranque terminó sin problemas; si algo falló mientras tanto,
-// /health sigue respondiendo 200 (para no tumbar el deploy) pero avisa
-// del estado degradado en el body, para que se vea en los logs/monitoring.
-let bootIssues = [];
-app.get('/health', (req, res) => {
-  res.json({
-    status: bootIssues.length === 0 ? 'ok' : 'degraded',
-    message: 'Zoco IA conectado con éxito',
-    ...(bootIssues.length ? { warnings: bootIssues } : {}),
-  });
-});
 
 if (!process.env.JWT_SECRET) {
   console.warn('⚠️  JWT_SECRET no está definido. Usando uno temporal generado al vuelo.');
@@ -58,86 +29,66 @@ const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString('he
 const JWT_EXPIRES_IN = '7d';
 const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hora
 
-// Rutas SIEMPRE absolutas: path.join(__dirname, ...) o el volumen que
-// inyecta Railway (RAILWAY_VOLUME_MOUNT_PATH, ya absoluto de por sí).
-// Nunca una ruta relativa tipo './data/app.db', que dependería del cwd
-// con el que Docker/Railway lance el proceso.
-let DB_PATH = process.env.DB_PATH || (process.env.RAILWAY_VOLUME_MOUNT_PATH ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'app.db') : path.join(__dirname, 'data', 'app.db'));
-let dbDir = path.dirname(DB_PATH);
+// Resolución de la ruta de la base de datos, en orden de prioridad:
+//   1. DB_PATH explícito (si lo defines a mano en Railway, gana siempre)
+//   2. RAILWAY_VOLUME_MOUNT_PATH (Railway lo inyecta solo cuando el Volumen
+//      está realmente adjuntado a ESTE servicio y hubo un redeploy después)
+//   3. Fallback defensivo: si /data existe como directorio en el filesystem
+//      del contenedor (típico si el volumen se montó ahí pero por lo que
+//      sea la env var no llegó a inyectarse), se usa igualmente — así el
+//      requisito "SÍ O SÍ en /data" se cumple aunque falle la detección
+//      automática de Railway.
+//   4. Solo si nada de lo anterior existe, cae a ./data/ local (dev/local).
+function resolveDbPath() {
+  if (process.env.DB_PATH) return process.env.DB_PATH;
+  if (process.env.RAILWAY_VOLUME_MOUNT_PATH) return path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'zocoia.db');
+  if (fs.existsSync('/data')) return '/data/zocoia.db';
+  return path.join(__dirname, 'data', 'app.db');
+}
 
-// BLINDAJE 1/3: crear el directorio de la base de datos. Si el volumen de
-// Railway aún no está montado o no hay permisos de escritura, esto lanzaba
-// antes de forma síncrona y tumbaba TODO el proceso (nunca se llegaba a
-// app.listen(), /health no respondía => "Healthcheck failed"). Ahora, si
-// falla, caemos a una ruta local dentro del propio contenedor
-// (path.join(__dirname, 'data', 'app.db')) para que el servidor arranque
-// igualmente; se deja constancia en bootIssues para verlo en /health.
-try {
-  if (dbDir && !fs.existsSync(dbDir)) {
-    console.log(`📁 Creando directorio de base de datos en: ${dbDir}`);
-    fs.mkdirSync(dbDir, { recursive: true });
-  }
-} catch (err) {
-  console.error(`❌ No se pudo crear el directorio de base de datos (${dbDir}): ${err.message}`);
-  bootIssues.push(`No se pudo crear dbDir (${dbDir}): ${err.message}`);
-  DB_PATH = path.join(__dirname, 'data', 'app.db');
-  dbDir = path.dirname(DB_PATH);
-  try {
-    fs.mkdirSync(dbDir, { recursive: true });
-  } catch (err2) {
-    console.error(`❌ Tampoco se pudo crear el directorio de fallback (${dbDir}): ${err2.message}`);
-    bootIssues.push(`Fallback dbDir también falló: ${err2.message}`);
+const DB_PATH = resolveDbPath();
+const dbDir = path.dirname(DB_PATH);
+if (dbDir && !fs.existsSync(dbDir)) {
+  console.log(`📁 Creando directorio de base de datos en: ${dbDir}`);
+  fs.mkdirSync(dbDir, { recursive: true });
+}
+
+// Migración de compatibilidad: si existe una BD antigua con el nombre
+// previo (app.db) en el mismo directorio del volumen y todavía NO existe
+// zocoia.db, se renombra en vez de arrancar en blanco — así ningún dato
+// que ya sobrevivió en el volumen se pierde solo por el cambio de nombre.
+const legacyDbPath = path.join(dbDir, 'app.db');
+if (!fs.existsSync(DB_PATH) && fs.existsSync(legacyDbPath)) {
+  console.log(`♻️  Migrando base de datos existente: ${legacyDbPath} → ${DB_PATH}`);
+  fs.renameSync(legacyDbPath, DB_PATH);
+  for (const ext of ['-wal', '-shm']) {
+    if (fs.existsSync(legacyDbPath + ext)) fs.renameSync(legacyDbPath + ext, DB_PATH + ext);
   }
 }
 
 console.log(`🗄️ Usando base de datos en: ${DB_PATH}`);
 
-// Aviso crítico: si estamos en producción (Railway) y NO hay un volumen
-// persistente montado, todo lo que se guarde en `db` (agentes, habilidades,
-// entornos, memoria...) vivirá SOLO dentro del contenedor y desaparecerá en
-// el próximo deploy/reinicio. Esto no se puede arreglar solo con código: hay
-// que adjuntar un Volumen al servicio desde el dashboard/CLI de Railway
-// (Command Palette ⌘K → "Create Volume", montado p. ej. en /data). En cuanto
-// exista, Railway inyecta RAILWAY_VOLUME_MOUNT_PATH automáticamente y esta
-// misma línea de arriba empezará a usarlo sin tocar nada más.
-if (process.env.NODE_ENV === 'production' && !process.env.RAILWAY_VOLUME_MOUNT_PATH && !process.env.DB_PATH) {
-  const noVolumeWarning = 'RIESGO DE PÉRDIDA DE DATOS: no hay volumen persistente de Railway montado (RAILWAY_VOLUME_MOUNT_PATH ausente). La base de datos SQLite vive dentro del contenedor y SE BORRARÁ en el próximo deploy/reinicio. Solución: Railway dashboard → Command Palette ⌘K → "Create Volume", móntalo en /data, redeploy.';
-  console.warn('⚠️⚠️⚠️  ATENCIÓN: no se detecta ningún volumen persistente de Railway (RAILWAY_VOLUME_MOUNT_PATH no está definido).');
+// Aviso crítico: si estamos en producción (Railway) y NO hay ningún rastro
+// de volumen persistente (ni env var ni /data existente), todo lo que se
+// guarde en `db` vivirá SOLO dentro del contenedor y desaparecerá en el
+// próximo deploy/reinicio. Esto no se arregla con código: hay que adjuntar
+// un Volumen al servicio desde el dashboard/CLI de Railway (Command Palette
+// ⌘K → "Create Volume", montado en /data) y luego hacer un redeploy — la
+// variable RAILWAY_VOLUME_MOUNT_PATH solo aparece DESPUÉS de ese redeploy.
+if (process.env.NODE_ENV === 'production' && !process.env.RAILWAY_VOLUME_MOUNT_PATH && !process.env.DB_PATH && !fs.existsSync('/data')) {
+  console.warn('⚠️⚠️⚠️  ATENCIÓN: no se detecta ningún volumen persistente de Railway.');
   console.warn('⚠️⚠️⚠️  La base de datos SQLite vive dentro del contenedor y SE BORRARÁ en el próximo deploy/reinicio.');
-  console.warn('⚠️⚠️⚠️  Solución: adjunta un Volumen a este servicio en el dashboard de Railway (Command Palette ⌘K → "Create Volume"), móntalo en /data, y haz redeploy.');
-  // BLINDAJE DE DATOS: antes esto solo se veía en logs de consola, que casi
-  // nadie mira en producción — el sistema "sabía" que iba a perder todos los
-  // datos y no lo comunicaba por ningún canal monitoreable. Ahora se
-  // registra también en bootIssues, así que /health devuelve status
-  // "degraded" con este warning explícito hasta que se adjunte el volumen.
-  bootIssues.push(noVolumeWarning);
+  console.warn('⚠️⚠️⚠️  Solución: 1) Adjunta un Volumen a ESTE servicio (no a otro) en Railway, móntalo en /data.');
+  console.warn('⚠️⚠️⚠️  2) Haz un redeploy manual DESPUÉS de adjuntarlo — la variable solo se inyecta en el siguiente deploy.');
+  console.warn('⚠️⚠️⚠️  3) Revisa en Settings → Volumes que el volumen aparece "Attached" a este servicio concreto.');
 }
 
-// BLINDAJE 2/3: abrir la base de datos. Si better-sqlite3 no puede abrir
-// el fichero (corrupto, permisos, lock...) caemos a una base de datos en
-// memoria SOLO para que el proceso siga vivo y /health responda; se marca
-// como degradado porque en ese modo no hay persistencia real.
-let db;
-try {
-  db = new Database(DB_PATH);
-  db.pragma('journal_mode = WAL');
-} catch (err) {
-  console.error(`❌ No se pudo abrir la base de datos en ${DB_PATH}: ${err.message}`);
-  bootIssues.push(`No se pudo abrir la base de datos: ${err.message}`);
-  db = new Database(':memory:');
-}
+const db = new Database(DB_PATH);
+db.pragma('journal_mode = WAL');
 
-// BLINDAJE 3/3: workspaces de los agentes. Un fallo aquí no debe impedir
-// que el resto del servidor (auth, chat, admin) arranque con normalidad.
 const WORKSPACES_ROOT = makeWorkspacesRoot(dbDir);
-try {
-  fs.mkdirSync(WORKSPACES_ROOT, { recursive: true });
-} catch (err) {
-  console.error(`❌ No se pudo crear WORKSPACES_ROOT (${WORKSPACES_ROOT}): ${err.message}`);
-  bootIssues.push(`No se pudo crear WORKSPACES_ROOT: ${err.message}`);
-}
+fs.mkdirSync(WORKSPACES_ROOT, { recursive: true });
 
-try {
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -227,42 +178,10 @@ db.exec(`
     FOREIGN KEY (user_id) REFERENCES users(id)
   );
 `);
-} catch (err) {
-  console.error('❌ No se pudo crear/verificar el esquema principal de la base de datos:', err.message);
-  bootIssues.push(`Esquema principal falló: ${err.message}`);
-}
 
-try {
-  const userColumns = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
-  if (!userColumns.includes('modelo_activo')) {
-    db.exec("ALTER TABLE users ADD COLUMN modelo_activo TEXT DEFAULT 'zoco-plus'");
-  }
-} catch (err) {
-  console.error('❌ No se pudo verificar/migrar la columna modelo_activo:', err.message);
-  bootIssues.push(`Migración modelo_activo falló: ${err.message}`);
-}
-
-// BLINDAJE DE DATOS — POLÍTICA DE BORRADO LÓGICO OBLIGATORIA: ningún borrado
-// manual (agentes/recursos, memoria de agente, API keys) debe eliminar la
-// fila físicamente nunca. Se añaden columnas is_deleted/deleted_at/deleted_reason
-// a las tablas afectadas; los endpoints DELETE pasan a hacer UPDATE, y las
-// consultas SELECT existentes se filtran para no mostrar lo archivado.
-try {
-  for (const table of ['resources', 'agent_memory', 'api_keys', 'prompt_cache']) {
-    const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
-    if (!cols.includes('is_deleted')) {
-      db.exec(`ALTER TABLE ${table} ADD COLUMN is_deleted INTEGER DEFAULT 0`);
-    }
-    if (!cols.includes('deleted_at')) {
-      db.exec(`ALTER TABLE ${table} ADD COLUMN deleted_at TEXT`);
-    }
-    if (!cols.includes('deleted_reason')) {
-      db.exec(`ALTER TABLE ${table} ADD COLUMN deleted_reason TEXT`);
-    }
-  }
-} catch (err) {
-  console.error('❌ No se pudo verificar/migrar las columnas de soft delete:', err.message);
-  bootIssues.push(`Migración soft-delete falló: ${err.message}`);
+const userColumns = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
+if (!userColumns.includes('modelo_activo')) {
+  db.exec("ALTER TABLE users ADD COLUMN modelo_activo TEXT DEFAULT 'zoco-plus'");
 }
 
 const RESOURCE_TYPES = ['agente', 'archivo', 'habilidad', 'lote', 'sesion', 'implementacion', 'entorno', 'credencial', 'memoria'];
@@ -416,7 +335,7 @@ function seedDefaultAgents() {
   const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email.toLowerCase());
   if (!user) return; // No debería pasar justo después de seedAdminAccount(), pero por seguridad.
 
-  const existentes = db.prepare("SELECT name FROM resources WHERE user_id = ? AND type = 'agente' AND is_deleted = 0").all(user.id);
+  const existentes = db.prepare("SELECT name FROM resources WHERE user_id = ? AND type = 'agente'").all(user.id);
   const nombresExistentes = new Set(existentes.map(r => r.name));
 
   const insert = db.prepare('INSERT INTO resources (id, user_id, type, name, data) VALUES (?, ?, ?, ?, ?)');
@@ -440,60 +359,13 @@ function seedDefaultAgents() {
   }
   if (creados > 0) {
     console.log(`✅ Sembrados ${creados} agente(s) por defecto para ${email} (de un total de ${DEFAULT_AGENTS.length} esperados).`);
-    // BLINDAJE DE DATOS: si esto se dispara en producción y NO es el primer
-    // arranque (es decir, ya existía al menos 1 agente, aunque fuera de
-    // otro tipo/nombre), es una señal de que la base de datos acaba de
-    // perder datos que antes existían (ver aviso de volumen persistente más
-    // arriba) y se está enmascarando el hueco con prompts placeholder
-    // genéricos, en vez de con un panel vacío. Se hace visible en /health
-    // para que no pase desapercibido como "los agentes ya estaban así".
-    if (process.env.NODE_ENV === 'production') {
-      const seedAlert = `Se sembraron ${creados} agente(s) por defecto para ${email} en este arranque — si ya tenías agentes personalizados con otros prompts, es probable que la base de datos se haya reiniciado (ver aviso de volumen persistente) y estos placeholders NO son tu configuración real.`;
-      bootIssues.push(seedAlert);
-    }
   } else {
     console.log(`ℹ️  Los ${DEFAULT_AGENTS.length} agentes por defecto ya existen para ${email}; no se crea ninguno nuevo.`);
   }
 }
 seedDefaultAgents();
 
-// ── CORS ────────────────────────────────────────────────────────────────
-// Lista blanca explícita de orígenes permitidos. Se puede ampliar sin tocar
-// código añadiendo CORS_EXTRA_ORIGINS="https://foo.com,https://bar.com" en
-// las variables de entorno de Railway (separados por comas).
-const DEFAULT_ALLOWED_ORIGINS = [
-  'https://zocoia.es',
-  'https://www.zocoia.es',
-  'https://marisai.es',
-  'https://www.marisai.es',
-  'http://localhost:5173',
-  'http://localhost:3000',
-];
-const EXTRA_ORIGINS = (process.env.CORS_EXTRA_ORIGINS || '')
-  .split(',')
-  .map(o => o.trim())
-  .filter(Boolean);
-const ALLOWED_ORIGINS = [...DEFAULT_ALLOWED_ORIGINS, ...EXTRA_ORIGINS];
-
-const corsOptions = {
-  origin(origin, callback) {
-    // Peticiones sin origin (curl, health checks, server-to-server) se permiten.
-    if (!origin) return callback(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-    console.warn(`⚠️  CORS bloqueado para origin no permitido: ${origin}`);
-    return callback(new Error(`Origin no permitido por CORS: ${origin}`));
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-  optionsSuccessStatus: 204,
-};
-
-app.use(cors(corsOptions));
-// Responde explícitamente a las peticiones preflight (OPTIONS) para
-// cualquier ruta, usando las mismas opciones que arriba.
-app.options('*', cors(corsOptions));
-
+app.use(cors());
 app.use(express.json());
 
 function signToken(user) {
@@ -590,6 +462,10 @@ function firstOfMonthISO() {
   return new Date(d.getFullYear(), d.getMonth(), 1).toISOString();
 }
 
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', message: 'Zoco IA conectado con éxito' });
+});
+
 async function callChatModel({ usandoOllama, ollamaUrl, ollamaModel, groqModel, messages, maxTokens, temperature, tools, ollamaOptions }) {
   async function doFetch(url, auth, model, extraOllamaOptions) {
     const controller = new AbortController();
@@ -680,7 +556,7 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   let systemPromptText = '';
 
   if (agentId) {
-    agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ? AND is_deleted = 0').get(agentId, authSub, 'agente');
+    agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(agentId, authSub, 'agente');
     if (!agente) { const e = new Error('Agente no encontrado'); e.status = 404; throw e; }
 
     agenteData = agente.data ? JSON.parse(agente.data) : {};
@@ -693,7 +569,7 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
       return runDeterministicAgent({ db, uuidv4, userId: authSub, agente, agenteData, userMessage });
     }
 
-    const historial = db.prepare('SELECT role, content FROM agent_memory WHERE agente_id = ? AND is_deleted = 0 ORDER BY created_at ASC LIMIT 50').all(agentId);
+    const historial = db.prepare('SELECT role, content FROM agent_memory WHERE agente_id = ? ORDER BY created_at ASC LIMIT 50').all(agentId);
 
     systemPromptText = agenteData.tipo === 'generic_prompted' && agenteData.templateId
       ? resolveTemplatePrompt({ db, templateId: agenteData.templateId, overrideVars: agenteData.templateVars })
@@ -880,17 +756,17 @@ app.put('/api/user/modelo', authMiddleware, (req, res) => {
 });
 
 app.get('/api/agentes/:id/memoria', authMiddleware, (req, res) => {
-  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ? AND is_deleted = 0').get(req.params.id, req.auth.sub, 'agente');
+  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(req.params.id, req.auth.sub, 'agente');
   if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
 
-  const mensajes = db.prepare('SELECT id, role, content, created_at FROM agent_memory WHERE agente_id = ? AND is_deleted = 0 ORDER BY created_at ASC').all(req.params.id);
-  const cacheActiva = db.prepare('SELECT COUNT(*) as count FROM prompt_cache WHERE agente_id = ? AND is_deleted = 0 AND expires_at > ?').get(req.params.id, Date.now()).count;
+  const mensajes = db.prepare('SELECT id, role, content, created_at FROM agent_memory WHERE agente_id = ? ORDER BY created_at ASC').all(req.params.id);
+  const cacheActiva = db.prepare('SELECT COUNT(*) as count FROM prompt_cache WHERE agente_id = ? AND expires_at > ?').get(req.params.id, Date.now()).count;
 
   res.json({ mensajes, cacheActiva: cacheActiva > 0 });
 });
 
 app.post('/api/agentes/:id/memoria', authMiddleware, (req, res) => {
-  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ? AND is_deleted = 0').get(req.params.id, req.auth.sub, 'agente');
+  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(req.params.id, req.auth.sub, 'agente');
   if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
 
   const { role, content } = req.body || {};
@@ -904,13 +780,11 @@ app.post('/api/agentes/:id/memoria', authMiddleware, (req, res) => {
 });
 
 app.delete('/api/agentes/:id/memoria', authMiddleware, (req, res) => {
-  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ? AND is_deleted = 0').get(req.params.id, req.auth.sub, 'agente');
+  const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(req.params.id, req.auth.sub, 'agente');
   if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
 
-  console.warn(`⚠️ [audit] soft-delete manual: memoria del agente ${req.params.id} por usuario ${req.auth.sub} (ruta DELETE /api/agentes/:id/memoria)`);
-  const now = new Date().toISOString();
-  db.prepare('UPDATE agent_memory SET is_deleted = 1, deleted_at = ?, deleted_reason = ? WHERE agente_id = ? AND is_deleted = 0').run(now, 'manual-delete', req.params.id);
-  db.prepare('UPDATE prompt_cache SET is_deleted = 1, deleted_at = ?, deleted_reason = ? WHERE agente_id = ? AND is_deleted = 0').run(now, 'manual-delete', req.params.id);
+  db.prepare('DELETE FROM agent_memory WHERE agente_id = ?').run(req.params.id);
+  db.prepare('DELETE FROM prompt_cache WHERE agente_id = ?').run(req.params.id);
   res.json({ ok: true });
 });
 
@@ -1022,7 +896,7 @@ async function sendPasswordResetEmail(toEmail, resetLink) {
 
 app.get('/api/keys', authMiddleware, (req, res) => {
   const rows = db.prepare(
-    'SELECT id, name, key_prefix, last_used_at, revoked, created_at FROM api_keys WHERE user_id = ? AND is_deleted = 0 ORDER BY created_at DESC'
+    'SELECT id, name, key_prefix, last_used_at, revoked, created_at FROM api_keys WHERE user_id = ? ORDER BY created_at DESC'
   ).all(req.auth.sub);
   res.json(rows.map(r => ({
     id: r.id,
@@ -1052,10 +926,9 @@ app.post('/api/keys', authMiddleware, (req, res) => {
 });
 
 app.delete('/api/keys/:id', authMiddleware, (req, res) => {
-  const key = db.prepare('SELECT * FROM api_keys WHERE id = ? AND user_id = ? AND is_deleted = 0').get(req.params.id, req.auth.sub);
+  const key = db.prepare('SELECT * FROM api_keys WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
   if (!key) return res.status(404).json({ error: 'Clave no encontrada' });
-  console.warn(`⚠️ [audit] soft-delete manual: api_key ${req.params.id} por usuario ${req.auth.sub} (ruta DELETE /api/keys/:id)`);
-  db.prepare('UPDATE api_keys SET revoked = 1, is_deleted = 1, deleted_at = ?, deleted_reason = ? WHERE id = ?').run(new Date().toISOString(), 'manual-delete', req.params.id);
+  db.prepare('DELETE FROM api_keys WHERE id = ?').run(req.params.id);
   res.json({ ok: true });
 });
 
@@ -1064,8 +937,8 @@ app.get('/api/resources', authMiddleware, (req, res) => {
   if (type && !RESOURCE_TYPES.includes(type)) return res.status(400).json({ error: 'Tipo de recurso no válido' });
 
   const rows = type
-    ? db.prepare('SELECT * FROM resources WHERE user_id = ? AND type = ? AND is_deleted = 0 ORDER BY created_at DESC').all(req.auth.sub, type)
-    : db.prepare('SELECT * FROM resources WHERE user_id = ? AND is_deleted = 0 ORDER BY created_at DESC').all(req.auth.sub);
+    ? db.prepare('SELECT * FROM resources WHERE user_id = ? AND type = ? ORDER BY created_at DESC').all(req.auth.sub, type)
+    : db.prepare('SELECT * FROM resources WHERE user_id = ? ORDER BY created_at DESC').all(req.auth.sub);
 
   res.json(rows.map(r => ({
     id: r.id,
@@ -1092,7 +965,7 @@ app.post('/api/resources', authMiddleware, (req, res) => {
 });
 
 app.put('/api/resources/:id', authMiddleware, (req, res) => {
-  const row = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND is_deleted = 0').get(req.params.id, req.auth.sub);
+  const row = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
   if (!row) return res.status(404).json({ error: 'Recurso no encontrado' });
 
   const { name, data } = req.body || {};
@@ -1105,14 +978,12 @@ app.put('/api/resources/:id', authMiddleware, (req, res) => {
 });
 
 app.delete('/api/resources/:id', authMiddleware, (req, res) => {
-  const row = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND is_deleted = 0').get(req.params.id, req.auth.sub);
+  const row = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
   if (!row) return res.status(404).json({ error: 'Recurso no encontrado' });
-  console.warn(`⚠️ [audit] soft-delete manual: resource ${row.id} (type=${row.type}) por usuario ${req.auth.sub} (ruta DELETE /api/resources/:id)`);
-  const now = new Date().toISOString();
-  db.prepare('UPDATE resources SET is_deleted = 1, deleted_at = ?, deleted_reason = ? WHERE id = ?').run(now, 'manual-delete', row.id);
+  db.prepare('DELETE FROM resources WHERE id = ?').run(row.id);
   if (row.type === 'agente') {
-    db.prepare('UPDATE agent_memory SET is_deleted = 1, deleted_at = ?, deleted_reason = ? WHERE agente_id = ? AND is_deleted = 0').run(now, 'manual-delete', row.id);
-    db.prepare('UPDATE prompt_cache SET is_deleted = 1, deleted_at = ?, deleted_reason = ? WHERE agente_id = ? AND is_deleted = 0').run(now, 'manual-delete', row.id);
+    db.prepare('DELETE FROM agent_memory WHERE agente_id = ?').run(row.id);
+    db.prepare('DELETE FROM prompt_cache WHERE agente_id = ?').run(row.id);
   }
   res.json({ ok: true });
 });
@@ -1127,14 +998,14 @@ app.get('/api/billing/summary', authMiddleware, (req, res) => {
   ).get(user.id, monthStart);
 
   const resourceCounts = db.prepare(
-    'SELECT type, COUNT(*) as count FROM resources WHERE user_id = ? AND is_deleted = 0 GROUP BY type'
+    'SELECT type, COUNT(*) as count FROM resources WHERE user_id = ? GROUP BY type'
   ).all(user.id);
 
   const countsByType = {};
   RESOURCE_TYPES.forEach(t => { countsByType[t] = 0; });
   resourceCounts.forEach(r => { countsByType[r.type] = r.count; });
 
-  const keysCount = db.prepare('SELECT COUNT(*) as count FROM api_keys WHERE user_id = ? AND revoked = 0 AND is_deleted = 0').get(user.id).count;
+  const keysCount = db.prepare('SELECT COUNT(*) as count FROM api_keys WHERE user_id = ? AND revoked = 0').get(user.id).count;
 
   res.json({
     creditos: user.creditos,
@@ -1374,19 +1245,7 @@ app.put('/admin/clientes/:id', authMiddleware, requireAdmin, (req, res) => {
 // Rutas admin del puente Marisai (import de prompts As-Is, gestión de
 // templates maestros, config de executors deterministas). Todas viven bajo
 // /admin/bridge/* y reutilizan authMiddleware + requireAdmin ya existentes.
-//
-// BLINDAJE: esta llamada es SÍNCRONA y se ejecuta durante la carga del
-// módulo (no dentro de una request). Internamente dispara
-// ensureBridgeTables(db), que ya está blindada con try/catch propio (ver
-// bridge-marisai.js), pero se envuelve también aquí como defensa en
-// profundidad: si algo inesperado lanzara de todos modos, el servidor debe
-// seguir arrancando y /health debe seguir respondiendo en vez de morir.
-try {
-  registerBridgeAdminRoutes({ app, db, authMiddleware, requireAdmin, uuidv4 });
-} catch (err) {
-  console.error('❌ No se pudieron registrar las rutas admin del puente Marisai:', err.message);
-  bootIssues.push(`Rutas /admin/bridge/* no disponibles: ${err.message}`);
-}
+registerBridgeAdminRoutes({ app, db, authMiddleware, requireAdmin, uuidv4 });
 
 // ── Endpoint compatible con el formato Anthropic Messages API ─────────────
 // Permite que Marisai (u otro cliente que use el SDK/formato de Anthropic)
@@ -1457,9 +1316,9 @@ app.post('/v1/messages', authMiddleware, async (req, res) => {
 async function resolveAgentIdBySlug(slug, userId) {
   // metadata.agent_slug puede venir como el id real del recurso o como un
   // alias legible; se busca primero por id exacto y si no, por nombre.
-  const porId = db.prepare("SELECT id FROM resources WHERE id = ? AND user_id = ? AND type = 'agente' AND is_deleted = 0").get(slug, userId);
+  const porId = db.prepare("SELECT id FROM resources WHERE id = ? AND user_id = ? AND type = 'agente'").get(slug, userId);
   if (porId) return porId.id;
-  const porNombre = db.prepare("SELECT id FROM resources WHERE user_id = ? AND type = 'agente' AND name = ? AND is_deleted = 0").get(userId, slug);
+  const porNombre = db.prepare("SELECT id FROM resources WHERE user_id = ? AND type = 'agente' AND name = ?").get(userId, slug);
   return porNombre?.id;
 }
 
