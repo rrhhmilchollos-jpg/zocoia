@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useAuth, API_BASE } from '../context/AuthContext';
+import SoportePanel from '../components/SoportePanel';
+import WebhooksPanel from '../components/WebhooksPanel';
 
 interface Recurso { id: string; type: string; name: string; data: Record<string, any>; createdAt: string; }
 interface ApiKey { id: string; name: string; display: string; revoked: boolean; createdAt: string; }
@@ -810,6 +812,14 @@ export default function Dashboard() {
             <button onClick={() => setActiveTab('billing')} className={`w-full mt-1 flex items-center ${sidebarOpen ? 'space-x-3 px-3' : 'justify-center'} py-2 rounded-xl transition-all ${activeTab === 'billing' ? 'bg-purple-600/10 text-purple-400 border border-purple-500/20' : 'hover:bg-[#161616] text-gray-500'}`}>
               <span className="text-lg">💳</span>
               {sidebarOpen && <span className="text-sm font-medium">Facturación</span>}
+            </button>
+            <button onClick={() => setActiveTab('soporte')} className={`w-full mt-1 flex items-center ${sidebarOpen ? 'space-x-3 px-3' : 'justify-center'} py-2 rounded-xl transition-all ${activeTab === 'soporte' ? 'bg-blue-600/10 text-blue-400 border border-blue-500/20' : 'hover:bg-[#161616] text-gray-500'}`}>
+              <span className="text-lg">💬</span>
+              {sidebarOpen && <span className="text-sm font-medium">Soporte</span>}
+            </button>
+            <button onClick={() => setActiveTab('webhooks')} className={`w-full mt-1 flex items-center ${sidebarOpen ? 'space-x-3 px-3' : 'justify-center'} py-2 rounded-xl transition-all ${activeTab === 'webhooks' ? 'bg-green-600/10 text-green-400 border border-green-500/20' : 'hover:bg-[#161616] text-gray-500'}`}>
+              <span className="text-lg">🔗</span>
+              {sidebarOpen && <span className="text-sm font-medium">Webhooks</span>}
             </button>
             {user?.isAdmin && (
               <button onClick={() => setActiveTab('admin')} className={`w-full mt-1 flex items-center ${sidebarOpen ? 'space-x-3 px-3' : 'justify-center'} py-2 rounded-xl transition-all ${activeTab === 'admin' ? 'bg-red-600/10 text-red-400 border border-red-500/20' : 'hover:bg-[#161616] text-gray-500'}`}>
@@ -1874,6 +1884,16 @@ export default function Dashboard() {
                 </div>
               )}
             </div>
+          )}
+
+          {/* ══ SOPORTE (TICKETS) ══════════════════════════════════════════════════════════ */}
+          {activeTab === 'soporte' && (
+            <SoportePanel authHeaders={authHeaders} API_BASE={API_BASE} isStaff={!!(user?.isAdmin || user?.isSupport)} />
+          )}
+
+          {/* ══ WEBHOOKS ════════════════════════════════════════════════════════════════════════ */}
+          {activeTab === 'webhooks' && (
+            <WebhooksPanel authHeaders={authHeaders} API_BASE={API_BASE} />
           )}
 
         </div>

@@ -19,6 +19,62 @@
 
 export function ensureConsoleTables(db) {
   db.exec(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      agent_id TEXT,
+      model TEXT NOT NULL DEFAULT 'zoco-plus',
+      title TEXT NOT NULL DEFAULT 'Nueva conversación',
+      preview TEXT DEFAULT '',
+      message_count INTEGER NOT NULL DEFAULT 0,
+      attached_file_ids TEXT NOT NULL DEFAULT '[]',
+      active_skill_ids TEXT NOT NULL DEFAULT '[]',
+      created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+      updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
+    );
+    CREATE TABLE IF NOT EXISTS session_messages (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      attachments TEXT NOT NULL DEFAULT '[]',
+      skills TEXT NOT NULL DEFAULT '[]',
+      created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+      FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_session_messages_session ON session_messages (session_id, created_at);
+    CREATE TABLE IF NOT EXISTS support_tickets (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open',
+      priority TEXT NOT NULL DEFAULT 'normal',
+      created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+      updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
+    );
+    CREATE TABLE IF NOT EXISTS support_messages (
+      id TEXT PRIMARY KEY,
+      ticket_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      is_staff INTEGER NOT NULL DEFAULT 0,
+      content TEXT NOT NULL,
+      created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+      FOREIGN KEY (ticket_id) REFERENCES support_tickets(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS webhooks (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      url TEXT NOT NULL,
+      events TEXT NOT NULL DEFAULT '[]',
+      secret TEXT,
+      active INTEGER NOT NULL DEFAULT 1,
+      last_triggered_at INTEGER,
+      last_status INTEGER,
+      created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+      updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
+    );
     CREATE TABLE IF NOT EXISTS batches (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -366,6 +422,175 @@ export function registerConsoleRoutes({ app, db, authMiddleware, uuidv4, process
     db.prepare(`INSERT INTO deployments_log (id, user_id, provider, target_id, action, status, detail) VALUES (?, ?, ?, ?, ?, ?, ?)`)
       .run(logId, req.auth.sub, provider, String(targetId), action, status, detail);
     res.status(status === 'ok' ? 200 : 502).json({ id: logId, status, detail: safeJson(detail) || detail });
+  });
+
+
+  // ══ SESIONES ═══════════════════════════════════════════════════════════════
+  app.get('/api/sesiones', authMiddleware, (req, res) => {
+    const rows = db.prepare(`
+      SELECT id, agent_id as agentId, model, title, preview, message_count as messageCount,
+             attached_file_ids as attachedFileIds, active_skill_ids as activeSkillIds,
+             created_at as createdAt, updated_at as updatedAt
+      FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT 100
+    `).all(req.auth.sub);
+    res.json(rows.map(r => ({
+      ...r,
+      attachedFileIds: safeJson(r.attachedFileIds) || [],
+      activeSkillIds: safeJson(r.activeSkillIds) || [],
+    })));
+  });
+
+  app.post('/api/sesiones', authMiddleware, (req, res) => {
+    const { agentId, model, attachedFileIds, activeSkillIds } = req.body || {};
+    const id = uuidv4(); const now = Date.now();
+    db.prepare(`INSERT INTO sessions (id, user_id, agent_id, model, title, preview, attached_file_ids, active_skill_ids, created_at, updated_at) VALUES (?, ?, ?, ?, 'Nueva conversación', '', ?, ?, ?, ?)`)
+      .run(id, req.auth.sub, agentId || null, model || 'zoco-plus', JSON.stringify(attachedFileIds || []), JSON.stringify(activeSkillIds || []), now, now);
+    const s = db.prepare('SELECT * FROM sessions WHERE id = ?').get(id);
+    res.json({ ...s, agentId: s.agent_id, messageCount: s.message_count, attachedFileIds: safeJson(s.attached_file_ids) || [], activeSkillIds: safeJson(s.active_skill_ids) || [] });
+  });
+
+  app.get('/api/sesiones/:id', authMiddleware, (req, res) => {
+    const s = db.prepare('SELECT * FROM sessions WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
+    if (!s) return res.status(404).json({ error: 'Sesión no encontrada' });
+    const msgs = db.prepare('SELECT role, content FROM session_messages WHERE session_id = ? ORDER BY created_at ASC').all(s.id);
+    res.json({ ...s, agentId: s.agent_id, messageCount: s.message_count, attachedFileIds: safeJson(s.attached_file_ids) || [], activeSkillIds: safeJson(s.active_skill_ids) || [], messages: msgs });
+  });
+
+  app.put('/api/sesiones/:id', authMiddleware, (req, res) => {
+    const { title } = req.body || {};
+    const s = db.prepare('SELECT id FROM sessions WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
+    if (!s) return res.status(404).json({ error: 'Sesión no encontrada' });
+    db.prepare('UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?').run(String(title || '').slice(0, 200), Date.now(), s.id);
+    res.json({ ok: true });
+  });
+
+  app.delete('/api/sesiones/:id', authMiddleware, (req, res) => {
+    const s = db.prepare('SELECT id FROM sessions WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
+    if (!s) return res.status(404).json({ error: 'Sesión no encontrada' });
+    db.prepare('DELETE FROM session_messages WHERE session_id = ?').run(s.id);
+    db.prepare('DELETE FROM sessions WHERE id = ?').run(s.id);
+    res.json({ ok: true });
+  });
+
+  app.post('/api/sesiones/:id/mensajes', authMiddleware, async (req, res) => {
+    const s = db.prepare('SELECT * FROM sessions WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
+    if (!s) return res.status(404).json({ error: 'Sesión no encontrada' });
+    const { message, attachments, skills } = req.body || {};
+    if (!message || !String(message).trim()) return res.status(400).json({ error: 'Falta el mensaje' });
+    db.prepare('INSERT INTO session_messages (id, session_id, user_id, role, content, attachments, skills, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(uuidv4(), s.id, req.auth.sub, 'user', String(message), JSON.stringify(attachments || []), JSON.stringify(skills || []), Date.now());
+    try {
+      const history = db.prepare('SELECT role, content FROM session_messages WHERE session_id = ? ORDER BY created_at ASC LIMIT 40').all(s.id);
+      const result = await processChatCompletion(req.auth.sub, { agentId: s.agent_id || undefined, model: s.model || 'zoco-plus', messages: history });
+      const response = result?.choices?.[0]?.message?.content || '';
+      db.prepare('INSERT INTO session_messages (id, session_id, user_id, role, content, attachments, skills, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(uuidv4(), s.id, req.auth.sub, 'assistant', response, '[]', '[]', Date.now());
+      const preview = String(message).slice(0, 120);
+      const title = s.title === 'Nueva conversación' ? String(message).slice(0, 60) : s.title;
+      db.prepare('UPDATE sessions SET title = ?, preview = ?, message_count = message_count + 2, updated_at = ? WHERE id = ?').run(title, preview, Date.now(), s.id);
+      res.json({ response, sessionId: s.id });
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message || 'Error al procesar el mensaje' });
+    }
+  });
+
+  // ══ SOPORTE (TICKETS) ══════════════════════════════════════════════════════
+  app.get('/api/soporte/tickets', authMiddleware, (req, res) => {
+    const isAdmin = req.auth.isAdmin || req.auth.isSupport;
+    const rows = isAdmin
+      ? db.prepare(`SELECT t.*, u.email, u.nombre, (SELECT COUNT(*) FROM support_messages WHERE ticket_id = t.id) as msg_count FROM support_tickets t JOIN users u ON u.id = t.user_id ORDER BY t.updated_at DESC LIMIT 200`).all()
+      : db.prepare(`SELECT t.*, (SELECT COUNT(*) FROM support_messages WHERE ticket_id = t.id) as msg_count FROM support_tickets t WHERE t.user_id = ? ORDER BY t.updated_at DESC`).all(req.auth.sub);
+    res.json(rows);
+  });
+
+  app.post('/api/soporte/tickets', authMiddleware, (req, res) => {
+    const { subject, message, priority } = req.body || {};
+    if (!subject || !message) return res.status(400).json({ error: 'Faltan subject y message' });
+    const id = uuidv4(); const msgId = uuidv4(); const now = Date.now();
+    db.prepare('INSERT INTO support_tickets (id, user_id, subject, status, priority, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(id, req.auth.sub, String(subject).slice(0, 200), 'open', priority || 'normal', now, now);
+    db.prepare('INSERT INTO support_messages (id, ticket_id, user_id, is_staff, content, created_at) VALUES (?, ?, ?, 0, ?, ?)')
+      .run(msgId, id, req.auth.sub, String(message).slice(0, 5000), now);
+    res.json({ id, subject, status: 'open', priority: priority || 'normal', createdAt: now });
+  });
+
+  app.get('/api/soporte/tickets/:id', authMiddleware, (req, res) => {
+    const isAdmin = req.auth.isAdmin || req.auth.isSupport;
+    const t = isAdmin ? db.prepare('SELECT * FROM support_tickets WHERE id = ?').get(req.params.id)
+      : db.prepare('SELECT * FROM support_tickets WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
+    if (!t) return res.status(404).json({ error: 'Ticket no encontrado' });
+    const msgs = db.prepare('SELECT sm.*, u.nombre, u.email FROM support_messages sm JOIN users u ON u.id = sm.user_id WHERE sm.ticket_id = ? ORDER BY sm.created_at ASC').all(t.id);
+    res.json({ ...t, messages: msgs });
+  });
+
+  app.post('/api/soporte/tickets/:id/mensajes', authMiddleware, (req, res) => {
+    const isAdmin = req.auth.isAdmin || req.auth.isSupport;
+    const t = isAdmin ? db.prepare('SELECT * FROM support_tickets WHERE id = ?').get(req.params.id)
+      : db.prepare('SELECT * FROM support_tickets WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
+    if (!t) return res.status(404).json({ error: 'Ticket no encontrado' });
+    const { content } = req.body || {};
+    if (!content) return res.status(400).json({ error: 'Falta el contenido' });
+    const id = uuidv4(); const now = Date.now();
+    db.prepare('INSERT INTO support_messages (id, ticket_id, user_id, is_staff, content, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(id, t.id, req.auth.sub, isAdmin ? 1 : 0, String(content).slice(0, 5000), now);
+    db.prepare('UPDATE support_tickets SET updated_at = ?, status = ? WHERE id = ?').run(now, isAdmin ? 'answered' : 'open', t.id);
+    res.json({ ok: true, id });
+  });
+
+  app.put('/api/soporte/tickets/:id', authMiddleware, (req, res) => {
+    const isAdmin = req.auth.isAdmin || req.auth.isSupport;
+    if (!isAdmin) return res.status(403).json({ error: 'Solo el equipo de soporte puede actualizar tickets' });
+    const { status, priority } = req.body || {};
+    db.prepare('UPDATE support_tickets SET status = COALESCE(?, status), priority = COALESCE(?, priority), updated_at = ? WHERE id = ?')
+      .run(status || null, priority || null, Date.now(), req.params.id);
+    res.json({ ok: true });
+  });
+
+  // ══ WEBHOOKS ═══════════════════════════════════════════════════════════════
+  app.get('/api/webhooks', authMiddleware, (req, res) => {
+    const rows = db.prepare('SELECT id, name, url, events, active, last_triggered_at as lastTriggeredAt, last_status as lastStatus, created_at as createdAt FROM webhooks WHERE user_id = ? ORDER BY created_at DESC').all(req.auth.sub);
+    res.json(rows.map(r => ({ ...r, events: safeJson(r.events) || [] })));
+  });
+
+  app.post('/api/webhooks', authMiddleware, (req, res) => {
+    const { name, url, events, secret } = req.body || {};
+    if (!name || !url) return res.status(400).json({ error: 'Faltan name y url' });
+    try { new URL(url); } catch { return res.status(400).json({ error: 'URL inválida' }); }
+    const id = uuidv4(); const now = Date.now();
+    db.prepare('INSERT INTO webhooks (id, user_id, name, url, events, secret, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)')
+      .run(id, req.auth.sub, String(name).slice(0, 100), String(url).slice(0, 500), JSON.stringify(events || []), secret ? String(secret).slice(0, 200) : null, now, now);
+    res.json({ id, name, url, events: events || [], active: true, createdAt: now });
+  });
+
+  app.put('/api/webhooks/:id', authMiddleware, (req, res) => {
+    const w = db.prepare('SELECT id FROM webhooks WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
+    if (!w) return res.status(404).json({ error: 'Webhook no encontrado' });
+    const { name, url, events, active, secret } = req.body || {};
+    if (url) { try { new URL(url); } catch { return res.status(400).json({ error: 'URL inválida' }); } }
+    db.prepare('UPDATE webhooks SET name = COALESCE(?, name), url = COALESCE(?, url), events = COALESCE(?, events), active = COALESCE(?, active), secret = COALESCE(?, secret), updated_at = ? WHERE id = ?')
+      .run(name || null, url || null, events ? JSON.stringify(events) : null, active !== undefined ? (active ? 1 : 0) : null, secret || null, Date.now(), w.id);
+    res.json({ ok: true });
+  });
+
+  app.delete('/api/webhooks/:id', authMiddleware, (req, res) => {
+    const w = db.prepare('SELECT id FROM webhooks WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
+    if (!w) return res.status(404).json({ error: 'Webhook no encontrado' });
+    db.prepare('DELETE FROM webhooks WHERE id = ?').run(w.id);
+    res.json({ ok: true });
+  });
+
+  app.post('/api/webhooks/:id/test', authMiddleware, async (req, res) => {
+    const w = db.prepare('SELECT * FROM webhooks WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
+    if (!w) return res.status(404).json({ error: 'Webhook no encontrado' });
+    const payload = { event: 'webhook.test', timestamp: Date.now(), webhook_id: w.id, message: 'Prueba de Zoco IA' };
+    try {
+      const r = await fetch(w.url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Zoco-Event': 'webhook.test' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(10000) });
+      db.prepare('UPDATE webhooks SET last_triggered_at = ?, last_status = ? WHERE id = ?').run(Date.now(), r.status, w.id);
+      res.json({ ok: r.ok, status: r.status, message: r.ok ? 'Webhook enviado correctamente' : `El servidor respondió con ${r.status}` });
+    } catch (err) {
+      db.prepare('UPDATE webhooks SET last_triggered_at = ?, last_status = 0 WHERE id = ?').run(Date.now(), w.id);
+      res.status(502).json({ error: `No se pudo conectar: ${err.message}` });
+    }
   });
 
   // ══ ALMACENES DE MEMORIA ═══════════════════════════════════════════════
