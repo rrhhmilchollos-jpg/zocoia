@@ -32,8 +32,15 @@ ENV PORT=8080
 
 # BLINDAJE DE DATOS: la persistencia real NO se declara aquí. Railway
 # RECHAZA la directiva `VOLUME` de Docker (rompía el build anterior), y
-# tampoco hace falta `mkdir -p /data` a mano: en cuanto adjuntas un Railway
-# Volume al servicio (dashboard → Command Palette ⌘K → "Create Volume",
-# montado en /data), Railway crea y gestiona ese directorio en tiempo de
-# arranque del contenedor — no en tiempo de build. RAILWAY_VOLUME_MOUNT_PATH
-# se inyecta automáticamente y server.js ya lo usa sin tocar nad
+# tampoco hace falta `mkdir -p /data` a mano en Railway. Sin embargo, en
+# Coolify SÍ es obligatorio inicializar el directorio y otorgarle permisos.
+# RAILWAY_VOLUME_MOUNT_PATH se inyecta automáticamente y server.js ya lo usa sin tocar nada.
+
+# Configuración obligatoria para el entorno de Coolify:
+RUN mkdir -p /data && chmod -R 777 /data
+
+# Exponer el puerto de escucha configurado de la API
+EXPOSE 8080
+
+# COMANDO DE ARRANQUE DEFINITIVO: ejecuta el parcheador y levanta el servidor
+CMD ["sh", "-c", "node parchear.js && node server.js"]
