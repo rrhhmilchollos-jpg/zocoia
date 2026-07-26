@@ -5,23 +5,23 @@
   "rewrites": [
     {
       "source": "/v1/:path*",
-      "destination": "https://zocoia-production.up.railway.app/v1/:path*"
+      "destination": "https://api.zocoia.es/v1/:path*"
     },
     {
       "source": "/admin/:path*",
-      "destination": "https://zocoia-production.up.railway.app/admin/:path*"
+      "destination": "https://api.zocoia.es/admin/:path*"
     },
     {
       "source": "/auth/:path*",
-      "destination": "https://zocoia-production.up.railway.app/auth/:path*"
+      "destination": "https://api.zocoia.es/auth/:path*"
     },
     {
       "source": "/api/:path*",
-      "destination": "https://zocoia-production.up.railway.app/api/:path*"
+      "destination": "https://api.zocoia.es/api/:path*"
     },
     {
       "source": "/health",
-      "destination": "https://zocoia-production.up.railway.app/health"
+      "destination": "https://api.zocoia.es/health"
     },
     {
       "source": "/((?!v1|admin|auth|api|health|assets).*)",
