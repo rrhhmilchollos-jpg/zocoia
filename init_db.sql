@@ -1,0 +1,6 @@
+-- Este archivo queda obsoleto: el esquema real de usuarios ahora vive en
+-- SQLite y se crea automáticamente al arrancar server.js (ver tabla `users`).
+--
+-- La cuenta de administración/soporte se siembra leyendo las variables de
+-- entorno ADMIN_EMAIL y ADMIN_PASSWORD en Railway — nunca se guarda ninguna
+-- contraseña en texto plano en este repositorio.
