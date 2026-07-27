@@ -1,296 +1,357 @@
 // bridge-marisai.js
+// -----------------------------------------------------------------------------
+// Puente entre el gateway de chat (server.js) y un sandbox Docker REAL,
+// usando Dockerode. Sustituye la version "CLI-only" de agent.js por un
+// bucle agentico que se puede invocar desde una peticion HTTP/WS normal.
 //
-// Archivo NUEVO y autocontenible: no modifica tools.js ni ningún otro módulo
-// existente. server.js lo importa y le pasa `db`/`uuidv4` explícitamente
-// (este archivo no abre su propia conexión a la base de datos).
+// Diseño:
+//  - Un contenedor Docker POR SESION DE USUARIO (no por comando), para que
+//    los comandos compartan estado (ficheros, paquetes instalados) durante
+//    la tarea, igual que Manus/Claude Code.
+//  - El contenedor se destruye al terminar la tarea o al expirar un TTL de
+//    inactividad (evita contenedores zombie acumulandose en el host).
+//  - Limites duros de memoria/CPU/pids, usuario no root, filesystem con
+//    tamano limitado (tmpfs), y timeout por comando.
+//  - Red: OFF por defecto. Si una tarea necesita instalar paquetes, se activa
+//    una red dedicada con egress restringido (ver SANDBOX_NETWORK abajo) en
+//    lugar de dar acceso abierto a internet. Esto es lo mas importante que
+//    NO debes saltarte: bash arbitrario + red abierta == tu servidor puede
+//    acabar siendo usado como proxy de salida por cualquier cosa que el
+//    modelo (o un usuario malicioso via prompt injection) le pida ejecutar.
 //
-// Cubre las 3 piezas que faltaban del puente Zoco IA -> Marisai:
-//   1) Prompts maestros para los 2 agentes "genéricos" (Frontend, Database)
-//   2) Executors deterministas para los 3 agentes sin LLM (DevOps, Testing, Reparación)
-//   3) Rutas admin para: importar prompts As-Is de Marisai, gestionar
-//      templates, y configurar credenciales de los executors.
+// Uso esperado desde server.js / zoco-sessions.js:
+//
+//   import { runAgenticTask } from './bridge-marisai.js';
+//   await runAgenticTask({
+//     userId, sessionId, task: userMessage,
+//     model: 'zoco-max',
+//     gatewayUrl: 'http://localhost:4000/v1',
+//     gatewayApiKey: process.env.GATEWAY_API_KEY,
+//     emit: (sessionId, payload) => wsHub.broadcast(sessionId, payload),
+//   });
+// -----------------------------------------------------------------------------
 
-import { execFile } from 'child_process';
-import { promisify } from 'util';
-const execFileAsync = promisify(execFile);
+import Docker from 'dockerode';
+import fetch from 'node-fetch';
+import { randomUUID } from 'crypto';
 
-// ── 1) Tabla de templates maestros ──────────────────────────────────────
-// Se crea de forma aditiva (IF NOT EXISTS) — no toca ninguna tabla de server.js.
-export function ensureBridgeTables(db) {
-  // BLINDAJE: esta función se llama de forma SÍNCRONA al arrancar server.js
-  // (línea `registerBridgeAdminRoutes(...)`), fuera de cualquier request.
-  // Si `db.exec`/`run` lanzara (volumen persistente no listo aún, filesystem
-  // read-only en ese instante, lock de WAL, etc.), antes esa excepción no
-  // se atrapaba en ningún sitio: mataba la carga del módulo server.js
-  // completo y el proceso nunca llegaba a app.listen() -> /health nunca
-  // respondía -> "Healthcheck failed" en la plataforma de hosting. Con este try/catch,
-  // como mucho las tablas/plantillas del puente Marisai no estarán listas
-  // (se reintentará en la siguiente llamada, p.ej. en cada request de
-  // runDeterministicAgent), pero el servidor sigue vivo y /health responde.
-  try {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS prompt_templates (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        base_prompt TEXT NOT NULL,
-        variables_json TEXT DEFAULT '{}',
-        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-      );
+const docker = new Docker(); // usa /var/run/docker.sock por defecto
 
-      CREATE TABLE IF NOT EXISTS deterministic_executors (
-        agent_id TEXT PRIMARY KEY,
-        executor_type TEXT NOT NULL,
-        config_json TEXT NOT NULL DEFAULT '{}',
-        action_fee_eur REAL DEFAULT 0
-      );
-    `);
-  } catch (err) {
-    console.error('⚠️  [bridge-marisai] No se pudieron crear/verificar las tablas del puente:', err.message);
-    return; // no seguimos con el seed si ni siquiera existen las tablas
+// ─── Configuracion ───────────────────────────────────────────────────────────
+
+const MAX_ITERATIONS = parseInt(process.env.AGENT_MAX_ITERATIONS || '8', 10);
+const COMMAND_TIMEOUT_MS = parseInt(process.env.AGENT_COMMAND_TIMEOUT_MS || '60000', 10);
+const SESSION_IDLE_TTL_MS = parseInt(process.env.AGENT_SESSION_TTL_MS || '600000', 10); // 10 min
+const SANDBOX_IMAGE = process.env.AGENT_SANDBOX_IMAGE || 'python:3.12-slim';
+
+// Si true, el contenedor de la sesion se crea con red (para pip/npm install).
+// Recomendado: red dedicada 'zoco-sandbox-net' con reglas de firewall/egress
+// en el host que solo permitan salida a los registries (pypi.org, npmjs.org,
+// etc.), nunca 'bridge' abierta a todo internet.
+const ALLOW_NETWORK_FOR_INSTALLS = process.env.AGENT_ALLOW_NETWORK === 'true';
+const SANDBOX_NETWORK = process.env.AGENT_SANDBOX_NETWORK || 'zoco-sandbox-net';
+
+// Registro en memoria de sesiones activas: sessionId -> { container, timer }
+const activeSessions = new Map();
+
+// ─── Prompt de sistema: protocolo unico <execute_command> ───────────────────
+
+export const SYSTEM_PROMPT_EXECUTE = `Eres Zoco-Max, un agente autonomo con acceso a un sandbox Linux real,
+aislado y efimero. Tienes memoria de todo lo ejecutado en esta sesion.
+
+Cuando necesites manipular archivos, instalar paquetes, ejecutar scripts o
+inspeccionar el entorno, responde EXCLUSIVAMENTE con un unico bloque:
+
+<execute_command>
+comando_bash_aqui
+</execute_command>
+
+Reglas estrictas:
+- Un unico bloque <execute_command> por respuesta. Nunca mezclado con texto
+  explicativo antes o despues si vas a ejecutar algo.
+- Los comandos deben ser no interactivos (usa flags como -y, --yes,
+  DEBIAN_FRONTEND=noninteractive, etc. para evitar que el proceso se quede
+  esperando input).
+- Tras cada ejecucion recibiras un mensaje "[RESULTADO DE TERMINAL REAL]"
+  con el stdout/stderr real. No lo inventes nunca: si no has recibido ese
+  mensaje, el comando NO se ha ejecutado todavia.
+- Cuando la tarea este completa, responde con texto normal SIN el tag
+  <execute_command>. Eso senaliza el fin de la tarea.
+- Si un comando falla, analiza el error real recibido y corrige tu siguiente
+  intento; no repitas el mismo comando que ya fallo sin cambiarlo.`;
+
+// ─── Gestion del contenedor sandbox (uno por sesion) ────────────────────────
+
+async function getOrCreateSandbox(sessionId) {
+  const existing = activeSessions.get(sessionId);
+  if (existing) {
+    resetIdleTimer(sessionId);
+    return existing.container;
   }
 
-  try {
-    const seedTemplates = db.prepare(`
-      INSERT INTO prompt_templates (id, name, base_prompt, variables_json)
-      VALUES (@id, @name, @base_prompt, @variables_json)
-      ON CONFLICT(id) DO NOTHING
-    `);
+  const containerName = `zoco-sandbox-${sessionId}-${randomUUID().slice(0, 8)}`;
 
-    seedTemplates.run({
-    id: 'tpl_frontend_master',
-    name: 'Frontend Master Prompt',
-    base_prompt: `Eres el agente Frontend dentro de un pipeline de desarrollo autónomo multi-agente (Zoco IA / Marisai). Recibes especificaciones ya validadas por el Arquitecto y el Diseñador, y tu única responsabilidad es traducirlas en código de interfaz funcional, coherente con el stack indicado en {framework} y el sistema de diseño {design_system}.
-
-REGLAS DE OPERACIÓN:
-1. No tomas decisiones de arquitectura ni de modelo de datos: si detectas que falta información de backend/API, decláralo explícitamente en el campo "notes" del JSON de salida en vez de inventar contratos.
-2. Todo componente que generes debe ser autocontenible: props tipadas, sin estado global implícito salvo que el input lo especifique.
-3. Sigue las convenciones de nombrado y estructura de carpetas que se te pasen bajo la clave "project_conventions"; si no se pasan, usa PascalCase para componentes y kebab-case para archivos.
-4. Tu respuesta completa es el JSON de salida, sin texto ni markdown fuera de él.
-5. Ante ambigüedad de requisitos, elige la interpretación más simple y compatible con lo ya construido, y documenta la decisión en "notes".
-
-FORMATO DE SALIDA (obligatorio, JSON estricto):
-{"status":"ok"|"error","files":[{"path":"string","content":"string"}],"notes":"string"}`,
-    variables_json: JSON.stringify({ framework: 'React', design_system: 'tailwind' }),
-  });
-
-  seedTemplates.run({
-    id: 'tpl_database_master',
-    name: 'Database Master Prompt',
-    base_prompt: `Eres el agente Database dentro de un pipeline de desarrollo autónomo multi-agente (Zoco IA / Marisai). Tu responsabilidad es diseñar y/o modificar el esquema de datos usando el motor {db_engine}, a partir de las entidades y relaciones que te entrega el Arquitecto.
-
-REGLAS DE OPERACIÓN:
-1. Toda migración es ADITIVA por defecto: nunca generes DROP TABLE / DROP COLUMN salvo que el input lo pida explícitamente con "allow_destructive": true.
-2. Usa claves primarias explícitas, y define índices para toda columna usada en JOIN o WHERE frecuente según el contexto dado.
-3. Normaliza hasta 3FN salvo necesidad justificada de desnormalización (ej. tablas de logs/analíticas de alto volumen).
-4. Toda tabla incluye "created_at" y, si aplica edición, "updated_at".
-5. Si el motor es SQLite, evita features no soportadas (sin ENUM nativo, sin ALTER COLUMN); si es Postgres, puedes usar JSONB/ENUM/arrays cuando el input lo permita.
-6. Nunca generes credenciales, tokens ni datos de ejemplo con apariencia de PII real.
-
-FORMATO DE SALIDA (obligatorio, JSON estricto):
-{"status":"ok"|"error","migration_sql":"string","schema_summary":"string","notes":"string"}`,
-      variables_json: JSON.stringify({ db_engine: 'sqlite' }),
-    });
-  } catch (err) {
-    console.error('⚠️  [bridge-marisai] No se pudieron sembrar los templates maestros:', err.message);
-    // No relanzamos: las tablas ya existen (o no se llegó a esta parte),
-    // el servidor sigue arrancando con normalidad.
-  }
-}
-
-// Resuelve el system prompt final de un agente "generic_prompted"
-// interpolando las variables del template con overrides puntuales del agente.
-export function resolveTemplatePrompt({ db, templateId, overrideVars }) {
-  const tpl = db.prepare('SELECT * FROM prompt_templates WHERE id = ?').get(templateId);
-  if (!tpl) return null;
-  const vars = { ...JSON.parse(tpl.variables_json || '{}'), ...(overrideVars || {}) };
-  let prompt = tpl.base_prompt;
-  for (const [key, value] of Object.entries(vars)) {
-    prompt = prompt.replaceAll(`{${key}}`, String(value));
-  }
-  return prompt;
-}
-
-// ── 2) Executors deterministas (DevOps, Testing, Reparación) ───────────
-// No llaman a ningún LLM. Devuelven el mismo shape { choices, usage, model }
-// que processChatCompletion(), para que /v1/messages y /api/chat no tengan
-// que distinguir "esto lo respondió un modelo" de "esto lo ejecutó código".
-export async function runDeterministicAgent({ db, uuidv4, userId, agente, agenteData, userMessage }) {
-  ensureBridgeTables(db); // ya blindada internamente (ver arriba), no lanza
-
-  let execConfig = null;
-  let config = {};
-  try {
-    execConfig = db.prepare('SELECT * FROM deterministic_executors WHERE agent_id = ?').get(agente.id);
-    config = execConfig ? JSON.parse(execConfig.config_json) : {};
-  } catch (err) {
-    console.error('⚠️  [bridge-marisai] No se pudo leer la config del executor:', err.message);
-  }
-  const actionFee = execConfig?.action_fee_eur || 0;
-  const contenido = String(userMessage?.content || '');
-
-  let resultado;
-  try {
-    switch (agenteData.executorType) {
-      case 'vercel_api':
-        resultado = await runVercelAction(contenido, config);
-        break;
-      case 'static_code_analysis':
-        resultado = await runStaticAnalysis(contenido, config);
-        break;
-      case 'sandbox_repair':
-        resultado = await runSandboxRepair(contenido, config);
-        break;
-      default:
-        resultado = { status: 'error', notes: `executorType no configurado para ${agente.name}` };
-    }
-  } catch (err) {
-    resultado = { status: 'error', notes: `fallo del executor: ${err.message}` };
-  }
-
-  // Se guarda en agent_memory igual que una respuesta normal, para que el
-  // historial del agente en el Dashboard sea consistente. Envuelto en
-  // try/catch: si la escritura en SQLite falla, el usuario debe seguir
-  // recibiendo la respuesta del executor (ya ejecutado) en vez de un 500.
-  const textoRespuesta = JSON.stringify(resultado);
-  try {
-    db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)')
-      .run(uuidv4(), agente.id, userId, 'user', contenido);
-    db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)')
-      .run(uuidv4(), agente.id, userId, 'assistant', textoRespuesta);
-
-    if (actionFee > 0) {
-      db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)')
-        .run(uuidv4(), userId, actionFee, 'gasto', `Acción determinista: ${agente.name}`);
-      db.prepare('UPDATE users SET creditos = creditos - ? WHERE id = ?').run(actionFee, userId);
-    }
-  } catch (err) {
-    console.error('⚠️  [bridge-marisai] No se pudo persistir memoria/consumo del executor determinista:', err.message);
-  }
-
-  return {
-    choices: [{ message: { role: 'assistant', content: textoRespuesta } }],
-    usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
-    model: `zoco-agent-${agente.name.toLowerCase().replace(/\s+/g, '-')}-deterministic`,
+  const hostConfig = {
+    Memory: 512 * 1024 * 1024, // 512MB
+    NanoCpus: 1e9, // 1 CPU
+    PidsLimit: 128,
+    ReadonlyRootfs: false, // necesitamos escribir en /workspace, ver Tmpfs
+    Tmpfs: { '/workspace': 'rw,size=256m,exec' },
+    AutoRemove: true,
   };
-}
 
-async function runVercelAction(userContent, config) {
-  const { action, project_id } = safeParseAction(userContent);
-  if (!config.vercel_token) return { status: 'error', notes: 'vercel_token no configurado en deterministic_executors' };
+  if (!ALLOW_NETWORK_FOR_INSTALLS) {
+    hostConfig.NetworkMode = 'none';
+  } else {
+    hostConfig.NetworkMode = SANDBOX_NETWORK; // red restringida, ver comentario arriba
+  }
 
-  if (action === 'redeploy') {
-    const resp = await fetch(`https://api.vercel.com/v13/deployments`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${config.vercel_token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: project_id, target: 'production' }),
+  let container;
+  try {
+    container = await docker.createContainer({
+      name: containerName,
+      Image: SANDBOX_IMAGE,
+      Cmd: ['sleep', 'infinity'], // se mantiene vivo; ejecutamos via exec
+      WorkingDir: '/workspace',
+      User: '1000:1000', // no-root
+      HostConfig: hostConfig,
+      Tty: false,
     });
-    const data = await resp.json();
-    return { status: resp.ok ? 'ok' : 'error', action: 'redeploy', deployment_id: data.id ?? null, raw: data };
+    await container.start();
+  } catch (err) {
+    throw new Error(`No se pudo crear el sandbox: ${err.message}`);
   }
-  return { status: 'error', notes: `acción no soportada: ${action}` };
+
+  activeSessions.set(sessionId, { container, timer: null });
+  resetIdleTimer(sessionId);
+  return container;
 }
 
-// Testing/Patcher: análisis estático (eslint/tsc/etc.) en sandbox Docker
-// --network none, igual que ya hace agent/agent.js para el agente autónomo.
-async function runStaticAnalysis(userContent, config) {
-  const { file_path, error_trace } = safeParseInput(userContent);
-  if (!config.workspace_path) return { status: 'error', notes: 'workspace_path no configurado' };
-
-  const { stdout } = await execFileAsync('docker', [
-    'run', '--rm', '--network', 'none', '--memory', '256m', '--cpus', '0.5',
-    '-v', `${config.workspace_path}:/workspace:ro`,
-    config.image || 'zocoia/static-analyzer:latest',
-    '--file', file_path || '', '--trace', error_trace || '',
-  ], { timeout: Number(process.env.SANDBOX_ANALYSIS_TIMEOUT_MS || 120_000) });
-
-  const result = JSON.parse(stdout);
-  return { status: 'ok', file_path, diff: result.diff, diagnostics: result.diagnostics };
+function resetIdleTimer(sessionId) {
+  const entry = activeSessions.get(sessionId);
+  if (!entry) return;
+  if (entry.timer) clearTimeout(entry.timer);
+  entry.timer = setTimeout(() => destroySandbox(sessionId), SESSION_IDLE_TTL_MS);
 }
 
-// Reparación: ejecución + auto-corrección iterativa en sandbox.
-async function runSandboxRepair(userContent, config) {
-  const { file_path, max_attempts = Number(process.env.SANDBOX_REPAIR_MAX_ATTEMPTS || 10) } = safeParseInput(userContent);
-  if (!config.workspace_path) return { status: 'error', notes: 'workspace_path no configurado' };
+async function destroySandbox(sessionId) {
+  const entry = activeSessions.get(sessionId);
+  if (!entry) return;
+  activeSessions.delete(sessionId);
+  if (entry.timer) clearTimeout(entry.timer);
+  try {
+    await entry.container.stop({ t: 2 });
+  } catch (_) {
+    // si ya estaba parado o AutoRemove lo quito, ignoramos
+  }
+}
 
-  let attempt = 0, lastError = null;
-  while (attempt < max_attempts) {
-    attempt++;
+// ─── Ejecucion real de un comando dentro del sandbox ────────────────────────
+
+function runWithTimeout(promise, ms, onTimeoutCleanup) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(async () => {
+      if (onTimeoutCleanup) {
+        try { await onTimeoutCleanup(); } catch (_) {}
+      }
+      reject(new Error(`Timeout tras ${ms}ms`));
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function execInSandbox(container, bashCommand) {
+  let exec;
+  try {
+    exec = await container.exec({
+      Cmd: ['bash', '-lc', bashCommand],
+      AttachStdout: true,
+      AttachStderr: true,
+      Tty: false,
+    });
+  } catch (err) {
+    return { success: false, stdout: '', stderr: `No se pudo iniciar exec: ${err.message}` };
+  }
+
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+
+    exec.start({}, (err, stream) => {
+      if (err) {
+        resolve({ success: false, stdout: '', stderr: `Fallo al iniciar stream: ${err.message}` });
+        return;
+      }
+
+      const stdoutChunks = [];
+      const stderrChunks = [];
+      docker.modem.demuxStream(
+        stream,
+        { write: (chunk) => stdoutChunks.push(chunk) },
+        { write: (chunk) => stderrChunks.push(chunk) }
+      );
+
+      stream.on('end', async () => {
+        stdout = Buffer.concat(stdoutChunks).toString('utf8');
+        stderr = Buffer.concat(stderrChunks).toString('utf8');
+        try {
+          const inspect = await exec.inspect();
+          resolve({
+            success: inspect.ExitCode === 0,
+            stdout,
+            stderr,
+            exitCode: inspect.ExitCode,
+          });
+        } catch (inspectErr) {
+          resolve({ success: false, stdout, stderr: stderr + '\n' + inspectErr.message });
+        }
+      });
+
+      stream.on('error', (streamErr) => {
+        resolve({ success: false, stdout, stderr: `Error de stream: ${streamErr.message}` });
+      });
+    });
+  });
+}
+
+// ─── Parseo del tag <execute_command> ───────────────────────────────────────
+
+function extractExecuteCommand(text) {
+  const match = /<execute_command>([\s\S]*?)<\/execute_command>/.exec(text);
+  if (!match) return null;
+  return match[1].trim();
+}
+
+function stripExecuteTag(text) {
+  return text.replace(/<execute_command>[\s\S]*?<\/execute_command>/, '').trim();
+}
+
+// ─── Llamada al modelo via el gateway existente (server.js) ────────────────
+
+async function askModelViaGateway({ gatewayUrl, gatewayApiKey, model, messages }) {
+  const res = await fetch(`${gatewayUrl}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${gatewayApiKey}`,
+    },
+    body: JSON.stringify({ model, messages }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Gateway respondio ${res.status}: ${text}`);
+  }
+
+  const data = await res.json();
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content !== 'string') {
+    throw new Error('Respuesta del gateway sin contenido de texto valido.');
+  }
+  return content;
+}
+
+// ─── Bucle agentico principal ───────────────────────────────────────────────
+
+/**
+ * Ejecuta una tarea de agente completa: llama al modelo, si pide ejecutar
+ * un comando lo corre en el sandbox real, le devuelve el resultado, y repite
+ * hasta que el modelo responda sin tag <execute_command> o se agoten los
+ * intentos. Emite eventos por WebSocket en cada paso.
+ */
+export async function runAgenticTask({
+  userId,
+  sessionId,
+  task,
+  model = 'zoco-max',
+  gatewayUrl,
+  gatewayApiKey,
+  emit = () => {},
+}) {
+  if (!sessionId) throw new Error('sessionId es obligatorio (aislamiento por sesion).');
+  if (!gatewayApiKey) throw new Error('Falta gatewayApiKey.');
+
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT_EXECUTE },
+    { role: 'user', content: task },
+  ];
+
+  emit(sessionId, { type: 'terminal_status', stage: 'spawning_sandbox' });
+
+  let container;
+  try {
+    container = await getOrCreateSandbox(sessionId);
+  } catch (err) {
+    emit(sessionId, { type: 'terminal_status', stage: 'sandbox_error', error: err.message });
+    return { success: false, error: `No se pudo crear el sandbox: ${err.message}` };
+  }
+
+  emit(sessionId, { type: 'terminal_status', stage: 'sandbox_ready' });
+
+  for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
+    emit(sessionId, { type: 'terminal_status', stage: 'querying_model', iteration });
+
+    let raw;
     try {
-      const { stdout, stderr } = await execFileAsync('docker', [
-        'run', '--rm', '--network', 'none', '--memory', '256m', '--cpus', '0.5',
-        '-v', `${config.workspace_path}:/workspace:rw`,
-        config.image || 'zocoia/sandbox-runner:latest',
-        '--file', file_path || '',
-      ], { timeout: Number(process.env.SANDBOX_REPAIR_TIMEOUT_MS || 60_000) });
-      if (!stderr) return { status: 'ok', file_path, attempts: attempt, output: stdout };
-      lastError = stderr;
+      raw = await askModelViaGateway({ gatewayUrl, gatewayApiKey, model, messages });
     } catch (err) {
-      lastError = err.message;
+      emit(sessionId, { type: 'terminal_status', stage: 'model_error', error: err.message });
+      return { success: false, error: `Fallo al consultar el modelo: ${err.message}` };
     }
+
+    const command = extractExecuteCommand(raw);
+
+    if (!command) {
+      // Respuesta final: sin tag de ejecucion, tarea terminada.
+      const finalText = stripExecuteTag(raw);
+      emit(sessionId, { type: 'terminal_status', stage: 'task_complete' });
+      resetIdleTimer(sessionId); // mantenemos el sandbox vivo por si hay turnos siguientes
+      return { success: true, output: finalText, iterations: iteration };
+    }
+
+    emit(sessionId, { type: 'terminal_log', chunk: `$ ${command}\n` });
+    emit(sessionId, { type: 'terminal_status', stage: 'executing_command', iteration });
+
+    let result;
+    try {
+      result = await runWithTimeout(
+        execInSandbox(container, command),
+        COMMAND_TIMEOUT_MS,
+        () => destroySandbox(sessionId) // si se cuelga, matamos el sandbox entero
+      );
+    } catch (err) {
+      result = { success: false, stdout: '', stderr: `Timeout o fallo de ejecucion: ${err.message}` };
+    }
+
+    const outputChunk = (result.stdout || '') + (result.stderr ? `\n[stderr]\n${result.stderr}` : '');
+    emit(sessionId, { type: 'terminal_log', chunk: outputChunk || '(sin salida)' });
+    emit(sessionId, {
+      type: 'terminal_status',
+      stage: result.success ? 'command_success' : 'command_failed',
+      iteration,
+    });
+
+    messages.push({ role: 'assistant', content: raw });
+    messages.push({
+      role: 'user',
+      content:
+        `[RESULTADO DE TERMINAL REAL] exit_code=${result.exitCode ?? 'desconocido'}\n` +
+        `stdout:\n${result.stdout || '(vacio)'}\n` +
+        `stderr:\n${result.stderr || '(vacio)'}`,
+    });
   }
-  return { status: 'error', file_path, attempts: attempt, notes: `no resuelto tras ${attempt} intentos: ${lastError}` };
+
+  emit(sessionId, { type: 'terminal_status', stage: 'max_iterations_reached' });
+  return { success: false, error: `Limite de ${MAX_ITERATIONS} iteraciones alcanzado sin respuesta final.` };
 }
 
-function safeParseAction(content) {
-  try { return JSON.parse(content); }
-  catch { return { action: content.includes('redeploy') ? 'redeploy' : 'logs', service_id: null, project_id: null }; }
-}
-function safeParseInput(content) {
-  try { return JSON.parse(content); }
-  catch { return { file_path: null, error_trace: content }; }
+// ─── Limpieza al cerrar el proceso ──────────────────────────────────────────
+
+export async function shutdownAllSandboxes() {
+  const ids = [...activeSessions.keys()];
+  await Promise.allSettled(ids.map((id) => destroySandbox(id)));
 }
 
-// ── 3) Rutas admin del puente (solo owner/admin) ───────────────────────
-export function registerBridgeAdminRoutes({ app, db, authMiddleware, requireAdmin, uuidv4 }) {
-  ensureBridgeTables(db);
-
-  // Sobrescribe el systemPrompt/jsonSchema de UN agente propio con el
-  // prompt EXACTO migrado de Marisai (As-Is, sin reescritura ni parseo).
-  app.put('/admin/bridge/agentes/:id/import-marisai', authMiddleware, requireAdmin, (req, res) => {
-    const { systemPrompt, jsonSchema } = req.body || {};
-    if (typeof systemPrompt !== 'string' || !systemPrompt.trim()) {
-      return res.status(400).json({ error: 'systemPrompt es obligatorio (texto exacto de Marisai)' });
-    }
-    const agente = db.prepare("SELECT * FROM resources WHERE id = ? AND type = 'agente'").get(req.params.id);
-    if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
-
-    const data = JSON.parse(agente.data || '{}');
-    data.systemPrompt = systemPrompt;       // As-Is: se guarda tal cual, sin tocar
-    if (jsonSchema !== undefined) data.jsonSchema = jsonSchema;
-    data.tipo = data.tipo === 'deterministic' ? data.tipo : 'prompted'; // deja de ser "genérico" al recibir prompt propio
-
-    db.prepare('UPDATE resources SET data = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-      .run(JSON.stringify(data), agente.id);
-    res.json({ ok: true, agentId: agente.id });
-  });
-
-  // Configura credenciales/params de un executor determinista (Vercel/sandbox).
-  app.put('/admin/bridge/agentes/:id/executor', authMiddleware, requireAdmin, (req, res) => {
-    const { executorType, config, actionFeeEur } = req.body || {};
-    if (!executorType) return res.status(400).json({ error: 'executorType es obligatorio' });
-
-    db.prepare(`
-      INSERT INTO deterministic_executors (agent_id, executor_type, config_json, action_fee_eur)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(agent_id) DO UPDATE SET executor_type = excluded.executor_type, config_json = excluded.config_json, action_fee_eur = excluded.action_fee_eur
-    `).run(req.params.id, executorType, JSON.stringify(config || {}), actionFeeEur || 0);
-
-    res.json({ ok: true });
-  });
-
-  // Editar/crear un template maestro (Frontend/Database u otros futuros).
-  app.put('/admin/bridge/templates/:id', authMiddleware, requireAdmin, (req, res) => {
-    const { name, basePrompt, variables } = req.body || {};
-    if (!basePrompt) return res.status(400).json({ error: 'basePrompt es obligatorio' });
-    db.prepare(`
-      INSERT INTO prompt_templates (id, name, base_prompt, variables_json, updated_at)
-      VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-      ON CONFLICT(id) DO UPDATE SET name = excluded.name, base_prompt = excluded.base_prompt, variables_json = excluded.variables_json, updated_at = CURRENT_TIMESTAMP
-    `).run(req.params.id, name || req.params.id, basePrompt, JSON.stringify(variables || {}));
-    res.json({ ok: true });
-  });
-
-  app.get('/admin/bridge/templates', authMiddleware, requireAdmin, (req, res) => {
-    res.json(db.prepare('SELECT * FROM prompt_templates').all());
-  });
-}
+process.on('SIGTERM', shutdownAllSandboxes);
+process.on('SIGINT', shutdownAllSandboxes);
