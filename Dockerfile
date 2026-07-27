@@ -20,8 +20,12 @@ RUN npm install --omit=dev
 # Copy built frontend from previous stage
 COPY --from=frontend-builder /app/dist ./public
 
-# Copy the server script and its local modules
-COPY server.js tools.js bridge-marisai.js seed-owner-agents.js zoco-sessions.js zoco-console.js ./
+# Copy TODOS los .js sueltos de la raiz del repo (server.js + todos sus
+# modulos locales: tools.js, bridge-marisai.js, bridge-marisai-prompts.js,
+# seed-owner-agents.js, zoco-sessions.js, zoco-console.js, y cualquier
+# modulo nuevo que se añada en el futuro) -- evita tener que acordarse de
+# añadir cada archivo nuevo a mano en este Dockerfile.
+COPY *.js ./
 
 # Set environment variables
 ENV NODE_ENV=production
