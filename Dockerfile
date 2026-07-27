@@ -20,8 +20,12 @@ RUN npm install --omit=dev
 # Copy built frontend from previous stage
 COPY --from=frontend-builder /app/dist ./public
 
-# Copy the server script and its local modules
-COPY server.js tools.js ./
+# Copy the server script and its local modules.
+# (bridge-marisai.js, seed-owner-agents.js, zoco-sessions.js y zoco-console.js
+#  ya eran importados por server.js pero faltaban aquí; manus-agent/ es el
+#  módulo nuevo del agente autónomo.)
+COPY server.js tools.js bridge-marisai.js seed-owner-agents.js zoco-sessions.js zoco-console.js ./
+COPY manus-agent ./manus-agent
 
 # Set environment variables
 ENV NODE_ENV=production

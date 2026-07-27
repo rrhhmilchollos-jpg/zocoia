@@ -1,149 +1,103 @@
-# Integración del Manus-Agent en zocoia.es (rama `zoco-ia-1`)
+# Manus-Agent — integrado en zocoia.es (rama `zoco-ia-1`)
 
-## 1. Dónde están los archivos
+## Cómo funciona (arquitectura real, ya conectada)
 
-Ya están en la raíz del repo, al mismo nivel que `server.js`, `agent/` y
-`gateway/`:
+El agente **no llama a ningún proveedor de IA externo ni necesita su
+propia API key**. Se ejecuta dentro del mismo proceso Node que sirve
+zocoia.es y reutiliza directamente `processChatCompletion()` — la misma
+función que ya usan `/api/chat` y `/v1/chat/completions` — pasándole
+`tools` en formato OpenAI. `processChatCompletion()` ya soportaba esto
+en modo *passthrough* (tools del cliente), así que no hizo falta tocar
+su lógica interna, solo aprovecharla.
 
 ```
-zocoia/
-├── agent/
-├── gateway/
-├── src/
-├── manus-agent/          <-- este módulo
-│   ├── types.ts
-│   ├── config.ts
-│   ├── manusAgent.ts
-│   ├── routes.ts
-│   ├── index.ts
-│   └── tools/
-│       ├── workspace.ts
-│       ├── github.ts
-│       ├── coolify.ts
-│       └── index.ts
-├── server.js
-├── package.json
-└── ...
+Panel React (ManusAgentPanel)
+   │  POST /api/agent/run/stream   (con el JWT del usuario)
+   ▼
+server.js
+   │  app.use('/api/agent', authMiddleware, createAgentRouter({ processChatCompletion }))
+   ▼
+manus-agent/routes.js  →  manus-agent/manusAgent.js
+   │  bucle de function-calling llamando a processChatCompletion(authSub, { tools, ... })
+   ▼
+Ollama (motor local ya configurado: OLLAMA_URL / OLLAMA_MODEL_MAP)
 ```
 
-## 2. Dependencias nuevas
+Las tools reales (leer/escribir archivos, GitHub, Coolify) están en
+`manus-agent/tools/`.
+
+## Ya está montado
+
+- `server.js` importa `createAgentRouter` desde `./manus-agent/index.js`
+  y monta `/api/agent/run` y `/api/agent/run/stream` detrás de
+  `authMiddleware`, sin tocar ninguna otra ruta.
+- `Dockerfile`: corregido para copiar `manus-agent/` a la imagen de
+  producción (de paso, se corrigió un bug ya existente: la imagen no
+  copiaba `bridge-marisai.js`, `seed-owner-agents.js`, `zoco-sessions.js`
+  ni `zoco-console.js`, que `server.js` ya importaba).
+- `package.json`: añadidas `@octokit/rest` y `simple-git` (dependencias
+  reales usadas por las tools de GitHub).
+- `src/components/ManusAgentPanel.tsx`: panel con pestañas
+  Diferencia / Original / Modificado, consumiendo el streaming SSE.
+
+## Variables de entorno que SÍ tienes que rellenar tú
+
+El agente en sí no necesita API key de IA (usa el motor interno), pero
+sí necesita credenciales para tocar repos de GitHub y desplegar en
+Coolify — esto no lo puedo generar yo, son cuentas tuyas:
 
 ```bash
-npm install openai @octokit/rest simple-git
-npm install --save-dev @types/express tsx
+# GitHub: Personal Access Token con permisos "repo".
+# Genera uno NUEVO y dedicado en https://github.com/settings/tokens
+# (nunca reutilices uno que se haya compartido fuera de un gestor de secretos).
+GITHUB_TOKEN=
+
+# Coolify: Panel Coolify -> Keys & Tokens -> API tokens
+COOLIFY_API_URL=
+COOLIFY_API_TOKEN=
+COOLIFY_SERVER_UUID=       # opcional si prefieres que el agente busque la app por su repo
+COOLIFY_PROJECT_UUID=      # opcional, informativo
+
+# Opcionales, con valores por defecto sensatos:
+AGENT_WORKSPACE_DIR=/tmp/manus-agent-workspaces   # carpeta temporal de trabajo
+AGENT_MAX_STEPS=25                                # límite de iteraciones del bucle
+AGENT_DEFAULT_MODEL=zoco-max                       # una de: zoco-flash | zoco-plus | zoco-max | zoco-lab
 ```
 
-Se usa el paquete `openai` (no `@anthropic-ai/sdk`) porque el orquestador
-habla con **tu propio gateway de zocoia.es**, no con Anthropic
-directamente. zocoia.es actúa como tu Claude Console + litellm, sirviendo
-modelos de Ollama por detrás con un endpoint de chat compatible con
-OpenAI (`/v1/chat/completions`, con function calling).
+Añádelas en el panel de variables de entorno de Railway (donde corre
+`server.js`), no en `.env` local ni en el repo.
 
-> Si en algún momento cambias tu gateway para exponer en su lugar el
-> formato `/v1/messages` de Anthropic, solo hay que cambiar el bloque de
-> cliente en `manusAgent.ts` por `@anthropic-ai/sdk` con
-> `baseURL: config.llm.baseUrl`. El resto del agente (tools, github,
-> coolify, panel) no cambia.
+## Añadir el panel a tu Dashboard
 
-## 3. Variables de entorno
-
-```bash
-# Tu gateway (zocoia.es) en vez de Anthropic
-ZOCOIA_API_URL=https://zocoia.es/v1
-ZOCOIA_API_KEY=sk-zoco-xxxxxxxxxxxxxxxx     # generada en tu propio panel de zocoia.es
-ZOCOIA_MODEL=ollama/llama3.1:70b            # el modelo que tengas montado; usa uno con soporte de "tools"/function calling
-
-# GitHub (Personal Access Token con permisos "repo")
-GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
-
-# Coolify
-COOLIFY_API_URL=https://tu-instancia-coolify.com/api/v1
-COOLIFY_API_TOKEN=xxxxxxxxxxxxxxxx
-COOLIFY_SERVER_UUID=uuid-de-la-app-a-redesplegar   # opcional si usas búsqueda automática por repo
-COOLIFY_PROJECT_UUID=uuid-del-proyecto             # opcional, informativo
-
-# Agente
-AGENT_WORKSPACE_DIR=/tmp/manus-agent-workspaces
-AGENT_MAX_STEPS=25
-```
-
-> ⚠️ **Genera un `GITHUB_TOKEN` nuevo** antes de poner esto en producción.
-> El que se usó para crear este Pull Request se compartió en texto plano
-> en un chat — revócalo en
-> https://github.com/settings/tokens y crea uno nuevo solo para el
-> servidor (variable de entorno, nunca en el frontend ni en commits).
-
-> ⚠️ **Modelo con soporte de "tool calling"**: no todos los modelos de
-> Ollama soportan function calling de forma fiable. Modelos recomendados:
-> `llama3.1` (8B/70B), `qwen2.5`, `mistral-nemo`. Si tu modelo no soporta
-> tools, litellm puede fallar el `tool_choice: "auto"` — prueba primero
-> con una petición corta antes de confiar tareas grandes al agente.
-
-## 4. Montar las rutas en `server.js`
-
-```js
-// server.js
-import { agentRouter } from "./manus-agent/index.ts";
-// ... tus imports y middlewares existentes (cors, express.json(), authMiddleware, etc.)
-
-app.use(authMiddleware); // el que ya usas para proteger rutas (jsonwebtoken)
-app.use(agentRouter);
-```
-
-Para poder importar los `.ts` sin compilar aparte, la opción más simple
-es arrancar el server con `tsx` en vez de `node`:
-
-```json
-"scripts": {
-  "start": "node parchear.js && tsx server.js"
-}
-```
-
-o compilar `manus-agent/` con `tsc` como paso de build en el
-`Dockerfile` (`RUN npx tsc --project manus-agent/tsconfig.json`) e
-importar desde `manus-agent/dist/index.js`.
-
-## 5. Cómo lo llama el panel visual
-
-```json
-POST /api/agent/run/stream
-{
-  "instructions": "Añade un endpoint GET /health que devuelva { status: 'ok' }",
-  "repo_url": "https://github.com/rrhhmilchollos-jpg/zocoia",
-  "base_branch": "zoco-ia-1",
-  "auto_deploy": true,
-  "create_pull_request": true
-}
-```
-
-Devuelve eventos SSE (`event: step`) paso a paso y un evento final
-(`event: result`) con el `AgentRunResult` completo. El componente React
-`ManusAgentPanel.tsx` (en `src/components/`) ya consume este endpoint y
-pinta las pestañas Diferencia / Original / Modificado.
-
-## 5.1. Añadir el panel a tu Dashboard
-
-No he tocado `src/pages/Dashboard.tsx` directamente para no arriesgar nada
-en un archivo de 900+ líneas que ya funciona. Para mostrar el panel,
-añade tú una pestaña nueva donde ya tienes `activeTab`/`RESOURCE_SECTIONS`:
+No se tocó `src/pages/Dashboard.tsx` (900+ líneas ya en producción) para
+no arriesgar nada ahí. Para mostrarlo, añade una pestaña:
 
 ```tsx
 import ManusAgentPanel from '../components/ManusAgentPanel';
 
-// dentro del render, donde pintas el contenido según activeTab:
 {activeTab === 'agente' && <ManusAgentPanel />}
 ```
 
-y un botón más en tu barra de pestañas que haga `setActiveTab('agente')`.
-Es un componente autocontenido: no necesita props ni contexto adicional
-aparte de `useAuth()`, que ya está disponible en toda la app.
+y un botón que haga `setActiveTab('agente')`. El componente es
+autocontenido (solo usa `useAuth()`, ya disponible en toda la app).
 
-## 6. Seguridad
+## ⚠️ Problema encontrado, NO relacionado con este agente
 
-- El endpoint del agente debe estar **siempre** detrás de tu
-  `authMiddleware` (JWT).
-- Por defecto `create_pull_request: true`: abre PR en vez de tocar
-  `zoco-ia-1` directamente. Cámbialo a `false` solo cuando confíes en el
-  flujo para repos concretos.
+`seed-owner-agents.js` importa `./bridge-marisai-prompts.js`, un
+archivo que **no existe en ningún punto del historial de git de este
+repositorio** (revisado en todas las ramas). Si es así también en el
+commit que Railway está desplegando ahora mismo, `node server.js`
+debería fallar al arrancar con `ERR_MODULE_NOT_FOUND` — es decir, es un
+problema previo a este PR, no algo que yo haya introducido. Antes de
+mergear, confirma que ese archivo existe donde Railway construye la
+imagen (o recupéralo y añádelo al repo) para no encontrarte con un
+arranque roto por un motivo aparte del agente.
+
+## Seguridad
+
+- El agente corre "como" el usuario autenticado (`req.auth.sub`), con
+  su mismo saldo/créditos del sistema Ollama existente.
+- Por defecto abre Pull Request en vez de tocar `zoco-ia-1` directamente
+  (`create_pull_request: true`).
 - `AGENT_MAX_STEPS` limita las iteraciones del bucle.
 - El workspace de cada tarea se borra siempre al terminar.

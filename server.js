@@ -15,6 +15,7 @@ import { runDeterministicAgent, resolveTemplatePrompt, registerBridgeAdminRoutes
 import { seedOwnerAgentsIfEmpty, seedBasicAgentsForUser, isOwnerUser, DEEPSEEK_SAFE_FORMAT_RULE, ENTERPRISE_REQUIRED_MESSAGE } from './seed-owner-agents.js';
 import { registerSessionRoutes, validateZocoApiKey } from './zoco-sessions.js';
 import { registerConsoleRoutes, resumeInterruptedBatches, buildEnvironmentContext } from './zoco-console.js';
+import { createAgentRouter } from './manus-agent/index.js';
 
 dotenv.config();
 
@@ -1046,6 +1047,12 @@ app.post('/api/chat', authMiddleware, async (req, res) => {
     res.status(status).json({ error: err.message || 'Error interno al procesar el mensaje', ...(err.code ? { code: err.code } : {}) });
   }
 });
+
+// Agente autónomo estilo Manus: explora/edita repos de GitHub y despliega
+// en Coolify, usando el MISMO motor de IA (processChatCompletion, Ollama)
+// que /api/chat y /v1/chat/completions. Montado con prefijo propio y
+// authMiddleware aplicado solo aquí, para no tocar el resto de rutas.
+app.use('/api/agent', authMiddleware, createAgentRouter({ processChatCompletion }));
 
 app.get('/api/cache/stats', authMiddleware, (req, res) => {
   const rows = db.prepare(
