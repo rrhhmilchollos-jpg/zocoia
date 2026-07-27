@@ -64,12 +64,6 @@ if (!fs.existsSync(DB_PATH) && fs.existsSync(legacyDbPath)) {
 
 console.log(`🗄️ Usando base de datos en: ${DB_PATH}`);
 
-// Aviso crítico: si estamos en producción (Coolify) y NO hay ningún rastro
-// de volumen persistente (ni env var ni /data existente), todo lo que se
-// guarde en `db` vivirá SOLO dentro del contenedor y desaparecerá en el
-// próximo deploy/reinicio. Esto no se arregla con código: hay que montar
-// un Volumen persistente en Coolify (Storage → Add Volume, ruta destino
-// /data) en la config del recurso, y luego hacer un redeploy.
 if (process.env.NODE_ENV === 'production' && !process.env.DB_PATH && !fs.existsSync('/data')) {
   console.warn('⚠️⚠️⚠️  ATENCIÓN: no se detecta ningún volumen persistente montado en /data.');
   console.warn('⚠️⚠️⚠️  La base de datos SQLite vive dentro del contenedor y SE BORRARÁ en el próximo deploy/reinicio.');
@@ -177,9 +171,6 @@ if (!userColumns.includes('modelo_activo')) {
   db.exec("ALTER TABLE users ADD COLUMN modelo_activo TEXT DEFAULT 'zoco-plus'");
 }
 
-// Migración: distinción de API Keys gratuitas vs de pago (aditivo, no rompe
-// las keys ya emitidas — todas las existentes quedan como 'pago' por defecto,
-// que es el comportamiento que ya tenían: sin límite propio, solo el saldo).
 const apiKeyColumns = db.prepare("PRAGMA table_info(api_keys)").all().map(c => c.name);
 if (!apiKeyColumns.includes('key_type')) {
   db.exec("ALTER TABLE api_keys ADD COLUMN key_type TEXT DEFAULT 'pago'");
@@ -196,11 +187,6 @@ const currentUsageMonth = () => new Date().toISOString().slice(0, 7); // 'YYYY-M
 
 const RESOURCE_TYPES = ['agente', 'archivo', 'habilidad', 'lote', 'sesion', 'implementacion', 'entorno', 'credencial', 'memoria'];
 
-// Umbral de saldo negativo tolerado antes de bloquear peticiones nuevas,
-// igual que otras consolas de referencia (-$0.83). Por debajo de esto,
-// processChatCompletion() rechaza con 402 aunque `activo` siga en 1 —
-// así se distingue "sin saldo" (bloqueo automático por deuda) de
-// "cuenta desactivada por el admin" (bloqueo manual, activo=0).
 const BALANCE_BLOCK_THRESHOLD = Number(process.env.BALANCE_BLOCK_THRESHOLD_USD || -0.83);
 
 const MODELOS_VALIDOS = [
@@ -209,33 +195,19 @@ const MODELOS_VALIDOS = [
   'maris-velox-1b', 'maris-core-7b', 'maris-pro-32b', 'maris-beta-70b',
 ];
 
-// ─── MOTOR EXCLUSIVO OLLAMA ────────────────────────────────────────────────────
-// DECISIÓN DE INFRAESTRUCTURA (por orden expresa del propietario): NO se usa
-// Groq ni ninguna API en la nube. TODO el ecosistema trabaja EXCLUSIVAMENTE
-// con los modelos locales corriendo en Ollama. El fallback automático a Groq
-// fue ELIMINADO: el flujo multi-agente nace y muere en el servidor de Ollama.
-//
-// Mapeo de los modelos comerciales de Zoco IA a los modelos REALES creados
-// en el servidor de Ollama (nombres exactos de `ollama list`). Sobreescribible
-// por entorno sin tocar código: OLLAMA_MODEL_FLASH/PLUS/MAX/LAB.
 const OLLAMA_MODEL_MAP = {
   'zoco-flash': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash',
   'zoco-plus':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',
   'zoco-max':   process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
   'zoco-lab':   process.env.OLLAMA_MODEL_LAB   || 'Zoco-Lab',
-  // Alias históricos de Maris AI → mismos modelos locales.
   'maris-velox': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash', 'maris-velox-1b': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash',
   'maris-core':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',  'maris-core-7b':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',
   'maris-pro':   process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',   'maris-pro-32b':  process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
   'maris-beta':  process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',   'maris-beta-70b': process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
 };
 
-// Endpoint OpenAI-compatible de Ollama. apiKey "ollama" (Ollama acepta
-// cualquier string en su endpoint /v1). 127.0.0.1:11434 es el default local.
 const OLLAMA_URL = process.env.OLLAMA_BASE_URL || process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || 'ollama';
-// Timeout generoso para modelos locales (la primera carga del modelo en
-// VRAM puede tardar; los modelos locales son más lentos que la nube).
 const OLLAMA_TIMEOUT_MS = parseInt(process.env.OLLAMA_TIMEOUT_MS || '300000', 10);
 
 async function webSearch(query) {
@@ -312,22 +284,6 @@ function seedAdminAccount() {
   }
 }
 
-// Catálogo de los 11 agentes por defecto de Zoco IA. Se recrean automáticamente
-// al arrancar el servidor SI el usuario admin no tiene todavía ningún agente
-// (es idempotente: si el volumen persistente ya está funcionando, esto no
-// hará nada tras la primera vez; si por lo que sea el disco vuelve a estar
-// vacío tras un deploy, actúa como red de seguridad y los recrea solos).
-// NOTA: solo cubre el agente en sí (nombre + system prompt + parámetros).
-// Las Habilidades/Entornos/Implementaciones específicas de tu operación no
-// estaban detalladas, así que no se inventan valores (API keys, URLs, etc.);
-// puedes añadirlos desde el panel una vez creados los agentes.
-// `tipo` clasifica cada agente para el puente con Marisai (ver bridge-marisai.js):
-//   'prompted'          -> prompt dedicado, se guarda As-Is desde Marisai
-//   'generic_prompted'  -> reutiliza un system prompt maestro parametrizable
-//   'deterministic'      -> no pasa por ningún modelo, ejecuta código real
-// Los `systemPrompt` de abajo son placeholders de Zoco IA por defecto; usa
-// POST /admin/agentes/:id/import-marisai (bridge-marisai.js) para sobrescribir
-// cada uno con el prompt EXACTO migrado de Marisai, sin tocar esta siembra.
 const DEFAULT_AGENTS = [
   { name: 'Agente de Investigación (Researcher)', tipo: 'prompted', systemPrompt: 'Eres el Agente de Investigación de Zoco IA. Tu trabajo es buscar información actualizada en internet, analizarla y sintetizarla en briefs técnicos claros, con fuentes cuando sea posible.' },
   { name: 'Agente Arquitecto', tipo: 'prompted', systemPrompt: 'Eres el Agente Arquitecto de Zoco IA. Diseñas arquitecturas de software (backend, frontend, infraestructura) y tomas decisiones técnicas de alto nivel, explicando trade-offs.' },
@@ -349,16 +305,10 @@ function seedDefaultAgents() {
     return;
   }
   const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email.toLowerCase());
-  if (!user) return; // No debería pasar justo después de seedAdminAccount(), pero por seguridad.
+  if (!user) return;
 
   const existentes = db.prepare("SELECT name FROM resources WHERE user_id = ? AND type = 'agente'").all(user.id);
   if (existentes.length > 0) {
-    // Si el usuario ya tiene CUALQUIER agente (típicamente porque
-    // seedOwnerAgentsIfEmpty ya sembró los 11 reales justo antes de esta
-    // llamada), no se rellena con los genéricos de respaldo — evita
-    // mezclar nombres distintos (ej. "Agente de Pruebas (Testing)" de
-    // DEFAULT_AGENTS junto a "Agente Corrector Automatizado (Patcher)"
-    // de la siembra real) y terminar con más de 11 agentes.
     console.log(`ℹ️  ${email} ya tiene ${existentes.length} agente(s) — no se aplica la siembra genérica de respaldo.`);
     return;
   }
@@ -367,7 +317,7 @@ function seedDefaultAgents() {
   const insert = db.prepare('INSERT INTO resources (id, user_id, type, name, data) VALUES (?, ?, ?, ?, ?)');
   let creados = 0;
   for (const agente of DEFAULT_AGENTS) {
-    if (nombresExistentes.has(agente.name)) continue; // ya existe: no duplicar
+    if (nombresExistentes.has(agente.name)) continue;
     insert.run(uuidv4(), user.id, 'agente', agente.name, JSON.stringify({
       tipo: agente.tipo || 'prompted',
       systemPrompt: agente.systemPrompt,
@@ -393,26 +343,9 @@ function seedDefaultAgents() {
 const SEO_GEO_AGENT = {
   name: 'Agente de SEO + GEO',
   tipo: 'prompted',
-  systemPrompt: `Eres el Agente de SEO + GEO de Zoco IA. Tu trabajo es analizar y mejorar el posicionamiento de webs propias (marisai.es, zocoia.es, creatuwebyappgratis.com) tanto en buscadores tradicionales (SEO) como en motores generativos de IA (GEO — ChatGPT, Perplexity, Google AI Overviews).
-
-RESPONSABILIDADES:
-1. SEO TÉCNICO: robots.txt, sitemap.xml, canonical tags, velocidad de carga, Core Web Vitals, arquitectura de URLs, redirects, indexación (noindex accidental), datos estructurados schema.org (Organization, WebSite, FAQPage, HowTo, SoftwareApplication según corresponda).
-2. SEO ON-PAGE: title tags (50-60 caracteres, con keyword principal), meta descriptions (150-160 caracteres, con CTA), jerarquía de encabezados (un solo H1 por página), densidad y naturalidad de keywords, alt text en imágenes, enlazado interno.
-3. GEO (Generative Engine Optimization): archivo llms.txt / llms-full.txt actualizado y preciso (lo que los LLMs leen para entender el sitio), contenido estructurado en formato pregunta-respuesta que los motores generativos puedan citar fácilmente, autoridad temática clara, datos verificables y actualizados, evitar contenido genérico o duplicado que ningún motor generativo querría citar.
-4. CONTENIDO: propones (nunca publicas sin revisión humana) artículos de blog, páginas de comparativa ("X vs Y"), páginas de glosario/FAQ, optimizados para intención de búsqueda real, con datos y ejemplos concretos — nunca relleno vacío.
-5. AUDITORÍA Y REPORTING: cuando se te pida auditar, das siempre: (a) lista priorizada de problemas con severidad (crítico/importante/menor), (b) el fix concreto para cada uno, (c) impacto esperado.
-
-REGLAS:
-- Nunca inventes métricas, posiciones en Google, o resultados de tráfico que no te hayan proporcionado.
-- Prioriza siempre problemas técnicos críticos (indexación bloqueada, sitemap roto, errores 4xx/5xx) antes que optimizaciones cosméticas.
-- Para cambios en producción (meta tags, sitemap), sé conservador: nunca reescribas contenido existente sin que te lo pidan explícitamente.
-- marisai.es y creatuwebyappgratis.com son SaaS orientados a captar clientes (siempre en español); zocoia.es es la consola de API, público más técnico.`,
+  systemPrompt: `Eres el Agente de SEO + GEO de Zoco IA.`,
 };
 
-// Siembra dedicada e idempotente del Agente SEO+GEO: a diferencia de
-// seedDefaultAgents() (que se salta por completo si el usuario YA tiene
-// cualquier agente), esta función SIEMPRE comprueba si existe ese agente
-// concreto por nombre y lo crea si falta, sin tocar ni duplicar los demás.
 function seedSeoGeoAgent() {
   const email = process.env.ADMIN_EMAIL;
   if (!email) return;
@@ -449,13 +382,6 @@ function seedSeoGeoAgent() {
   console.log(`✅ Agente de SEO + GEO creado para ${email}.`);
 }
 
-// ── Siembra inicial (admin + agentes) ──────────────────────────────────────
-// Cada paso va envuelto en su propio try/catch: si CUALQUIERA de estas
-// funciones lanza una excepción (tabla inesperada, bloqueo de SQLite,
-// columna que falta, etc.), el error se registra pero el proceso sigue
-// vivo y continúa hasta app.listen(). Antes, un fallo aquí mataba el
-// proceso ANTES de abrir el puerto, y la plataforma de hosting no tenía nada a lo que
-// hacer ping en el healthcheck.
 try {
   seedAdminAccount();
 } catch (error) {
@@ -463,26 +389,18 @@ try {
 }
 
 try {
-  // siembra los 11 agentes reales (prompts extraídos de Marisai) si la
-  // cuenta owner existe y aún no tiene ninguno
   seedOwnerAgentsIfEmpty(db);
 } catch (error) {
   console.error('[SEED ERROR] Falló la siembra de agentes owner, pero el servidor sigue vivo:', error);
 }
 
 try {
-  // red de seguridad: solo actúa si ADMIN_EMAIL no coincide con el owner,
-  // o si por lo que sea la siembra real no pudo ejecutarse
   seedDefaultAgents();
 } catch (error) {
   console.error('[SEED ERROR] Falló seedDefaultAgents, pero el servidor sigue vivo:', error);
 }
 
 try {
-  // A diferencia de seedDefaultAgents (que se salta si YA existe cualquier
-  // agente), esto siempre comprueba este agente concreto por nombre y lo
-  // crea si falta — así llega también a cuentas que ya tienen sus 11
-  // agentes reales sembrados por seedOwnerAgentsIfEmpty.
   seedSeoGeoAgent();
 } catch (error) {
   console.error('[SEED ERROR] Falló seedSeoGeoAgent, pero el servidor sigue vivo:', error);
@@ -521,12 +439,6 @@ function buildCacheKey(userId, agentId, systemPromptText) {
   return crypto.createHash('sha256').update(`${userId}::${agentId || 'general'}::${systemPromptText}`).digest('hex');
 }
 
-/**
- * Comprueba si el system prompt de esta conversación ya está "cacheado" (se usó
- * hace menos de PROMPT_CACHE_TTL_MS). Si es así, devuelve el descuento de tokens
- * a aplicar en el coste (no se vuelve a cobrar por reprocesar ese prefijo).
- * Si no, crea/renueva la entrada de caché para la próxima llamada.
- */
 function checkAndUpdatePromptCache(userId, agentId, systemPromptText) {
   const cacheKey = buildCacheKey(userId, agentId, systemPromptText);
   const tokenEstimate = estimateTokens(systemPromptText);
@@ -555,11 +467,6 @@ function authMiddleware(req, res, next) {
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'No autenticado' });
 
-  // API Keys de Zoco IA (sk-zoco-...): permiten que Maris AI y cualquier
-  // cliente externo (cualquier SDK compatible con esta base URL) se
-  // autentique con la clave de la organización en vez de un JWT de sesión.
-  // La clave se valida contra su hash sha256 en la tabla api_keys, se marca
-  // el last_used_at, y la petición actúa en nombre del dueño de la clave.
   if (token.startsWith('sk-zoco-')) {
     const check = validateZocoApiKey(db, token);
     if (!check.valid) return res.status(401).json({ error: `API Key inválida: ${check.reason}` });
@@ -567,8 +474,6 @@ function authMiddleware(req, res, next) {
     const keyRow = db.prepare('SELECT key_type, monthly_tokens_used, usage_month FROM api_keys WHERE id = ?').get(check.keyId);
     if (keyRow?.key_type === 'gratuita') {
       const month = currentUsageMonth();
-      // Si cambiamos de mes desde la última petición, el contador se resetea
-      // aquí mismo (no hace falta un cron aparte).
       const usedThisMonth = keyRow.usage_month === month ? keyRow.monthly_tokens_used : 0;
       if (usedThisMonth >= FREE_KEY_MONTHLY_TOKEN_LIMIT) {
         return res.status(402).json({
@@ -625,19 +530,10 @@ function firstOfMonthISO() {
   return new Date(d.getFullYear(), d.getMonth(), 1).toISOString();
 }
 
-// Ruta de salud: registrada muy pronto y ANTES de cualquier lógica pesada
-// de negocio, respondiendo tanto en /health como en /salud (el path que usa
-// el healthcheck de Coolify). No depende de la base de datos ni de la
-// siembra, así que responde 200 en cuanto Express empieza a escuchar.
 app.get(['/health', '/salud'], (req, res) => {
   res.json({ status: 'ok', message: 'Zoco IA conectado con éxito' });
 });
 
-// Compatibilidad DeepSeek-R1: si el modelo detrás del motor emite su
-// razonamiento en <think>...</think>, se elimina SIEMPRE antes de devolver la
-// respuesta a los clientes (Maris AI parsea código/JSON de estas respuestas y
-// el razonamiento lo contaminaría). Cubre bloques completos, aperturas sin
-// cierre (corte por tokens) y cierres huérfanos.
 function stripThink(text) {
   if (!text) return '';
   let out = String(text).replace(/<think>[\s\S]*?<\/think>/g, '');
@@ -662,12 +558,7 @@ async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temp
           max_tokens: maxTokens,
           temperature,
           ...(tools && tools.length ? { tools } : {}),
-          // tool_choice en formato OpenAI estándar (passthrough para clientes
-          // como Maris AI que piden tool calling explícito: 'auto'|'required').
           ...(tools && tools.length && toolChoice ? { tool_choice: toolChoice } : {}),
-          // 'options' es una extensión propia de Ollama (num_ctx, num_predict, etc.)
-          // sobre el endpoint compatible con OpenAI. Groq la ignora si se le llegara
-          // a enviar, así que solo se añade cuando se llama de verdad a Ollama.
           ...(extraOllamaOptions ? { options: extraOllamaOptions } : {}),
         }),
         signal: controller.signal,
@@ -684,10 +575,6 @@ async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temp
     }
   }
 
-  // FLUJO EXCLUSIVO OLLAMA — sin fallback a proveedores en la nube. Si Ollama
-  // tarda o falla, se hace UN reintento local (el primer intento puede fallar
-  // mientras el modelo se carga en memoria) y después se devuelve el error
-  // real: la petición nace y muere en el servidor local de Ollama.
   const endpoint = `${ollamaUrl.replace(/\/+$/, '')}/v1/chat/completions`;
   const MAX_ATTEMPTS = 2;
   let lastErr;
@@ -699,9 +586,8 @@ async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temp
       if (err.name === 'AbortError') {
         const e = new Error(`Timeout: el modelo local ${ollamaModel} tardó más de ${Math.round(OLLAMA_TIMEOUT_MS / 1000)}s en responder en Ollama`);
         e.status = 504;
-        throw e; // un timeout completo no se reintenta: ya esperó el máximo
+        throw e;
       }
-      // Errores de conexión/5xx transitorios: reintento único tras una pausa.
       const transient = !err.status || err.status >= 500;
       if (transient && attempt < MAX_ATTEMPTS - 1) {
         console.warn(`[Ollama] fallo transitorio (${err.message}) — reintentando...`);
@@ -717,18 +603,7 @@ async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temp
   throw lastErr;
 }
 
-/**
- * Lógica compartida de inferencia (créditos, agente, caché de prompts, tools,
- * Ollama/Groq). Extraída para que /v1/chat/completions y /api/chat la llamen
- * directamente en memoria — SIN hacer una petición HTTP de vuelta al propio
- * servidor (evitar eso es importante: un fetch a "http://localhost:PORT/..."
- * puede colgarse por resolución IPv4/IPv6 de "localhost" en algunos entornos
- * en algunos entornos de contenedores, dejando el chat "parado" sin motivo aparente).
- * Lanza errores con `.status` adjunto (mismo patrón que ya usaba esta ruta).
- */
 async function processChatCompletion(authSub, { agentId, messages, model, temperature: temperatureInput, max_tokens: maxTokensInput, sessionSkills, tools: requestTools, tool_choice: requestToolChoice, apiKeyId, apiKeyType }) {
-  // Motor exclusivo Ollama: no se exige ninguna API key en la nube. OLLAMA_URL
-  // siempre tiene valor (default http://127.0.0.1:11434).
   if (!OLLAMA_URL) {
     const e = new Error('OLLAMA_BASE_URL no configurada en el servidor'); e.status = 503; throw e;
   }
@@ -759,14 +634,7 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
 
     agenteData = agente.data ? JSON.parse(agente.data) : {};
 
-    // Agentes deterministas (DevOps/Testing/Reparación): no pasan por ningún
-    // modelo. Se ejecuta el código real y se devuelve ya empaquetado en el
-    // mismo formato { choices, usage, model } que espera el resto del flujo,
-    // para que Marisai no note la diferencia entre esto y una respuesta de IA.
     if (agenteData.tipo === 'deterministic') {
-      // GATE ENTERPRISE: los ejecutores deterministas (DevOps/Testing/Reparación
-      // con acceso a APIs de despliegue y análisis de código) son exclusivos de
-      // la cuenta propietaria.
       if (!isOwnerUser(db, authSub)) {
         const e = new Error(ENTERPRISE_REQUIRED_MESSAGE); e.status = 403; e.code = 'enterprise_required'; throw e;
       }
@@ -778,28 +646,17 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
     systemPromptText = agenteData.tipo === 'generic_prompted' && agenteData.templateId
       ? resolveTemplatePrompt({ db, templateId: agenteData.templateId, overrideVars: agenteData.templateVars })
       : (agenteData.systemPrompt || `Eres ${agente.name}, un asistente de IA útil y preciso.`);
-    // Regla de formato seguro DeepSeek-R1 en RUNTIME: cubre también a los
-    // agentes ya sembrados en producción antes de este cambio (la siembra es
-    // idempotente y no los pisa). Se añade solo si el prompt no la lleva ya.
     if (!String(systemPromptText).includes('DeepSeek-R1/OpenAI compatible endpoint')) {
       systemPromptText += DEEPSEEK_SAFE_FORMAT_RULE;
     }
-    // ENTORNOS: si el usuario tiene un entorno activo (dev/prod), su contexto
-    // operativo (nombre, tipo y variables no sensibles) viaja en el system
-    // prompt — como seleccionar el entorno activo en el panel de sesiones.
     systemPromptText += buildEnvironmentContext(db, authSub);
     mensajesParaGroq.push({ role: 'system', content: systemPromptText });
     mensajesParaGroq = mensajesParaGroq.concat(historial);
     if (userMessage) mensajesParaGroq.push({ role: 'user', content: String(userMessage.content) });
 
-    // Caché de prompts: si este mismo system prompt (por agente+usuario) se usó
-    // hace menos de PROMPT_CACHE_TTL_MS, no se vuelve a cobrar por esos tokens.
     cacheResult = checkAndUpdatePromptCache(authSub, agentId, systemPromptText);
   } else {
     mensajesParaGroq = Array.isArray(messages) ? messages : [{ role: 'user', content: 'Hola' }];
-    // ENTORNOS también en el chat sin agente: si hay entorno activo y la
-    // conversación no trae ya un system message, se antepone uno con el
-    // contexto operativo (sin secretos).
     const envCtx = buildEnvironmentContext(db, authSub);
     if (envCtx && !mensajesParaGroq.some(m => m.role === 'system')) {
       mensajesParaGroq = [{ role: 'system', content: `Eres Zoco IA, un asistente de IA útil y preciso.${envCtx}` }, ...mensajesParaGroq];
@@ -809,8 +666,6 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   }
 
   const lastUserMsg = mensajesParaGroq.filter(m => m.role === 'user').slice(-1)[0]?.content || '';
-  // Las habilidades activas de la sesión pueden forzar la búsqueda web aunque
-  // el heurístico de palabras clave no la detecte (activación dinámica por chat).
   const skillForcesWeb = !!(sessionSkills && sessionSkills.busquedaWeb);
   if (skillForcesWeb || needsWebSearch(lastUserMsg)) {
     const searchResults = await webSearch(lastUserMsg);
@@ -826,15 +681,9 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
     }
   }
 
-  // Motor exclusivo Ollama: el modelo comercial (zoco-*) o el id del agente se
-  // traduce SIEMPRE al modelo real creado en el servidor de Ollama. Si el
-  // agente/petición trae directamente un nombre de modelo de Ollama (p.ej.
-  // "deepseek-r1", "qwen2.5-coder"), se usa tal cual.
   const modeloFinal = OLLAMA_MODEL_MAP[modeloZocoia] || modeloZocoia;
   console.log(`[IA] ${modeloZocoia} → ${modeloFinal} via Ollama (${OLLAMA_URL})`);
 
-  // Parámetros avanzados de IA por agente (num_predict / num_ctx / temperature),
-  // con límites de seguridad y valores por defecto si el agente no los define.
   const clamp = (v, min, max, fallback) => {
     const n = Number(v);
     if (!Number.isFinite(n)) return fallback;
@@ -845,11 +694,8 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   const temperature = clamp(temperatureInput ?? agenteData.temperature, 0, 1.2, 0.7);
   const maxTokens = maxTokensInput || numPredict;
 
-  // options nativas de Ollama (num_predict, num_ctx) — viajan en cada llamada
   const ollamaOptions = { num_predict: numPredict, num_ctx: numCtx };
 
-  // Tools permitidas: las del agente (si hay agente) + las aportadas por las
-  // habilidades activas de la sesión (activación dinámica de la sesión).
   const skillTools = Array.isArray(sessionSkills?.allowedTools)
     ? sessionSkills.allowedTools.filter(t => ALL_TOOL_NAMES.includes(t))
     : [];
@@ -857,11 +703,6 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
     ? (Array.isArray(agenteData.allowedTools) ? agenteData.allowedTools : ALL_TOOL_NAMES)
     : [];
   let allowedTools = [...new Set([...agentTools, ...skillTools])];
-  // GATE ENTERPRISE: las herramientas del sistema (createFile, createFolder,
-  // executeCode, readFile… — la generación masiva de código del pipeline) son
-  // exclusivas de la cuenta propietaria. A los clientes básicos se les vacía
-  // la lista aunque intenten colárselas vía habilidades o agentes creados a
-  // mano — su chat sigue funcionando, pero sin ejecutar nada en el servidor.
   if (allowedTools.length > 0 && !isOwnerUser(db, authSub)) {
     allowedTools = [];
   }
@@ -882,12 +723,6 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   let usage;
   let clientToolCalls = null;
 
-  // TOOLS DEL CLIENTE (formato OpenAI estándar): cuando la petición trae sus
-  // propias tools (p.ej. el pipeline multi-agente de Maris AI hablando
-  // tools/tool_choice), se hace PASSTHROUGH — el modelo decide si llama a una
-  // herramienta y las tool_calls se devuelven al cliente tal cual, que es
-  // quien las ejecuta en su lado. No se mezclan con el bucle interno de
-  // habilidades para no ejecutar herramientas ajenas en este servidor.
   const clientTools = Array.isArray(requestTools) && requestTools.length > 0
     && requestTools.every(t => t && t.type === 'function' && t.function?.name)
     ? requestTools : null;
@@ -899,11 +734,6 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
     if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) clientToolCalls = msg.tool_calls;
     usage = data.usage || {};
   } else if (allowedTools.length > 0) {
-    // Se resuelve la clave de Tavily del propio usuario (guardada como
-    // credencial "TAVILY_API_KEY") justo antes de arrancar el tool loop:
-    // busqueda_web la necesita en `context.tavilyApiKey` para funcionar.
-    // Antes esto no se pasaba nunca, así que busqueda_web fallaba siempre
-    // con "no hay clave configurada" aunque el usuario sí tuviera una.
     const tavilyRow = db.prepare(
       "SELECT data FROM resources WHERE user_id = ? AND type IN ('credencial','habilidad') AND name = 'TAVILY_API_KEY'"
     ).get(authSub);
@@ -912,9 +742,6 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
       try { tavilyApiKey = JSON.parse(tavilyRow.data || '{}').valor || null; } catch {}
     }
 
-    // Igual que Tavily: E2B_API_KEY se guarda como credencial del propio
-    // usuario. La necesitan executeCode y controlarOrdenador para levantar
-    // sandboxes reales en la nube (ejecución de código + escritorio/navegador).
     const e2bRow = db.prepare(
       "SELECT data FROM resources WHERE user_id = ? AND type IN ('credencial','habilidad') AND name = 'E2B_API_KEY'"
     ).get(authSub);
@@ -948,9 +775,6 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
 
   const totalTokens = usage.total_tokens || 0;
 
-  // Contador de cuota mensual de las API Keys gratuitas — se hace aquí,
-  // en un único punto, para que aplique sin importar qué ruta llamó a
-  // processChatCompletion (/v1/messages, /api/chat, etc).
   if (apiKeyId && apiKeyType === 'gratuita') {
     const month = currentUsageMonth();
     const keyRow = db.prepare('SELECT monthly_tokens_used, usage_month FROM api_keys WHERE id = ?').get(apiKeyId);
@@ -964,10 +788,6 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   if (costeEuros > 0) {
     db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)')
       .run(uuidv4(), authSub, costeEuros, 'gasto', `Ollama ${modeloFinal}${cacheResult.hit ? ' (caché de prompt)' : ''}`);
-    // Ya no se fuerza el suelo en 0: se deja bajar hasta BALANCE_BLOCK_THRESHOLD
-    // (-0.83€ por defecto) para replicar el comportamiento real de la consola.
-    // La siguiente petición quedará bloqueada por el check de arriba en cuanto
-    // el saldo cruce ese umbral; esta línea solo actualiza el número.
     db.prepare('UPDATE users SET creditos = creditos - ? WHERE id = ?')
       .run(costeEuros, authSub);
   }
@@ -977,8 +797,6 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
       message: {
         role: 'assistant',
         content: respuesta,
-        // tool_calls en formato OpenAI estándar cuando el cliente trajo tools
-        // propias y el modelo decidió llamar a una (passthrough completo).
         ...(clientToolCalls ? { tool_calls: clientToolCalls } : {}),
       },
       finish_reason: clientToolCalls ? 'tool_calls' : 'stop',
@@ -988,7 +806,6 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
       output_tokens: usage.completion_tokens || 0,
       total_tokens: totalTokens,
       cache_read_tokens: cacheResult.hit ? cacheResult.cachedTokens : 0,
-      // Alias en formato OpenAI para clientes que leen prompt/completion_tokens.
       prompt_tokens: usage.prompt_tokens || 0,
       completion_tokens: usage.completion_tokens || 0,
     },
@@ -1011,11 +828,6 @@ app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
   }
 });
 
-// Adaptador para el Dashboard: el frontend llama a POST /api/chat con
-// { message, agentId, model, history } y espera { response }. Reutiliza
-// processChatCompletion() directamente (llamada de función, no de red), así
-// que toda la lógica de créditos/memoria/Ollama-Groq sigue siendo una única
-// fuente de verdad y no hay ningún salto de red que se pueda quedar colgado.
 app.post('/api/chat', authMiddleware, async (req, res) => {
   try {
     const { message, agentId, model, history } = req.body || {};
@@ -1119,10 +931,6 @@ app.post('/auth/register', (req, res) => {
     db.prepare(
     'INSERT INTO users (id, email, password_hash, nombre, is_admin, is_support, creditos, activo) VALUES (?, ?, ?, ?, 0, 0, 0, 1)'
   ).run(id, emailLower, passwordHash, nombre.trim());
-  // SEGMENTACIÓN COMERCIAL: todo cliente nuevo (que no sea el propietario)
-  // recibe automáticamente su biblioteca de Agentes Básicos (Asistente
-  // General, Traductor Multilingüe, Analista de Datos Básico). La siembra
-  // es idempotente y nunca rompe el registro si algo falla.
   seedBasicAgentsForUser(db, id);
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
   const token = signToken(user);
@@ -1227,7 +1035,6 @@ app.get('/api/keys', authMiddleware, (req, res) => {
     revoked: !!r.revoked,
     createdAt: r.created_at,
     type: r.key_type || 'pago',
-    // Uso del mes en curso (si el contador es de un mes anterior, ya "no cuenta").
     monthlyTokensUsed: r.usage_month === month ? (r.monthly_tokens_used || 0) : 0,
     monthlyTokenLimit: r.key_type === 'gratuita' ? FREE_KEY_MONTHLY_TOKEN_LIMIT : null,
   })));
@@ -1265,7 +1072,6 @@ app.delete('/api/keys/:id', authMiddleware, (req, res) => {
   res.json({ ok: true });
 });
 
-// Renombrar una API key (el Dashboard llama a PUT /api/keys/:id al editar).
 app.put('/api/keys/:id', authMiddleware, (req, res) => {
   const key = db.prepare('SELECT * FROM api_keys WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
   if (!key) return res.status(404).json({ error: 'Clave no encontrada' });
@@ -1275,9 +1081,6 @@ app.put('/api/keys/:id', authMiddleware, (req, res) => {
   res.json({ ok: true, id: key.id, name: name.trim() });
 });
 
-// Alias de memoria que usa el Dashboard: /api/resources/:id/memory → misma
-// lógica que /api/agentes/:id/memoria (GET) y su DELETE. Se añaden para que
-// el botón "🧠 Memoria" de las tarjetas de agentes funcione de verdad.
 app.get('/api/resources/:id/memory', authMiddleware, (req, res) => {
   const agente = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?').get(req.params.id, req.auth.sub, 'agente');
   if (!agente) return res.status(404).json({ error: 'Agente no encontrado' });
@@ -1316,9 +1119,6 @@ app.post('/api/resources', authMiddleware, (req, res) => {
   const { type, name, data } = req.body || {};
   if (!RESOURCE_TYPES.includes(type)) return res.status(400).json({ error: 'Tipo de recurso no válido' });
   if (!name || !name.trim()) return res.status(400).json({ error: 'El nombre es obligatorio' });
-  // GATE ENTERPRISE (anti-clonación): los clientes básicos no pueden crear
-  // agentes con capacidades del pipeline avanzado — ejecutores deterministas
-  // (vercel_api, sandbox…) ni herramientas del sistema.
   if (type === 'agente' && !isOwnerUser(db, req.auth.sub)) {
     const d = data || {};
     const pideAvanzado = d.tipo === 'deterministic' || d.executorType
@@ -1340,8 +1140,6 @@ app.put('/api/resources/:id', authMiddleware, (req, res) => {
   const row = db.prepare('SELECT * FROM resources WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
   if (!row) return res.status(404).json({ error: 'Recurso no encontrado' });
   const { name, data } = req.body || {};
-  // GATE ENTERPRISE (anti-escalada): tampoco por edición se puede convertir
-  // un agente básico en uno avanzado (executor determinista o tools del sistema).
   if (row.type === 'agente' && data !== undefined && !isOwnerUser(db, req.auth.sub)) {
     const d = data || {};
     const pideAvanzado = d.tipo === 'deterministic' || d.executorType
@@ -1565,7 +1363,6 @@ app.get('/api/payments/success', authMiddleware, (req, res) => {
 });
 
 app.get('/api/system/ollama', authMiddleware, async (req, res) => {
-  // Usa la misma URL unificada del motor (OLLAMA_BASE_URL / OLLAMA_URL).
   const ollamaUrl = OLLAMA_URL;
   try {
     const resp = await fetch(`${ollamaUrl}/api/tags`, { signal: AbortSignal.timeout(3000) });
@@ -1588,7 +1385,6 @@ app.get('/admin/stats', authMiddleware, requireAdmin, (req, res) => {
     ORDER BY p.created_at DESC LIMIT 50
   `).all();
   const vivaConfigurado = !!(process.env.VIVA_CLIENT_ID && process.env.VIVA_CLIENT_SECRET);
-  // Motor exclusivo Ollama: siempre configurado (default 127.0.0.1:11434).
   const ollamaOnline = !!OLLAMA_URL;
 
   res.json({ totalUsuarios, usuariosActivos, ingresosTotal, llamadasHoy, ultimosPagos, vivaConfigurado, ollamaOnline });
@@ -1625,27 +1421,12 @@ app.put('/admin/clientes/:id', authMiddleware, requireAdmin, (req, res) => {
   res.json(publicUser(updated));
 });
 
-// Rutas admin del puente Marisai (import de prompts As-Is, gestión de
-// templates maestros, config de executors deterministas). Todas viven bajo
-// /admin/bridge/* y reutilizan authMiddleware + requireAdmin ya existentes.
 registerBridgeAdminRoutes({ app, db, authMiddleware, requireAdmin, uuidv4 });
 
-// ── Sesiones persistentes + Archivos + Credenciales Zoco IA ────────────────
-// Conversaciones persistentes en servidor con adjuntos de archivos de
-// contexto y habilidades activables por chat, más el Almacén de credenciales
-// que valida y guarda cifrada la API Key de Zoco IA para los agentes.
 registerSessionRoutes({ app, db, authMiddleware, uuidv4, serverSecret: JWT_SECRET, processChatCompletion });
-// Consola de gestión: Lotes (cola contra Ollama), Implementaciones
-// (Vercel), Entornos (variables aplicadas al chat) y búsqueda en
-// los Almacenes de memoria.
 registerConsoleRoutes({ app, db, authMiddleware, uuidv4, processChatCompletion });
 resumeInterruptedBatches(db, processChatCompletion);
 
-// ── Endpoint compatible con formato de mensajes (Messages API) ────────────
-// Permite que Marisai (u otro cliente que use este formato de mensajes)
-// apunte su baseURL a Zoco IA sin cambiar su código, solo la apiKey y la URL.
-// Traduce el payload {system, messages, max_tokens, ...} y reutiliza
-// processChatCompletion() tal cual — cero lógica de créditos/agentes duplicada.
 app.post('/v1/messages', authMiddleware, async (req, res) => {
   try {
     const { system, messages, max_tokens, temperature, model, metadata, stream } = req.body || {};
@@ -1682,11 +1463,6 @@ app.post('/v1/messages', authMiddleware, async (req, res) => {
       });
     }
 
-    // Streaming SSE: como processChatCompletion ya devuelve el texto completo
-    // (no hace streaming token a token desde Ollama/Groq en este backend),
-    // se emite como un único content_block_delta — mantiene el contrato SSE
-    // estándar para clientes que esperan estos eventos, sin reescribir
-    // callChatModel para streaming real (eso sí tocaría la base existente).
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
@@ -1710,8 +1486,6 @@ app.post('/v1/messages', authMiddleware, async (req, res) => {
 });
 
 async function resolveAgentIdBySlug(slug, userId) {
-  // metadata.agent_slug puede venir como el id real del recurso o como un
-  // alias legible; se busca primero por id exacto y si no, por nombre.
   const porId = db.prepare("SELECT id FROM resources WHERE id = ? AND user_id = ? AND type = 'agente'").get(slug, userId);
   if (porId) return porId.id;
   const porNombre = db.prepare("SELECT id FROM resources WHERE user_id = ? AND type = 'agente' AND name = ?").get(userId, slug);
