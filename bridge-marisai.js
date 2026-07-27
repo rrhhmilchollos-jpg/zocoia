@@ -1,4 +1,4 @@
-// bridge-marisai.js
+bridge-marisai.js
 // -----------------------------------------------------------------------------
 // Puente entre el gateway de chat (server.js) y un sandbox Docker REAL,
 // usando Dockerode. Sustituye la version "CLI-only" de agent.js por un
