@@ -1,34 +1,17 @@
-bridge-marisai.js
+// bridge-marisai.js
 // -----------------------------------------------------------------------------
-// Puente entre el gateway de chat (server.js) y un sandbox Docker REAL,
-// usando Dockerode. Sustituye la version "CLI-only" de agent.js por un
-// bucle agentico que se puede invocar desde una peticion HTTP/WS normal.
+// Puente entre el gateway de chat (server.js) y dos cosas distintas:
 //
-// Diseño:
-//  - Un contenedor Docker POR SESION DE USUARIO (no por comando), para que
-//    los comandos compartan estado (ficheros, paquetes instalados) durante
-//    la tarea, igual que Manus/Claude Code.
-//  - El contenedor se destruye al terminar la tarea o al expirar un TTL de
-//    inactividad (evita contenedores zombie acumulandose en el host).
-//  - Limites duros de memoria/CPU/pids, usuario no root, filesystem con
-//    tamano limitado (tmpfs), y timeout por comando.
-//  - Red: OFF por defecto. Si una tarea necesita instalar paquetes, se activa
-//    una red dedicada con egress restringido (ver SANDBOX_NETWORK abajo) en
-//    lugar de dar acceso abierto a internet. Esto es lo mas importante que
-//    NO debes saltarte: bash arbitrario + red abierta == tu servidor puede
-//    acabar siendo usado como proxy de salida por cualquier cosa que el
-//    modelo (o un usuario malicioso via prompt injection) le pida ejecutar.
+//   1. Un sandbox Docker REAL (Dockerode) para tareas agenticas de ejecucion
+//      de comandos — runAgenticTask() / shutdownAllSandboxes().
+//   2. Las piezas que server.js necesita para los agentes "generic_prompted"
+//      y "deterministic": plantillas maestras de prompt, ejecutores sin LLM,
+//      y las rutas admin del puente con Marisai (import de prompts As-Is).
 //
-// Uso esperado desde server.js / zoco-sessions.js:
-//
-//   import { runAgenticTask } from './bridge-marisai.js';
-//   await runAgenticTask({
-//     userId, sessionId, task: userMessage,
-//     model: 'zoco-max',
-//     gatewayUrl: 'http://localhost:4000/v1',
-//     gatewayApiKey: process.env.GATEWAY_API_KEY,
-//     emit: (sessionId, payload) => wsHub.broadcast(sessionId, payload),
-//   });
+// Este archivo se sobrescribio en un commit anterior solo con la parte (1)
+// (el sandbox Docker), perdiendo la parte (2) que server.js sigue
+// importando y usando (ensureBridgeTables/resolveTemplatePrompt/
+// runDeterministicAgent/registerBridgeAdminRoutes). Aqui se fusionan ambas.
 // -----------------------------------------------------------------------------
 
 import Docker from 'dockerode';
@@ -37,7 +20,7 @@ import { randomUUID } from 'crypto';
 
 const docker = new Docker(); // usa /var/run/docker.sock por defecto
 
-// ─── Configuracion ───────────────────────────────────────────────────────────
+// ─── Configuracion sandbox ──────────────────────────────────────────────────
 
 const MAX_ITERATIONS = parseInt(process.env.AGENT_MAX_ITERATIONS || '8', 10);
 const COMMAND_TIMEOUT_MS = parseInt(process.env.AGENT_COMMAND_TIMEOUT_MS || '60000', 10);
@@ -252,7 +235,7 @@ async function askModelViaGateway({ gatewayUrl, gatewayApiKey, model, messages }
   return content;
 }
 
-// ─── Bucle agentico principal ───────────────────────────────────────────────
+// ─── Bucle agentico principal (sandbox Docker) ──────────────────────────────
 
 /**
  * Ejecuta una tarea de agente completa: llama al modelo, si pide ejecutar
@@ -346,8 +329,6 @@ export async function runAgenticTask({
   return { success: false, error: `Limite de ${MAX_ITERATIONS} iteraciones alcanzado sin respuesta final.` };
 }
 
-// ─── Limpieza al cerrar el proceso ──────────────────────────────────────────
-
 export async function shutdownAllSandboxes() {
   const ids = [...activeSessions.keys()];
   await Promise.allSettled(ids.map((id) => destroySandbox(id)));
@@ -355,3 +336,257 @@ export async function shutdownAllSandboxes() {
 
 process.on('SIGTERM', shutdownAllSandboxes);
 process.on('SIGINT', shutdownAllSandboxes);
+
+// =============================================================================
+// ─── PARTE 2: puente de plantillas + agentes deterministas + rutas admin ───
+// (Esto es lo que faltaba y server.js sigue importando/usando)
+// =============================================================================
+
+function safeParseJSON(text, fallback = {}) {
+  try { return JSON.parse(text || '{}'); } catch { return fallback; }
+}
+
+function getUserCredential(db, userId, name) {
+  const row = db.prepare(
+    "SELECT data FROM resources WHERE user_id = ? AND type IN ('credencial','habilidad') AND name = ?"
+  ).get(userId, name);
+  if (!row) return null;
+  try { return JSON.parse(row.data || '{}').valor || null; } catch { return null; }
+}
+
+// ─── Plantillas maestras por defecto ────────────────────────────────────────
+// Placeholders con la sintaxis {{variable}}. Editables en caliente desde
+// /admin/bridge/templates sin necesidad de tocar código ni redeploy — estos
+// valores solo se usan como fallback si la plantilla no existe aún en la BD.
+const DEFAULT_MASTER_TEMPLATES = {
+  tpl_frontend_master: `Eres el Agente de Interfaz (Frontend) de Zoco IA. Implementas componentes de
+frontend en {{framework}} con {{styling}}, priorizando accesibilidad, código
+limpio y componentes reutilizables. Sigues las convenciones del proyecto
+existente en vez de imponer las tuyas. Cuando generes código, entrégalo
+completo y funcional, nunca fragmentos a medias.`,
+  tpl_database_master: `Eres el Agente de Base de Datos de Zoco IA. Diseñas esquemas para
+{{motor}}, escribes migraciones seguras (nunca destructivas sin
+confirmación explícita), consultas eficientes con índices apropiados, y
+explicas el razonamiento detrás de cada decisión de modelado de datos.`,
+};
+
+// ─── ensureBridgeTables ─────────────────────────────────────────────────────
+// Crea (si no existen) las tablas propias del puente: plantillas maestras
+// y el log de imports As-Is desde Marisai. Idempotente — segura de llamar
+// en cada arranque o en cada request a las rutas admin.
+export function ensureBridgeTables(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS prompt_templates (
+      template_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      prompt_text TEXT NOT NULL,
+      default_vars TEXT DEFAULT '{}',
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS bridge_imports_log (
+      id TEXT PRIMARY KEY,
+      agente_id TEXT NOT NULL,
+      admin_user_id TEXT NOT NULL,
+      source TEXT DEFAULT 'marisai',
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+}
+
+// ─── resolveTemplatePrompt ───────────────────────────────────────────────────
+// Usado por server.js cuando agenteData.tipo === 'generic_prompted': resuelve
+// el prompt final sustituyendo {{variable}} por overrideVars (o los valores
+// por defecto guardados junto a la plantilla). Si la plantilla no existe ni
+// en BD ni en los defaults hardcodeados, degrada a un prompt genérico en vez
+// de lanzar una excepción (para no tumbar el chat por un templateId mal escrito).
+export function resolveTemplatePrompt({ db, templateId, overrideVars }) {
+  ensureBridgeTables(db);
+  const row = db.prepare('SELECT * FROM prompt_templates WHERE template_id = ?').get(templateId);
+  const baseTemplate = row ? row.prompt_text : (DEFAULT_MASTER_TEMPLATES[templateId] || null);
+
+  if (!baseTemplate) {
+    return `Eres un agente de Zoco IA (la plantilla "${templateId}" no está configurada todavía). Ayuda de forma útil y precisa.`;
+  }
+
+  const vars = { ...(row ? safeParseJSON(row.default_vars) : {}), ...(overrideVars || {}) };
+  return baseTemplate.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (match, key) =>
+    Object.prototype.hasOwnProperty.call(vars, key) ? String(vars[key]) : match
+  );
+}
+
+// ─── Ejecutores deterministas (sin LLM) ─────────────────────────────────────
+
+async function runVercelDevOpsExecutor(db, userId, userText) {
+  const token = getUserCredential(db, userId, 'VERCEL_TOKEN') || process.env.VERCEL_TOKEN;
+  if (!token) {
+    return 'El Agente DevOps necesita una credencial "VERCEL_TOKEN" configurada en el Almacén de credenciales para poder consultar/gestionar despliegues en Vercel. Añádela desde el panel y vuelve a intentarlo.';
+  }
+  try {
+    const resp = await fetch('https://api.vercel.com/v6/deployments?limit=5', {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      return `Vercel respondió con un error (${resp.status}): ${err.error?.message || 'sin detalles'}.`;
+    }
+    const data = await resp.json();
+    const deployments = data.deployments || [];
+    if (deployments.length === 0) return 'No se encontraron despliegues recientes en la cuenta de Vercel conectada.';
+    const resumen = deployments
+      .map(d => `• ${d.name} — estado: ${d.state || d.readyState} — ${new Date(d.created).toLocaleString('es-ES')}`)
+      .join('\n');
+    return `Últimos despliegues en Vercel:\n${resumen}`;
+  } catch (err) {
+    return `No se pudo contactar con la API de Vercel: ${err.message}`;
+  }
+}
+
+function runStaticCodeAnalysisExecutor(userText) {
+  const problemas = [];
+  if (/console\.log\(/.test(userText)) problemas.push('Se detectaron llamadas a console.log — revisa si deben quitarse antes de producción.');
+  if (/\bTODO\b|\bFIXME\b/.test(userText)) problemas.push('Hay marcadores TODO/FIXME pendientes en el código.');
+  if (/\bvar\s+/.test(userText)) problemas.push('Uso de "var" — se recomienda "const"/"let" en código moderno.');
+  if (/catch\s*\(\s*\)\s*{\s*}/.test(userText)) problemas.push('Hay bloques catch vacíos que silencian errores sin registrarlos.');
+  if (/await\s+[^;]+;(?![^{]*catch)/.test(userText) && !/try\s*{/.test(userText)) {
+    problemas.push('Hay `await` sin un bloque try/catch visible alrededor — posible error no controlado.');
+  }
+  if (problemas.length === 0) {
+    return 'Análisis estático básico: no se detectaron patrones problemáticos comunes en el fragmento proporcionado.';
+  }
+  return `Análisis estático — hallazgos:\n${problemas.map(p => `• ${p}`).join('\n')}`;
+}
+
+async function runSandboxRepairExecutor({ userId, agenteId, userText }) {
+  const gatewayUrl = process.env.GATEWAY_URL;
+  const gatewayApiKey = process.env.GATEWAY_API_KEY;
+  if (!gatewayUrl || !gatewayApiKey) {
+    return 'El Agente de Reparación necesita GATEWAY_URL y GATEWAY_API_KEY configurados en el servidor para poder ejecutar comandos reales en el sandbox. Configúralos y vuelve a intentarlo.';
+  }
+  try {
+    const result = await runAgenticTask({
+      userId,
+      sessionId: `repair-${agenteId}-${userId}`,
+      task: userText,
+      model: 'zoco-max',
+      gatewayUrl,
+      gatewayApiKey,
+    });
+    if (!result.success) return `La reparación automática no pudo completarse: ${result.error}`;
+    return result.output || 'Reparación completada sin salida de texto adicional.';
+  } catch (err) {
+    return `Error ejecutando la reparación en el sandbox: ${err.message}`;
+  }
+}
+
+// ─── runDeterministicAgent ───────────────────────────────────────────────────
+// Usado por server.js cuando agenteData.tipo === 'deterministic'. Empaqueta
+// la respuesta en el mismo formato { choices, usage, model } que devuelve
+// processChatCompletion() para una llamada normal a un LLM, para que el
+// resto del flujo (memoria, facturación, /v1/messages, etc.) no note la
+// diferencia.
+export async function runDeterministicAgent({ db, uuidv4, userId, agente, agenteData, userMessage }) {
+  const executorType = agenteData.executorType;
+  const userText = userMessage?.content ? String(userMessage.content) : '';
+
+  let responseText;
+  switch (executorType) {
+    case 'vercel_api':
+      responseText = await runVercelDevOpsExecutor(db, userId, userText);
+      break;
+    case 'static_code_analysis':
+      responseText = runStaticCodeAnalysisExecutor(userText);
+      break;
+    case 'sandbox_repair':
+      responseText = await runSandboxRepairExecutor({ userId, agenteId: agente.id, userText });
+      break;
+    default:
+      responseText = `El agente "${agente.name}" está marcado como determinista pero no tiene un executorType reconocido ("${executorType}"). Contacta con soporte.`;
+  }
+
+  return {
+    choices: [{
+      message: { role: 'assistant', content: responseText },
+      finish_reason: 'stop',
+    }],
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 0,
+      prompt_tokens: 0,
+      completion_tokens: 0,
+    },
+    model: `determinista:${executorType || 'desconocido'}`,
+  };
+}
+
+// ─── registerBridgeAdminRoutes ───────────────────────────────────────────────
+// Rutas admin del puente con Marisai, todas bajo /admin/bridge/* + la ruta
+// de import As-Is bajo /admin/agentes/:id/import-marisai. Reutilizan
+// authMiddleware + requireAdmin ya existentes en server.js.
+export function registerBridgeAdminRoutes({ app, db, authMiddleware, requireAdmin, uuidv4 }) {
+  ensureBridgeTables(db);
+
+  // Listar plantillas maestras configuradas
+  app.get('/admin/bridge/templates', authMiddleware, requireAdmin, (req, res) => {
+    const rows = db.prepare('SELECT * FROM prompt_templates ORDER BY updated_at DESC').all();
+    res.json(rows.map(r => ({
+      templateId: r.template_id,
+      name: r.name,
+      promptText: r.prompt_text,
+      defaultVars: safeParseJSON(r.default_vars),
+      updatedAt: r.updated_at,
+    })));
+  });
+
+  // Crear o actualizar una plantilla maestra (tpl_frontend_master, tpl_database_master, o una nueva)
+  app.put('/admin/bridge/templates/:templateId', authMiddleware, requireAdmin, (req, res) => {
+    const { name, promptText, defaultVars } = req.body || {};
+    if (!name || !promptText) return res.status(400).json({ error: 'name y promptText son obligatorios' });
+    const templateId = req.params.templateId;
+
+    const existing = db.prepare('SELECT template_id FROM prompt_templates WHERE template_id = ?').get(templateId);
+    if (existing) {
+      db.prepare('UPDATE prompt_templates SET name = ?, prompt_text = ?, default_vars = ?, updated_at = CURRENT_TIMESTAMP WHERE template_id = ?')
+        .run(name, promptText, JSON.stringify(defaultVars || {}), templateId);
+    } else {
+      db.prepare('INSERT INTO prompt_templates (template_id, name, prompt_text, default_vars) VALUES (?, ?, ?, ?)')
+        .run(templateId, name, promptText, JSON.stringify(defaultVars || {}));
+    }
+    res.json({ ok: true, templateId });
+  });
+
+  app.delete('/admin/bridge/templates/:templateId', authMiddleware, requireAdmin, (req, res) => {
+    db.prepare('DELETE FROM prompt_templates WHERE template_id = ?').run(req.params.templateId);
+    res.json({ ok: true });
+  });
+
+  // Import As-Is de un prompt migrado de Marisai: sobrescribe directamente
+  // el systemPrompt del agente indicado (agentes tipo 'prompted'), sin pasar
+  // por ninguna plantilla — para los 6 agentes con prompt dedicado.
+  app.post('/admin/agentes/:id/import-marisai', authMiddleware, requireAdmin, (req, res) => {
+    const { systemPrompt } = req.body || {};
+    if (!systemPrompt || !String(systemPrompt).trim()) {
+      return res.status(400).json({ error: 'systemPrompt es obligatorio' });
+    }
+    const row = db.prepare("SELECT * FROM resources WHERE id = ? AND type = 'agente'").get(req.params.id);
+    if (!row) return res.status(404).json({ error: 'Agente no encontrado' });
+
+    const data = row.data ? JSON.parse(row.data) : {};
+    data.systemPrompt = String(systemPrompt);
+    db.prepare('UPDATE resources SET data = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      .run(JSON.stringify(data), row.id);
+
+    db.prepare('INSERT INTO bridge_imports_log (id, agente_id, admin_user_id, source) VALUES (?, ?, ?, ?)')
+      .run(uuidv4(), row.id, req.auth.sub, 'marisai');
+
+    res.json({ ok: true });
+  });
+
+  app.get('/admin/bridge/imports-log', authMiddleware, requireAdmin, (req, res) => {
+    const rows = db.prepare('SELECT * FROM bridge_imports_log ORDER BY created_at DESC LIMIT 100').all();
+    res.json(rows);
+  });
+}
