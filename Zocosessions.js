@@ -1,249 +1,419 @@
 // zoco-sessions.js
-// -----------------------------------------------------------------------------
-// Archivo que faltaba en el repo pero que server.js ya importa y usa:
-//   import { registerSessionRoutes, validateZocoApiKey } from './zoco-sessions.js';
+// Zoco IA — Validación de API Keys + rutas de Sesiones / Archivos / Credenciales
 //
-// validateZocoApiKey() es la pieza CRÍTICA: sin ella, cualquier petición
-// autenticada con una API Key "sk-zoco-..." (incluido Maris AI apuntando a
-// esta base URL) falla en authMiddleware. Su contrato se dedujo 100% de cómo
-// la usa server.js:
-//
-//   const check = validateZocoApiKey(db, token);
-//   if (!check.valid) ... `API Key inválida: ${check.reason}`
-//   const keyRow = db.prepare('... FROM api_keys WHERE id = ?').get(check.keyId);
-//   const owner  = db.prepare('... FROM users WHERE id = ?').get(check.ownerId);
-//
-// registerSessionRoutes() no tiene ningún consumidor confirmado en el
-// frontend (no encontré llamadas a /api/sessions/* desde el Dashboard), así
-// que su forma exacta es una propuesta razonable siguiendo el resto del
-// patrón del repo (resources, agent_memory, etc.), no una migración 1:1 de
-// nada existente. Revisa las rutas y ajusta nombres/payloads si tu frontend
-// espera algo distinto.
-// -----------------------------------------------------------------------------
+// Este módulo NO crea tablas nuevas: reutiliza la tabla `resources` que ya
+// existe en server.js (con type IN ('sesion','archivo','credencial', ...)).
+// Así evitamos migraciones duplicadas y mantenemos un único lugar de verdad
+// para el esquema de la base de datos (server.js).
 
 import crypto from 'crypto';
 
-// ─── Validación de API Keys de Zoco IA (sk-zoco-...) ────────────────────────
-// Misma lógica de hash que /api/keys en server.js: la clave completa nunca
-// se guarda en claro, solo su sha256. Se compara ese hash contra key_hash.
+// ---------------------------------------------------------------------------
+// 1) validateZocoApiKey — CRÍTICO: si esto falla, se cae todo el login por
+//    API key en authMiddleware (server.js línea ~471). Contrato exacto:
+//
+//    validateZocoApiKey(db, token) -> { valid, reason, keyId, ownerId }
+//
+//    Se llama únicamente cuando token.startsWith('sk-zoco-'), pero esta
+//    función es defensiva por sí misma de todas formas.
+// ---------------------------------------------------------------------------
+
 export function validateZocoApiKey(db, token) {
   if (!token || typeof token !== 'string' || !token.startsWith('sk-zoco-')) {
-    return { valid: false, reason: 'formato de clave no reconocido' };
+    return { valid: false, reason: 'Formato de clave no reconocido', keyId: null, ownerId: null };
   }
 
+  // Las claves se generan como `sk-zoco-${crypto.randomBytes(24).toString('hex')}`
+  // y se guardan hasheadas con sha256 en api_keys.key_hash (ver /api/keys POST
+  // en server.js). Nunca se guarda ni se compara la clave en claro.
   const keyHash = crypto.createHash('sha256').update(token).digest('hex');
-  const row = db.prepare('SELECT id, user_id, revoked FROM api_keys WHERE key_hash = ?').get(keyHash);
 
-  if (!row) return { valid: false, reason: 'clave no encontrada' };
-  if (row.revoked) return { valid: false, reason: 'clave revocada' };
+  let row;
+  try {
+    row = db
+      .prepare('SELECT id, user_id, revoked FROM api_keys WHERE key_hash = ?')
+      .get(keyHash);
+  } catch (err) {
+    console.error('[validateZocoApiKey] Error consultando api_keys:', err);
+    return { valid: false, reason: 'Error interno validando la clave', keyId: null, ownerId: null };
+  }
 
-  return { valid: true, keyId: row.id, ownerId: row.user_id };
+  if (!row) {
+    return { valid: false, reason: 'Clave no encontrada', keyId: null, ownerId: null };
+  }
+
+  if (row.revoked) {
+    return { valid: false, reason: 'Clave revocada', keyId: row.id, ownerId: row.user_id };
+  }
+
+  return { valid: true, reason: null, keyId: row.id, ownerId: row.user_id };
 }
 
-// ─── Tablas propias de sesiones persistentes + archivos adjuntos ───────────
-function ensureSessionTables(db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS chat_sessions (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      name TEXT NOT NULL DEFAULT 'Nueva sesión',
-      agent_id TEXT,
-      skills TEXT DEFAULT '{}',
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (user_id) REFERENCES users(id)
-    );
+// ---------------------------------------------------------------------------
+// 2) registerSessionRoutes — Sesiones (chat con memoria ligera, sin necesidad
+//    de crear un "agente" completo) + Archivos + Credenciales.
+//
+//    Diseño: todo vive en la tabla `resources` ya existente:
+//      - type = 'sesion'     -> data = { model, messages: [{role, content, ts}] }
+//      - type = 'archivo'    -> data = { mimeType, size, content (base64 o texto) }
+//      - type = 'credencial' -> data = { valor }  (el valor NUNCA se devuelve
+//                                en listados; solo al crearla)
+//
+//    Esto es una superficie razonable y documentada — ajusta rutas/payloads
+//    si el frontend real espera algo distinto; no hay consumidor confirmado.
+// ---------------------------------------------------------------------------
 
-    CREATE TABLE IF NOT EXISTS session_messages (
-      id TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL,
-      role TEXT NOT NULL,
-      content TEXT NOT NULL,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (session_id) REFERENCES chat_sessions(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS session_files (
-      id TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL,
-      filename TEXT NOT NULL,
-      content TEXT NOT NULL,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (session_id) REFERENCES chat_sessions(id)
-    );
-  `);
-}
-
-function safeParseJSON(text, fallback = {}) {
-  try { return JSON.parse(text || '{}'); } catch { return fallback; }
-}
-
-function publicSession(row) {
-  return {
-    id: row.id,
-    name: row.name,
-    agentId: row.agent_id || null,
-    skills: safeParseJSON(row.skills),
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
-}
-
-// ─── Rutas: Sesiones persistentes + Archivos + Credenciales ────────────────
 export function registerSessionRoutes({ app, db, authMiddleware, uuidv4, serverSecret, processChatCompletion }) {
-  ensureSessionTables(db);
+  const getResourceOr404 = (id, userId, type, res) => {
+    const row = db
+      .prepare('SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = ?')
+      .get(id, userId, type);
+    if (!row) {
+      res.status(404).json({ error: `${type} no encontrado` });
+      return null;
+    }
+    return row;
+  };
 
-  // — Sesiones —
+  const parseData = (row) => {
+    try {
+      return JSON.parse(row.data || '{}');
+    } catch {
+      return {};
+    }
+  };
+
+  // -------------------------------------------------------------------
+  // SESIONES — chats ligeros con historial, sin crear un "agente" formal
+  // -------------------------------------------------------------------
+
+  // Listar sesiones del usuario (sin el historial completo, solo metadata)
   app.get('/api/sessions', authMiddleware, (req, res) => {
-    const rows = db.prepare('SELECT * FROM chat_sessions WHERE user_id = ? ORDER BY updated_at DESC').all(req.auth.sub);
-    res.json(rows.map(publicSession));
+    const rows = db
+      .prepare("SELECT * FROM resources WHERE user_id = ? AND type = 'sesion' ORDER BY updated_at DESC")
+      .all(req.auth.sub);
+
+    res.json(
+      rows.map((r) => {
+        const data = parseData(r);
+        return {
+          id: r.id,
+          name: r.name,
+          model: data.model || null,
+          messageCount: Array.isArray(data.messages) ? data.messages.length : 0,
+          createdAt: r.created_at,
+          updatedAt: r.updated_at,
+        };
+      })
+    );
   });
 
+  // Crear sesión nueva
   app.post('/api/sessions', authMiddleware, (req, res) => {
-    const { name, agentId, skills } = req.body || {};
+    const { name, model } = req.body || {};
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: 'El nombre de la sesión es obligatorio' });
+    }
+
     const id = uuidv4();
-    db.prepare('INSERT INTO chat_sessions (id, user_id, name, agent_id, skills) VALUES (?, ?, ?, ?, ?)')
-      .run(id, req.auth.sub, (name && name.trim()) || 'Nueva sesión', agentId || null, JSON.stringify(skills || {}));
-    const row = db.prepare('SELECT * FROM chat_sessions WHERE id = ?').get(id);
-    res.status(201).json(publicSession(row));
+    const data = { model: model || null, messages: [] };
+    db.prepare('INSERT INTO resources (id, user_id, type, name, data) VALUES (?, ?, ?, ?, ?)').run(
+      id,
+      req.auth.sub,
+      'sesion',
+      name.trim(),
+      JSON.stringify(data)
+    );
+
+    const row = db.prepare('SELECT * FROM resources WHERE id = ?').get(id);
+    res.status(201).json({ id: row.id, name: row.name, model: data.model, messages: [], createdAt: row.created_at });
   });
 
+  // Obtener una sesión con su historial completo
   app.get('/api/sessions/:id', authMiddleware, (req, res) => {
-    const session = db.prepare('SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
-    if (!session) return res.status(404).json({ error: 'Sesión no encontrada' });
-
-    const mensajes = db.prepare('SELECT id, role, content, created_at FROM session_messages WHERE session_id = ? ORDER BY created_at ASC').all(session.id);
-    const archivos = db.prepare('SELECT id, filename, created_at FROM session_files WHERE session_id = ? ORDER BY created_at ASC').all(session.id);
-
-    res.json({ ...publicSession(session), mensajes, archivos });
+    const row = getResourceOr404(req.params.id, req.auth.sub, 'sesion', res);
+    if (!row) return;
+    const data = parseData(row);
+    res.json({
+      id: row.id,
+      name: row.name,
+      model: data.model || null,
+      messages: data.messages || [],
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    });
   });
 
+  // Renombrar sesión / cambiar modelo
   app.put('/api/sessions/:id', authMiddleware, (req, res) => {
-    const session = db.prepare('SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
-    if (!session) return res.status(404).json({ error: 'Sesión no encontrada' });
+    const row = getResourceOr404(req.params.id, req.auth.sub, 'sesion', res);
+    if (!row) return;
+    const data = parseData(row);
+    const { name, model } = req.body || {};
 
-    const { name, agentId, skills } = req.body || {};
-    const newName = (name && name.trim()) || session.name;
-    const newAgentId = agentId !== undefined ? agentId : session.agent_id;
-    const newSkills = skills !== undefined ? JSON.stringify(skills) : session.skills;
+    const newName = (name && name.trim()) || row.name;
+    const newData = { ...data, model: model !== undefined ? model : data.model };
 
-    db.prepare('UPDATE chat_sessions SET name = ?, agent_id = ?, skills = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-      .run(newName, newAgentId, newSkills, session.id);
-
-    const updated = db.prepare('SELECT * FROM chat_sessions WHERE id = ?').get(session.id);
-    res.json(publicSession(updated));
+    db.prepare('UPDATE resources SET name = ?, data = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(
+      newName,
+      JSON.stringify(newData),
+      row.id
+    );
+    res.json({ id: row.id, name: newName, model: newData.model });
   });
 
+  // Borrar sesión
   app.delete('/api/sessions/:id', authMiddleware, (req, res) => {
-    const session = db.prepare('SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
-    if (!session) return res.status(404).json({ error: 'Sesión no encontrada' });
-
-    db.prepare('DELETE FROM session_messages WHERE session_id = ?').run(session.id);
-    db.prepare('DELETE FROM session_files WHERE session_id = ?').run(session.id);
-    db.prepare('DELETE FROM chat_sessions WHERE id = ?').run(session.id);
+    const row = getResourceOr404(req.params.id, req.auth.sub, 'sesion', res);
+    if (!row) return;
+    db.prepare('DELETE FROM resources WHERE id = ?').run(row.id);
     res.json({ ok: true });
   });
 
-  // Enviar un mensaje dentro de una sesión: reutiliza processChatCompletion
-  // (misma fuente de verdad de créditos/agente/Ollama que /api/chat), con el
-  // historial de la sesión y las habilidades activas guardadas en ella.
-  app.post('/api/sessions/:id/mensajes', authMiddleware, async (req, res) => {
-    const session = db.prepare('SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
-    if (!session) return res.status(404).json({ error: 'Sesión no encontrada' });
+  // Enviar un mensaje a la sesión: usa processChatCompletion con el
+  // historial acumulado, guarda ambos mensajes (user + assistant) y
+  // devuelve la respuesta. No pasa agentId: es una sesión "suelta", no
+  // ligada a un agente concreto.
+  app.post('/api/sessions/:id/messages', authMiddleware, async (req, res) => {
+    const row = getResourceOr404(req.params.id, req.auth.sub, 'sesion', res);
+    if (!row) return;
 
     const { message } = req.body || {};
-    if (!message || !String(message).trim()) return res.status(400).json({ error: 'El mensaje es obligatorio' });
+    if (!message || !String(message).trim()) {
+      return res.status(400).json({ error: 'El mensaje es obligatorio' });
+    }
+
+    const data = parseData(row);
+    const historial = Array.isArray(data.messages) ? data.messages : [];
+
+    const mensajesParaModelo = [
+      ...historial.map((m) => ({ role: m.role, content: m.content })),
+      { role: 'user', content: String(message) },
+    ];
 
     try {
-      const historial = db.prepare('SELECT role, content FROM session_messages WHERE session_id = ? ORDER BY created_at ASC').all(session.id);
-      const archivos = db.prepare('SELECT filename, content FROM session_files WHERE session_id = ?').all(session.id);
-
-      let messages = historial.map(m => ({ role: m.role, content: m.content }));
-      if (archivos.length > 0) {
-        const contexto = archivos.map(f => `--- ${f.filename} ---\n${f.content}`).join('\n\n');
-        messages = [{ role: 'system', content: `Archivos de contexto adjuntos a esta sesión:\n\n${contexto}` }, ...messages];
-      }
-      messages.push({ role: 'user', content: String(message) });
-
       const result = await processChatCompletion(req.auth.sub, {
-        agentId: session.agent_id || undefined,
-        messages,
-        sessionSkills: safeParseJSON(session.skills),
+        messages: mensajesParaModelo,
+        model: data.model || undefined,
         apiKeyId: req.auth.viaApiKey ? req.auth.apiKeyId : undefined,
         apiKeyType: req.auth.viaApiKey ? req.auth.apiKeyType : undefined,
       });
 
       const respuesta = result.choices?.[0]?.message?.content || '';
+      const now = new Date().toISOString();
 
-      db.prepare('INSERT INTO session_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)')
-        .run(uuidv4(), session.id, 'user', String(message));
-      db.prepare('INSERT INTO session_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)')
-        .run(uuidv4(), session.id, 'assistant', respuesta);
-      db.prepare('UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(session.id);
+      const nuevosMensajes = [
+        ...historial,
+        { role: 'user', content: String(message), ts: now },
+        { role: 'assistant', content: respuesta, ts: now },
+      ];
+
+      db.prepare('UPDATE resources SET data = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(
+        JSON.stringify({ ...data, messages: nuevosMensajes }),
+        row.id
+      );
 
       res.json({ response: respuesta, usage: result.usage, model: result.model });
     } catch (err) {
-      console.error('Error en /api/sessions/:id/mensajes:', err);
+      console.error('Error en /api/sessions/:id/messages:', err);
       const status = err.status || 500;
       res.status(status).json({ error: err.message || 'Error interno al procesar el mensaje', ...(err.code ? { code: err.code } : {}) });
     }
   });
 
-  // — Archivos de contexto adjuntos a una sesión —
-  app.post('/api/sessions/:id/archivos', authMiddleware, (req, res) => {
-    const session = db.prepare('SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
-    if (!session) return res.status(404).json({ error: 'Sesión no encontrada' });
-
-    const { filename, content } = req.body || {};
-    if (!filename || !content) return res.status(400).json({ error: 'filename y content son obligatorios' });
-
-    const id = uuidv4();
-    db.prepare('INSERT INTO session_files (id, session_id, filename, content) VALUES (?, ?, ?, ?)')
-      .run(id, session.id, String(filename), String(content));
-    res.status(201).json({ id, filename: String(filename) });
-  });
-
-  app.delete('/api/sessions/:id/archivos/:fileId', authMiddleware, (req, res) => {
-    const session = db.prepare('SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
-    if (!session) return res.status(404).json({ error: 'Sesión no encontrada' });
-    db.prepare('DELETE FROM session_files WHERE id = ? AND session_id = ?').run(req.params.fileId, session.id);
+  // Vaciar historial de la sesión (sin borrar la sesión en sí)
+  app.delete('/api/sessions/:id/messages', authMiddleware, (req, res) => {
+    const row = getResourceOr404(req.params.id, req.auth.sub, 'sesion', res);
+    if (!row) return;
+    const data = parseData(row);
+    db.prepare('UPDATE resources SET data = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(
+      JSON.stringify({ ...data, messages: [] }),
+      row.id
+    );
     res.json({ ok: true });
   });
 
-  // — Almacén de credenciales —
-  // Reutiliza la tabla `resources` (type='credencial') que server.js YA lee
-  // directamente en varios sitios (TAVILY_API_KEY, E2B_API_KEY: busca
-  // resources con type IN ('credencial','habilidad') y name=<clave>, y hace
-  // JSON.parse(data).valor). Por eso aquí se guarda en el mismo formato
-  // { valor: '...' } sin cifrar — si en el futuro quieres cifrar en reposo
-  // con `serverSecret`, hazlo también en los puntos de lectura de server.js,
-  // o ambos dejan de entenderse entre sí.
-  app.get('/api/credenciales', authMiddleware, (req, res) => {
-    const rows = db.prepare("SELECT id, name, created_at FROM resources WHERE user_id = ? AND type = 'credencial' ORDER BY created_at DESC").all(req.auth.sub);
-    res.json(rows); // nunca se devuelve el valor, solo nombre/id
+  // -------------------------------------------------------------------
+  // ARCHIVOS
+  // -------------------------------------------------------------------
+
+  app.get('/api/files', authMiddleware, (req, res) => {
+    const rows = db
+      .prepare("SELECT * FROM resources WHERE user_id = ? AND type = 'archivo' ORDER BY created_at DESC")
+      .all(req.auth.sub);
+
+    res.json(
+      rows.map((r) => {
+        const data = parseData(r);
+        return {
+          id: r.id,
+          name: r.name,
+          mimeType: data.mimeType || 'application/octet-stream',
+          size: data.size ?? (data.content ? String(data.content).length : 0),
+          createdAt: r.created_at,
+        };
+      })
+    );
   });
 
-  app.post('/api/credenciales', authMiddleware, (req, res) => {
-    const { name, valor } = req.body || {};
-    if (!name || !name.trim() || !valor) return res.status(400).json({ error: 'name y valor son obligatorios' });
-
-    const existing = db.prepare("SELECT id FROM resources WHERE user_id = ? AND type = 'credencial' AND name = ?").get(req.auth.sub, name.trim());
-    if (existing) {
-      db.prepare('UPDATE resources SET data = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-        .run(JSON.stringify({ valor }), existing.id);
-      return res.json({ ok: true, id: existing.id, name: name.trim() });
+  // Sube un archivo. `content` puede ser texto plano o base64 (marca
+  // encoding: 'base64' si es binario); no interpretamos el contenido aquí.
+  app.post('/api/files', authMiddleware, (req, res) => {
+    const { name, content, mimeType, encoding } = req.body || {};
+    if (!name || !name.trim()) return res.status(400).json({ error: 'El nombre del archivo es obligatorio' });
+    if (content === undefined || content === null) {
+      return res.status(400).json({ error: 'El contenido del archivo es obligatorio' });
     }
 
     const id = uuidv4();
-    db.prepare('INSERT INTO resources (id, user_id, type, name, data) VALUES (?, ?, ?, ?, ?)')
-      .run(id, req.auth.sub, 'credencial', name.trim(), JSON.stringify({ valor }));
-    res.status(201).json({ ok: true, id, name: name.trim() });
+    const data = {
+      mimeType: mimeType || 'application/octet-stream',
+      encoding: encoding === 'base64' ? 'base64' : 'utf8',
+      size: String(content).length,
+      content: String(content),
+    };
+
+    db.prepare('INSERT INTO resources (id, user_id, type, name, data) VALUES (?, ?, ?, ?, ?)').run(
+      id,
+      req.auth.sub,
+      'archivo',
+      name.trim(),
+      JSON.stringify(data)
+    );
+
+    res.status(201).json({ id, name: name.trim(), mimeType: data.mimeType, size: data.size });
   });
 
-  app.delete('/api/credenciales/:id', authMiddleware, (req, res) => {
-    const row = db.prepare("SELECT * FROM resources WHERE id = ? AND user_id = ? AND type = 'credencial'").get(req.params.id, req.auth.sub);
-    if (!row) return res.status(404).json({ error: 'Credencial no encontrada' });
+  // Descarga/lee el contenido completo de un archivo
+  app.get('/api/files/:id', authMiddleware, (req, res) => {
+    const row = getResourceOr404(req.params.id, req.auth.sub, 'archivo', res);
+    if (!row) return;
+    const data = parseData(row);
+    res.json({
+      id: row.id,
+      name: row.name,
+      mimeType: data.mimeType || 'application/octet-stream',
+      encoding: data.encoding || 'utf8',
+      content: data.content || '',
+      createdAt: row.created_at,
+    });
+  });
+
+  app.put('/api/files/:id', authMiddleware, (req, res) => {
+    const row = getResourceOr404(req.params.id, req.auth.sub, 'archivo', res);
+    if (!row) return;
+    const data = parseData(row);
+    const { name, content, mimeType, encoding } = req.body || {};
+
+    const newName = (name && name.trim()) || row.name;
+    const newData = {
+      ...data,
+      mimeType: mimeType || data.mimeType,
+      encoding: encoding === 'base64' ? 'base64' : data.encoding || 'utf8',
+      content: content !== undefined ? String(content) : data.content,
+      size: content !== undefined ? String(content).length : data.size,
+    };
+
+    db.prepare('UPDATE resources SET name = ?, data = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(
+      newName,
+      JSON.stringify(newData),
+      row.id
+    );
+    res.json({ id: row.id, name: newName, mimeType: newData.mimeType, size: newData.size });
+  });
+
+  app.delete('/api/files/:id', authMiddleware, (req, res) => {
+    const row = getResourceOr404(req.params.id, req.auth.sub, 'archivo', res);
+    if (!row) return;
     db.prepare('DELETE FROM resources WHERE id = ?').run(row.id);
     res.json({ ok: true });
   });
+
+  // -------------------------------------------------------------------
+  // CREDENCIALES — valores sensibles (p.ej. TAVILY_API_KEY, E2B_API_KEY,
+  // que server.js ya lee de resources type IN ('credencial','habilidad')).
+  // El `valor` real solo se devuelve en el POST de creación; en listados
+  // y GET individual se enmascara, igual que hace /api/keys con las claves.
+  // -------------------------------------------------------------------
+
+  const maskValue = (valor) => {
+    if (!valor || typeof valor !== 'string') return '••••••••';
+    if (valor.length <= 8) return '•'.repeat(valor.length);
+    return `${valor.slice(0, 4)}${'•'.repeat(Math.max(4, valor.length - 8))}${valor.slice(-4)}`;
+  };
+
+  app.get('/api/credentials', authMiddleware, (req, res) => {
+    const rows = db
+      .prepare("SELECT * FROM resources WHERE user_id = ? AND type = 'credencial' ORDER BY created_at DESC")
+      .all(req.auth.sub);
+
+    res.json(
+      rows.map((r) => {
+        const data = parseData(r);
+        return {
+          id: r.id,
+          name: r.name,
+          maskedValue: maskValue(data.valor),
+          createdAt: r.created_at,
+          updatedAt: r.updated_at,
+        };
+      })
+    );
+  });
+
+  app.post('/api/credentials', authMiddleware, (req, res) => {
+    const { name, valor } = req.body || {};
+    if (!name || !name.trim()) return res.status(400).json({ error: 'El nombre de la credencial es obligatorio' });
+    if (!valor || !String(valor).trim()) return res.status(400).json({ error: 'El valor de la credencial es obligatorio' });
+
+    // Evita duplicar credenciales con el mismo nombre para el mismo usuario
+    // (server.js las busca por user_id + name, p.ej. 'TAVILY_API_KEY').
+    const existing = db
+      .prepare("SELECT id FROM resources WHERE user_id = ? AND type = 'credencial' AND name = ?")
+      .get(req.auth.sub, name.trim());
+    if (existing) {
+      return res.status(409).json({ error: 'Ya existe una credencial con ese nombre. Bórrala o actualízala primero.' });
+    }
+
+    const id = uuidv4();
+    db.prepare('INSERT INTO resources (id, user_id, type, name, data) VALUES (?, ?, ?, ?, ?)').run(
+      id,
+      req.auth.sub,
+      'credencial',
+      name.trim(),
+      JSON.stringify({ valor: String(valor) })
+    );
+
+    // Única vez que se devuelve el valor en claro: justo tras crearla.
+    res.status(201).json({ id, name: name.trim(), valor: String(valor) });
+  });
+
+  app.put('/api/credentials/:id', authMiddleware, (req, res) => {
+    const row = getResourceOr404(req.params.id, req.auth.sub, 'credencial', res);
+    if (!row) return;
+    const { name, valor } = req.body || {};
+    const data = parseData(row);
+
+    const newName = (name && name.trim()) || row.name;
+    const newData = { valor: valor !== undefined ? String(valor) : data.valor };
+
+    db.prepare('UPDATE resources SET name = ?, data = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(
+      newName,
+      JSON.stringify(newData),
+      row.id
+    );
+    res.json({ id: row.id, name: newName, maskedValue: maskValue(newData.valor) });
+  });
+
+  app.delete('/api/credentials/:id', authMiddleware, (req, res) => {
+    const row = getResourceOr404(req.params.id, req.auth.sub, 'credencial', res);
+    if (!row) return;
+    db.prepare('DELETE FROM resources WHERE id = ?').run(row.id);
+    res.json({ ok: true });
+  });
+
+  // `serverSecret` queda reservado para casos futuros (p.ej. firmar enlaces
+  // de descarga temporales para /api/files/:id) — no se usa todavía porque
+  // no hay consumidor de frontend confirmado que lo necesite.
+  void serverSecret;
 }
