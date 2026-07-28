@@ -11,6 +11,8 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { TOOL_DEFINITIONS, ALL_TOOL_NAMES, runToolLoop, makeWorkspacesRoot } from './tools.js';
+import { construirSystemPrompt } from './sistema-prompt.js';
+import { registerEventStreamRoute, emitirEventoAgente } from './eventos-agente.js';
 import { runDeterministicAgent, resolveTemplatePrompt, registerBridgeAdminRoutes } from './bridge-marisai.js';
 import { seedOwnerAgentsIfEmpty, seedBasicAgentsForUser, isOwnerUser, DEEPSEEK_SAFE_FORMAT_RULE, ENTERPRISE_REQUIRED_MESSAGE } from './seed-owner-agents.js';
 import { registerSessionRoutes, validateZocoApiKey } from './zoco-sessions.js';
@@ -756,7 +758,12 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
       allowedTools,
       workspacesRoot: WORKSPACES_ROOT,
       workspaceId: agentId,
-      context: { tavilyApiKey, e2bApiKey, workspaceId: agentId },
+      context: {
+        tavilyApiKey,
+        e2bApiKey,
+        workspaceId: agentId,
+        onEvent: (evento) => emitirEventoAgente(agentId, evento),
+      },
     });
     respuesta = stripThink(result.finalMessage);
     usage = result.usage;
@@ -1422,6 +1429,7 @@ app.put('/admin/clientes/:id', authMiddleware, requireAdmin, (req, res) => {
 });
 
 registerBridgeAdminRoutes({ app, db, authMiddleware, requireAdmin, uuidv4 });
+registerEventStreamRoute({ app, jwt, JWT_SECRET, db });
 
 registerSessionRoutes({ app, db, authMiddleware, uuidv4, serverSecret: JWT_SECRET, processChatCompletion });
 registerConsoleRoutes({ app, db, authMiddleware, uuidv4, processChatCompletion });
