@@ -1,0 +1,66 @@
+Aplica estos 3 cambios sobre tu server.js actual. Son solo añadidos —
+no borres ni reescribas nada más de lo que ya tienes.
+
+─────────────────────────────────────────────────────────────────────────
+CAMBIO 1 — Import nuevo (junto a tus otros imports, ej. debajo de la línea
+que importa desde './tools.js')
+─────────────────────────────────────────────────────────────────────────
+
+import { registerEventStreamRoute, emitirEventoAgente } from './eventos-agente.js';
+
+
+─────────────────────────────────────────────────────────────────────────
+CAMBIO 2 — Registrar la ruta SSE (junto a tus otros registerXRoutes, ej.
+justo debajo de esta línea que ya tienes):
+
+    registerBridgeAdminRoutes({ app, db, authMiddleware, requireAdmin, uuidv4 });
+
+Añade justo debajo:
+─────────────────────────────────────────────────────────────────────────
+
+registerEventStreamRoute({ app, jwt, JWT_SECRET, db });
+
+
+─────────────────────────────────────────────────────────────────────────
+CAMBIO 3 — Conectar onEvent en la llamada a runToolLoop dentro de
+processChatCompletion. Tu código actual es:
+
+    const result = await runToolLoop({
+      messages: mensajesParaGroq,
+      callModel,
+      allowedTools,
+      workspacesRoot: WORKSPACES_ROOT,
+      workspaceId: agentId,
+      context: { tavilyApiKey, e2bApiKey, workspaceId: agentId },
+    });
+
+Cámbialo por (solo se añade la línea onEvent dentro de context):
+─────────────────────────────────────────────────────────────────────────
+
+const result = await runToolLoop({
+  messages: mensajesParaGroq,
+  callModel,
+  allowedTools,
+  workspacesRoot: WORKSPACES_ROOT,
+  workspaceId: agentId,
+  context: {
+    tavilyApiKey,
+    e2bApiKey,
+    workspaceId: agentId,
+    onEvent: (evento) => emitirEventoAgente(agentId, evento),
+  },
+});
+
+
+─────────────────────────────────────────────────────────────────────────
+EN EL FRONTEND — cómo escuchar estos eventos desde React:
+─────────────────────────────────────────────────────────────────────────
+
+const es = new EventSource(`/api/agentes/${agentId}/eventos?token=${jwtToken}`);
+es.onmessage = (e) => {
+  const evento = JSON.parse(e.data);
+  // evento.type: 'terminal_log' | 'terminal_status' | 'desktop_status'
+  //            | 'plan_status' | 'agent_status'
+  // úsalo para pintar el panel "Ordenador de Zoco" en vivo.
+};
+// recuerda cerrarlo al desmontar el componente: es.close()
