@@ -14,10 +14,10 @@ function fmtEUR(n: number) { return `${(n || 0).toFixed(2)} €`; }
 function fmtDate(s: string) { return new Date(s).toLocaleDateString('es-ES'); }
 
 const MODELOS = [
-  { nombre: 'Zoco Fable 5', backend: 'zoco-fable-5', badge: 'Nuevo', ollamaModel: 'mistral-nemo', tags: ['Más capaz','Investigación','Tareas de varios días'], color: 'from-blue-500 to-indigo-600', icon: '✦' },
-  { nombre: 'Zoco Opus 4.8', backend: 'zoco-opus-4-8', badge: null, ollamaModel: 'mistral-nemo', tags: ['Proyectos complejos','Agentes','Programación'], color: 'from-orange-400 to-rose-500', icon: '◈' },
-  { nombre: 'Zoco Sonnet 5', backend: 'zoco-sonnet-5', badge: 'Nuevo', ollamaModel: 'llama3.2', tags: ['Tareas cotidianas','Escritura','Rentable'], color: 'from-gray-500 to-slate-600', icon: '✳' },
-  { nombre: 'Zoco Haiku 4.5', backend: 'zoco-haiku-4-5', badge: null, ollamaModel: 'llama3.2', tags: ['Más rápido','Menor coste','Alto volumen'], color: 'from-teal-400 to-emerald-500', icon: '❋' },
+  { nombre: 'Zoco-Flash', backend: 'zoco-flash', badge: null, ollamaModel: 'OLLAMA_MODEL_FLASH', tags: ['Más rápido','Menor coste','Alto volumen'], color: 'from-teal-400 to-emerald-500', icon: '⚡' },
+  { nombre: 'Zoco-Plus', backend: 'zoco-plus', badge: null, ollamaModel: 'OLLAMA_MODEL_PLUS', tags: ['Tareas cotidianas','Escritura','Rentable'], color: 'from-gray-500 to-slate-600', icon: '✳' },
+  { nombre: 'Zoco-Max', backend: 'zoco-max', badge: null, ollamaModel: 'OLLAMA_MODEL_MAX', tags: ['Proyectos complejos','Agentes','Programación'], color: 'from-orange-400 to-rose-500', icon: '◈' },
+  { nombre: 'Zoco-Lab', backend: 'zoco-lab', badge: 'Beta', ollamaModel: 'OLLAMA_MODEL_LAB', tags: ['Experimental','Investigación','Nuevas capacidades'], color: 'from-purple-500 to-indigo-600', icon: '✦' },
 ];
 
 const RESOURCE_SECTIONS = [
@@ -43,7 +43,7 @@ export default function Dashboard() {
   const [adminLogs, setAdminLogs] = useState<any[]>([]);
   const [payments, setPayments] = useState<Payment[]>([]);
   const [creditPacks, setCreditPacks] = useState<CreditPack[]>([]);
-  const [selectedModel, setSelectedModel] = useState('zoco-sonnet-5');
+  const [selectedModel, setSelectedModel] = useState('zoco-plus');
   const [expandedAgentId, setExpandedAgentId] = useState<string|null>(null);
   const [agentMemory, setAgentMemory] = useState<Record<string, {mensajes: MemoriaMensaje[]; cacheActiva: boolean}>>({});
   const [adminTab, setAdminTab] = useState<'usuarios'|'pagos'|'sistema'|'logs'>('usuarios');
@@ -324,7 +324,7 @@ export default function Dashboard() {
         {/* Banner alertas */}
         {notification && (
           <div className="bg-[#1a1a2e] border-b border-[#333] px-6 py-2.5 flex items-center justify-between text-[12px]">
-            <span className="text-blue-300">ℹ️ Zoco IA Console activo · Groq Cloud IA en línea · {agentes.length} agentes registrados</span>
+            <span className="text-blue-300">ℹ️ Zoco IA Console activo · Ollama local en línea · {agentes.length} agentes registrados</span>
             <button onClick={() => setNotification(false)} className="text-gray-600 hover:text-gray-400">✕</button>
           </div>
         )}
@@ -476,7 +476,7 @@ export default function Dashboard() {
                     <div className="text-5xl mb-4">{activeAgent ? activeAgent.name.charAt(0).toUpperCase() : 'Z'}</div>
                     <p className="text-gray-400 font-medium">{activeAgent ? `${activeAgent.name} listo` : 'Zoco IA listo'}</p>
                     <p className="text-xs mt-1 text-gray-600">Modelo: {MODELOS.find(m => m.backend === selectedModel)?.nombre || selectedModel}</p>
-                    <p className="text-xs mt-0.5 text-gray-700 font-mono">Ollama: {MODELOS.find(m => m.backend === selectedModel)?.ollamaModel || 'llama3.2'} · Groq fallback: llama-3.3-70b</p>
+                    <p className="text-xs mt-0.5 text-gray-700 font-mono">Motor: Ollama local ({MODELOS.find(m => m.backend === selectedModel)?.ollamaModel || 'OLLAMA_MODEL_PLUS'})</p>
                     {activeAgent
                       ? <p className="text-xs mt-1 text-gray-600">🧠 Memoria persistente de este agente activada</p>
                       : <p className="text-xs mt-1 text-gray-600">🌐 Búsqueda web automática activada</p>}
@@ -748,7 +748,7 @@ export default function Dashboard() {
                 {[
                   {title:'Inicio rápido',desc:'Empieza a usar la API de Zoco IA en minutos',icon:'🚀'},
                   {title:'Referencia API',desc:'Documentación completa de todos los endpoints',icon:'📋'},
-                  {title:'Guía de modelos',desc:'Compara Zoco Fable, Opus, Sonnet y Haiku',icon:'🤖'},
+                  {title:'Guía de modelos',desc:'Compara Zoco-Flash, Zoco-Plus, Zoco-Max y Zoco-Lab',icon:'🤖'},
                   {title:'Ejemplos de código',desc:'Snippets en Python, JavaScript y más',icon:'💻'},
                   {title:'Límites y cuotas',desc:'Información sobre rate limits y facturación',icon:'📊'},
                   {title:'Soporte',desc:'Contacta con el equipo de Zoco IA',icon:'💬'},
@@ -823,7 +823,7 @@ export default function Dashboard() {
                   <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-6">
                     <h3 className="font-bold text-white mb-4">⚙️ Estado del sistema</h3>
                     <div className="space-y-3 text-xs">
-                      {[['Backend','● Online','text-green-400'],['Motor IA',adminStats.ollamaOnline?'🖥 Ollama local':'☁️ Groq Cloud','text-blue-400'],['Base de datos','SQLite + Volumen Railway','text-gray-300'],['Pasarela de pago',adminStats.vivaConfigurado?'✓ Viva.com':'⚠️ No configurada',adminStats.vivaConfigurado?'text-green-400':'text-amber-400'],['Total usuarios',adminStats.totalUsuarios,'text-white'],['Ingresos totales',fmtEUR(adminStats.ingresosTotal||0),'text-green-400']].map(([k,v,c])=>(
+                      {[['Backend','● Online','text-green-400'],['Motor IA',adminStats.ollamaOnline?'🖥 Ollama local':'⚠️ Ollama offline','text-blue-400'],['Base de datos','SQLite + Volumen persistente','text-gray-300'],['Pasarela de pago',adminStats.vivaConfigurado?'✓ Viva.com':'⚠️ No configurada',adminStats.vivaConfigurado?'text-green-400':'text-amber-400'],['Total usuarios',adminStats.totalUsuarios,'text-white'],['Ingresos totales',fmtEUR(adminStats.ingresosTotal||0),'text-green-400']].map(([k,v,c])=>(
                         <div key={String(k)} className="flex justify-between border-b border-[#222] pb-2">
                           <span className="text-gray-500">{k}</span><span className={String(c)}>{v}</span>
                         </div>
@@ -833,7 +833,7 @@ export default function Dashboard() {
                   <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-6">
                     <h3 className="font-bold text-white mb-4">🔑 Variables de entorno</h3>
                     <div className="space-y-2 text-xs font-mono">
-                      {[['GROQ_API_KEY','Motor IA cloud'],['OLLAMA_URL','Ollama/Ngrok local'],['VIVA_CLIENT_ID','Pagos'],['VIVA_CLIENT_SECRET','Pagos'],['VIVA_SOURCE_CODE','Pagos'],['JWT_SECRET','✓ Configurado']].map(([k,v])=>(
+                      {[['OLLAMA_BASE_URL','Motor IA local'],['OLLAMA_MODEL_FLASH','Zoco-Flash'],['OLLAMA_MODEL_PLUS','Zoco-Plus'],['OLLAMA_MODEL_MAX','Zoco-Max'],['OLLAMA_MODEL_LAB','Zoco-Lab'],['JWT_SECRET','✓ Configurado']].map(([k,v])=>(
                         <div key={k} className="flex justify-between p-2 bg-[#161616] rounded border border-[#222]">
                           <span className="text-purple-400">{k}</span><span className="text-gray-600">{v}</span>
                         </div>
