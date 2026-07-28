@@ -18,7 +18,6 @@ export function makeWorkspacesRoot(dbDir) {
 
 // ─── Definiciones de tools en formato OpenAI (Groq y Ollama /v1/chat/completions lo soportan) ───
 export const TOOL_DEFINITIONS = [
-  CONTROLAR_ORDENADOR_TOOL_SCHEMA,
   {
     type: 'function',
     function: {
@@ -73,7 +72,6 @@ export const TOOL_DEFINITIONS = [
         properties: {
           path: { type: 'string', description: 'Ruta relativa a listar. Vacío para la raíz del workspace.' },
         },
-        required: ['path'],
       },
     },
   },
@@ -122,7 +120,51 @@ export const TOOL_DEFINITIONS = [
       },
     },
   },
-
+  {
+    type: 'function',
+    function: {
+      name: 'controlarOrdenador',
+      description:
+        'Controla el "Ordenador de Zoco": un escritorio virtual real en la nube (Linux + navegador) para tareas que requieren interactuar con páginas web como lo haría una persona. Usa "screenshot" SIEMPRE antes de decidir la siguiente acción y SIEMPRE después de una acción importante para verificar que ha surtido efecto — no asumas que un clic ha funcionado sin comprobarlo visualmente. La sesión persiste entre llamadas mientras dure la conversación.',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: [
+              'navigate',
+              'click',
+              'doubleClick',
+              'rightClick',
+              'type',
+              'keyPress',
+              'drag',
+              'scroll',
+              'moveMouse',
+              'wait',
+              'screenshot',
+              'get_url',
+            ],
+            description: 'Acción a realizar en el ordenador virtual',
+          },
+          url: { type: 'string', description: 'URL a abrir (solo para action=navigate)' },
+          x: { type: 'number', description: 'Coordenada X (para click, doubleClick, rightClick, moveMouse, o punto de origen de drag)' },
+          y: { type: 'number', description: 'Coordenada Y (para click, doubleClick, rightClick, moveMouse, o punto de origen de drag)' },
+          toX: { type: 'number', description: 'Coordenada X de destino (solo para action=drag)' },
+          toY: { type: 'number', description: 'Coordenada Y de destino (solo para action=drag)' },
+          text: { type: 'string', description: 'Texto a escribir (solo para action=type)' },
+          key: {
+            type: 'string',
+            description:
+              'Tecla o combinación a pulsar (solo para action=keyPress). Nombres simples en minúscula: "enter", "space", "backspace", "escape", "tab". Para combinaciones, sepáralas con "+": "ctrl+c", "ctrl+a".',
+          },
+          amount: { type: 'number', description: 'Cantidad de scroll, positivo=abajo (solo para action=scroll)' },
+          ms: { type: 'number', description: 'Milisegundos a esperar (solo para action=wait, por defecto 1000)' },
+        },
+        required: ['action'],
+      },
+    },
+  },
   {
     type: 'function',
     function: {
@@ -168,12 +210,62 @@ export const TOOL_DEFINITIONS = [
 
 export const ALL_TOOL_NAMES = TOOL_DEFINITIONS.map((t) => t.function.name);
 
+function resolveSafePath(workspaceDir, relativePath) {
+  const target = path.join(workspaceDir, relativePath || '');
+  if (!target.startsWith(workspaceDir)) {
+    throw new Error('Ruta inválida: intento de salir del workspace');
+  }
+  return target;
+}
+
+async function ensureWorkspace(workspacesRoot, workspaceId) {
+  const dir = path.join(workspacesRoot, workspaceId);
+  await fs.mkdir(dir, { recursive: true });
+  return dir;
+}
+
+async function createFile(workspaceDir, { path: relPath, content }) {
+  const target = resolveSafePath(workspaceDir, relPath);
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await fs.writeFile(target, content ?? '', 'utf8');
+  return { success: true, path: relPath, bytesWritten: Buffer.byteLength(content ?? '') };
+}
+
+async function createFolder(workspaceDir, { path: relPath }) {
+  const target = resolveSafePath(workspaceDir, relPath);
+  await fs.mkdir(target, { recursive: true });
+  return { success: true, path: relPath };
+}
+
+async function readFile(workspaceDir, { path: relPath }) {
+  const target = resolveSafePath(workspaceDir, relPath);
+  try {
+    const content = await fs.readFile(target, 'utf8');
+    return { success: true, path: relPath, content };
+  } catch {
+    return { success: false, path: relPath, error: 'Archivo no encontrado o ilegible' };
+  }
+}
+
+/**
+ * Sesiones de sandbox E2B activas, una por workspace (= por agente/conversación).
+ * En memoria del proceso: si el servidor se reinicia se pierden y se crean
+ * de nuevo en la siguiente llamada — es una limitación aceptada de la v1,
+ * no persistimos sandboxes vivos en la base de datos.
+ */
 const codeSandboxes = new Map(); // workspaceId -> CodeSandbox
 const desktopSandboxes = new Map(); // workspaceId -> DesktopSandbox
 
 const E2B_SANDBOX_TIMEOUT_MS = Number(process.env.E2B_SANDBOX_TIMEOUT_MS || 10 * 60 * 1000); // 10 min de vida del sandbox
 const E2B_CALL_TIMEOUT_MS = Number(process.env.E2B_CALL_TIMEOUT_MS || 45 * 1000); // timeout duro por acción individual
 
+/**
+ * Envuelve cualquier llamada a E2B con un timeout duro propio, independiente
+ * del timeout interno del SDK — así, si Ollama está saturado reenviando
+ * peticiones o E2B tarda en responder, el hilo del chat nunca se queda
+ * colgado: a los E2B_CALL_TIMEOUT_MS se devuelve error y el modelo puede
+ * reintentar en la siguiente vuelta del tool loop en vez de bloquear.
+ */
 function withHardTimeout(promise, ms, label) {
   return Promise.race([
     promise,
@@ -181,6 +273,13 @@ function withHardTimeout(promise, ms, label) {
   ]);
 }
 
+/**
+ * Emite un evento en vivo hacia el frontend (panel "Ordenador de Zoco"),
+ * IGUAL que el `emit(sessionId, {...})` que viste en el ordenador de Manus.
+ * context.onEvent es opcional: si server.js no lo pasa (ej. modo API sin
+ * websocket/SSE abierto), simplemente no se emite nada y todo sigue
+ * funcionando igual — nunca lanza ni bloquea la ejecución de la tool.
+ */
 function emitLive(context, payload) {
   try {
     context?.onEvent?.({ workspaceId: context?.workspaceId, ...payload });
@@ -254,136 +353,4 @@ async function executeCode(workspaceDir, { language, code }, context) {
       return { success: false, error: `${execution.error.name}: ${execution.error.value}\n${(execution.error.traceback || []).join('\n')}` };
     }
     return {
-      success: true,
-      logs: execution.logs.stderr.concat(execution.logs.stdout).join('\n'),
-    };
-  } catch (err) {
-    return { success: false, error: err.message };
-  }
-}
-
-async function abrirTerminalLinux(workspaceDir, { command }, context) {
-  const apiKey = context?.e2bApiKey;
-  if (!apiKey) {
-    return {
-      success: false,
-      error: 'E2B_API_KEY no configurada. Añádela como credencial del usuario (E2B_API_KEY) para poder ejecutar comandos en el sandbox real.',
-    };
-  }
-
-  try {
-    const sbx = await getCodeSandbox(context.workspaceId, apiKey);
-    const proc = await withHardTimeout(sbx.process.start({ cmd: command ?? '' }), E2B_CALL_TIMEOUT_MS, 'ejecución de terminal');
-    const output = await withHardTimeout(proc.wait(), E2B_CALL_TIMEOUT_MS, 'espera de terminal');
-
-    if (output.exitCode !== 0) {
-      return { success: false, error: output.stderr || `Comando falló con código ${output.exitCode}` };
-    }
-    return { success: true, logs: output.stdout };
-  } catch (err) {
-    return { success: false, error: err.message };
-  }
-}
-
-export async function runToolLoop(toolCall, workspaceId, context) {
-  const toolName = toolCall.function.name;
-  const toolArgs = toolCall.function.arguments;
-
-  const toolsImplementations = {
-    createFile: (args) => createFile(context.workspaceDir, args),
-    createFolder: (args) => createFolder(context.workspaceDir, args),
-    readFile: (args) => readFile(context.workspaceDir, args),
-    listFiles: (args) => listFiles(context.workspaceDir, args),
-    deleteFile: (args) => deleteFile(context.workspaceDir, args),
-    executeCode: (args) => executeCode(context.workspaceDir, args, context),
-    abrirTerminalLinux: (args) => abrirTerminalLinux(context.workspaceDir, args, context),
-    controlarOrdenador: (args) => handleOrdenadorZocoAction(context.workspaceId, context.e2bApiKey, args, context.onEvent),
-    gestionarPlan: (args) => gestionarPlan(context.workspaceDir, args, context),
-    busqueda_web: (args) => busqueda_web(context.workspaceDir, args, context),
-  };
-
-  if (!toolsImplementations[toolName]) {
-    throw new Error(`Tool ${toolName} no implementada.`);
-  }
-
-  return toolsImplementations[toolName](JSON.parse(toolArgs));
-}
-
-async function runDesktopTool(workspaceDir, { action, ...params }, context) {
-  const apiKey = context?.e2bApiKey;
-  if (!apiKey) {
-    return {
-      success: false,
-      error: 'E2B_API_KEY no configurada. Añádela como credencial del usuario (E2B_API_KEY) para poder controlar el ordenador virtual.',
-    };
-  }
-
-  const sbx = await getDesktopSandbox(context.workspaceId, apiKey);
-
-  let result = {};
-  let screenshot = null;
-  let currentUrl = null;
-
-  emitLive({ workspaceId: context.workspaceId, onEvent: context.onEvent }, { type: 'action_start', action, params });
-
-  try {
-    switch (action) {
-      case 'navigate':
-        if (!params.url) throw new Error('URL es requerida para la acción navigate.');
-        emitLive({ workspaceId: context.workspaceId, onEvent: context.onEvent }, { type: 'navigate', url: params.url });
-        await withHardTimeout(sbx.browser.goto(params.url), 30000, 'navigate');
-        break;
-      case 'click':
-        if (typeof params.x !== 'number' || typeof params.y !== 'number') {
-          throw new Error('Coordenadas x e y son requeridas para la acción click.');
-        }
-        emitLive({ workspaceId: context.workspaceId, onEvent: context.onEvent }, { type: 'click', x: params.x, y: params.y });
-        await withHardTimeout(sbx.browser.click(params.x, params.y), 10000, 'click');
-        break;
-      case 'type':
-        if (!params.text) throw new Error('Texto es requerido para la acción type.');
-        emitLive({ workspaceId: context.workspaceId, onEvent: context.onEvent }, { type: 'type', text: params.text });
-        await withHardTimeout(sbx.browser.type(params.text), 10000, 'type');
-        break;
-      case 'scroll':
-        if (typeof params.amount !== 'number') {
-          throw new Error('Cantidad de scroll es requerida para la acción scroll.');
-        }
-        emitLive({ workspaceId: context.workspaceId, onEvent: context.onEvent }, { type: 'scroll', amount: params.amount });
-        await withHardTimeout(sbx.browser.scroll(params.amount), 10000, 'scroll');
-        break;
-      case 'screenshot':
-        emitLive({ workspaceId: context.workspaceId, onEvent: context.onEvent }, { type: 'screenshot_request' });
-        break;
-      case 'get_url':
-        emitLive({ workspaceId: context.workspaceId, onEvent: context.onEvent }, { type: 'get_url_request' });
-        currentUrl = await withHardTimeout(sbx.browser.getURL(), 5000, 'get_url');
-        result.url = currentUrl;
-        break;
-      default:
-        throw new Error(`Acción no soportada: ${action}`);
-    }
-
-    if (action !== 'screenshot') {
-      const screenshotBuffer = await withHardTimeout(sbx.browser.screenshot(), 20000, 'screenshot');
-      screenshot = screenshotBuffer.toString('base64');
-      emitLive({ workspaceId: context.workspaceId, onEvent: context.onEvent }, { type: 'screenshot_taken', size: screenshotBuffer.length });
-    }
-
-    if (!currentUrl) {
-      currentUrl = await withHardTimeout(sbx.browser.getURL(), 5000, 'get_url_after_action');
-      result.url = currentUrl;
-    }
-
-    emitLive({ workspaceId: context.workspaceId, onEvent: context.onEvent }, { type: 'action_success', action, result });
-    return { success: true, screenshot, url: currentUrl, result };
-  } catch (err) {
-    console.error(`Error en acción de Ordenador de Zoco (${action}):`, err);
-    emitLive({ workspaceId: context.workspaceId, onEvent: context.onEvent }, { type: 'action_error', action, error: err.message });
-    return { success: false, error: err.message, screenshot: null, url: currentUrl };
-  }
-}
-
-// Placeholder functions for now, will be implemented later or removed if not needed
-async function gestionarPlan(workspaceDir, args, context) { return { success: true, message: 'gestionarPlan placeholder' }; }
-async function busqueda_web(workspaceDir, args, context) { return { success: true, message: 'busqueda_web placeholder' }; }
+ 

@@ -17,6 +17,8 @@ import { runDeterministicAgent, resolveTemplatePrompt, registerBridgeAdminRoutes
 import { seedOwnerAgentsIfEmpty, seedBasicAgentsForUser, isOwnerUser, DEEPSEEK_SAFE_FORMAT_RULE, ENTERPRISE_REQUIRED_MESSAGE } from './seed-owner-agents.js';
 import { registerSessionRoutes, validateZocoApiKey } from './zoco-sessions.js';
 import { registerConsoleRoutes, resumeInterruptedBatches, buildEnvironmentContext } from './zoco-console.js';
+import { handleOrdenadorZocoAction } from './ordenadorZoco.js';
+import registerNewApiEndpoints from './new-api-endpoints.js';
 
 dotenv.config();
 
@@ -410,6 +412,29 @@ try {
 
 app.use(cors());
 app.use(express.json());
+
+registerNewApiEndpoints(app, db, authMiddleware);
+
+  // ==================== ENDPOINT DE ORDENADOR DE ZOCO ====================
+
+  app.post('/api/ordenador-zoco', authMiddleware, async (req, res) => {
+    try {
+      const { action, ...params } = req.body;
+      const workspaceId = req.auth.sub; // Usar el ID de usuario como workspaceId
+      const e2bApiKey = process.env.E2B_API_KEY; // Obtener la clave de entorno
+
+      // Placeholder para onEvent. La implementación real de eventos en vivo se hará en el frontend.
+      const onEvent = (payload) => {
+        // console.log('Ordenador de Zoco Event:', payload);
+      };
+
+      const result = await handleOrdenadorZocoAction(workspaceId, e2bApiKey, { action, ...params }, onEvent);
+      res.json(result);
+    } catch (err) {
+      console.error('Error en /api/ordenador-zoco:', err);
+      res.status(500).json({ error: err.message || 'Error al ejecutar acción en Ordenador de Zoco' });
+    }
+  });
 
 function signToken(user) {
   return jwt.sign(
