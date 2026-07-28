@@ -274,4 +274,83 @@ function withHardTimeout(promise, ms, label) {
 }
 
 /**
- * Emite un evento en vivo haci
+ * Emite un evento en vivo hacia el frontend (panel "Ordenador de Zoco"),
+ * IGUAL que el `emit(sessionId, {...})` que viste en el ordenador de Manus.
+ * context.onEvent es opcional: si server.js no lo pasa (ej. modo API sin
+ * websocket/SSE abierto), simplemente no se emite nada y todo sigue
+ * funcionando igual — nunca lanza ni bloquea la ejecución de la tool.
+ */
+function emitLive(context, payload) {
+  try {
+    context?.onEvent?.({ workspaceId: context?.workspaceId, ...payload });
+  } catch {
+    // un fallo del listener del frontend nunca debe tumbar la ejecución de la tool
+  }
+}
+
+async function getCodeSandbox(workspaceId, apiKey) {
+  let sbx = codeSandboxes.get(workspaceId);
+  if (sbx) {
+    try {
+      await sbx.setTimeout(E2B_SANDBOX_TIMEOUT_MS); // sigue viva, renovamos el TTL
+      return sbx;
+    } catch {
+      codeSandboxes.delete(workspaceId); // se murió/expiró, se recrea abajo
+    }
+  }
+  sbx = await withHardTimeout(
+    CodeSandbox.create({ apiKey, timeoutMs: E2B_SANDBOX_TIMEOUT_MS }),
+    E2B_CALL_TIMEOUT_MS,
+    'crear sandbox de código'
+  );
+  codeSandboxes.set(workspaceId, sbx);
+  return sbx;
+}
+
+async function getDesktopSandbox(workspaceId, apiKey) {
+  let sbx = desktopSandboxes.get(workspaceId);
+  if (sbx) {
+    try {
+      await sbx.setTimeout(E2B_SANDBOX_TIMEOUT_MS);
+      return sbx;
+    } catch {
+      desktopSandboxes.delete(workspaceId);
+    }
+  }
+  sbx = await withHardTimeout(
+    DesktopSandbox.create({ apiKey, timeoutMs: E2B_SANDBOX_TIMEOUT_MS, resolution: [1280, 800] }),
+    E2B_CALL_TIMEOUT_MS,
+    'crear sandbox de escritorio'
+  );
+  await sbx.stream.start();
+  desktopSandboxes.set(workspaceId, sbx);
+  return sbx;
+}
+
+/**
+ * Ejecuta código en un sandbox real de E2B (microVM aislada en la nube),
+ * no en este servidor. Requiere context.e2bApiKey (resuelto por-usuario en
+ * server.js igual que tavilyApiKey). Sin key configurada, falla con un
+ * error claro en vez de silenciosamente caer a ejecución local insegura.
+ */
+async function executeCode(workspaceDir, { language, code }, context) {
+  const apiKey = context?.e2bApiKey;
+  if (!apiKey) {
+    return {
+      success: false,
+      error: 'E2B_API_KEY no configurada. Añádela como credencial del usuario (E2B_API_KEY) para poder ejecutar código en el sandbox real.',
+    };
+  }
+
+  try {
+    const sbx = await getCodeSandbox(context.workspaceId, apiKey);
+    const execution = await withHardTimeout(
+      sbx.runCode(code ?? '', { language: language === 'python' ? 'python' : 'javascript' }),
+      E2B_CALL_TIMEOUT_MS,
+      'ejecución de código'
+    );
+    if (execution.error) {
+      return { success: false, error: `${execution.error.name}: ${execution.error.value}\n${(execution.error.traceback || []).join('\n')}` };
+    }
+    return {
+ 
