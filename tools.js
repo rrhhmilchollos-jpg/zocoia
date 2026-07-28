@@ -108,6 +108,21 @@ export const TOOL_DEFINITIONS = [
   {
     type: 'function',
     function: {
+      name: 'abrirTerminalLinux',
+      description:
+        'Abre una terminal Linux real, segura e independiente en la nube usando el Sandbox de E2B. Úsala obligatoriamente cuando el usuario te pida ejecutar comandos Bash, ver directorios del sistema, instalar paquetes con npm, o comprobar qué se está ejecutando en el entorno.',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', description: 'El comando bash exacto a ejecutar (ej: "ls -la", "npm install node-fetch")' },
+        },
+        required: ['command'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'controlarOrdenador',
       description:
         'Controla un ordenador virtual real en la nube (escritorio Linux con navegador) para tareas que requieren interactuar con páginas web como lo haría una persona: abrir una URL, hacer clic, escribir texto, hacer scroll o mirar la pantalla. Usa "screenshot" para ver el estado actual antes de decidir la siguiente acción. La sesión persiste entre llamadas mientras dure la conversación.',
@@ -286,6 +301,56 @@ async function executeCode(workspaceDir, { language, code }, context) {
 }
 
 /**
+ * Abre/reutiliza una terminal Linux real dentro del MISMO sandbox de código
+ * que usa `executeCode` (comparten el mapa `codeSandboxes` por workspaceId),
+ * para no gastar créditos duplicados levantando dos microVMs por agente.
+ * Usa la API nativa de comandos del SDK de code-interpreter
+ * (`sbx.commands.run`), que ejecuta el comando en el sistema de archivos
+ * persistente del sandbox y devuelve stdout/stderr/exitCode reales.
+ */
+async function abrirTerminalLinux(workspaceDir, { command }, context) {
+  const apiKey = context?.e2bApiKey;
+  if (!apiKey) {
+    return {
+      success: false,
+      error: 'E2B_API_KEY no configurada. Añádela como credencial del usuario (E2B_API_KEY) para poder usar la terminal Linux real.',
+    };
+  }
+  if (!command || !command.trim()) {
+    return { success: false, error: 'Falta "command": el comando bash exacto a ejecutar' };
+  }
+
+  try {
+    const sbx = await getCodeSandbox(context.workspaceId, apiKey);
+    const execution = await withHardTimeout(
+      sbx.commands.run(command),
+      E2B_CALL_TIMEOUT_MS,
+      'ejecución de comando en terminal'
+    );
+    return {
+      success: true,
+      command,
+      stdout: execution.stdout || '',
+      stderr: execution.stderr || '',
+      exitCode: execution.exitCode ?? 0,
+    };
+  } catch (err) {
+    // sbx.commands.run lanza si el comando devuelve un exit code distinto de 0
+    // (a diferencia de runCode, que devuelve el error dentro del objeto).
+    // Se captura aquí para no romper el tool loop y devolver stdout/stderr
+    // parciales si el SDK los incluye en el error.
+    return {
+      success: false,
+      command,
+      error: err.message,
+      stdout: err.stdout || '',
+      stderr: err.stderr || '',
+      exitCode: err.exitCode ?? 1,
+    };
+  }
+}
+
+/**
  * Controla un escritorio virtual real (E2B Desktop Sandbox) — el mismo tipo
  * de "ordenador" que usa Manus por debajo. Cada acción devuelve también
  * `liveViewUrl`: la URL de streaming VNC en vivo, para poder enseñársela al
@@ -458,7 +523,17 @@ async function busquedaWeb(workspaceDir, { query }, context) {
   }
 }
 
-const EXECUTORS = { createFile, createFolder, readFile, listFiles, deleteFile, executeCode, controlarOrdenador, busqueda_web: busquedaWeb };
+const EXECUTORS = {
+  createFile,
+  createFolder,
+  readFile,
+  listFiles,
+  deleteFile,
+  executeCode,
+  abrirTerminalLinux,
+  controlarOrdenador,
+  busqueda_web: busquedaWeb,
+};
 
 /**
  * Ejecuta una tool ya autorizada para el agente.
