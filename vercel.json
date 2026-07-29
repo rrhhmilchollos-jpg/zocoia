@@ -1,5 +1,6 @@
 {
   "rewrites": [
+    { "source": "/api/:path*", "destination": "https://api.zocoia.es/api/:path*" },
     { "source": "/(.*)", "destination": "/index.html" }
   ]
 }
