@@ -1,201 +1,222 @@
 import React, { useState, useEffect } from 'react';
-import { useAuth, API_BASE } from '../context/AuthContext';
+import { Modal, Button, Input, Textarea, Slider, Toggle, Badge, toast } from './ui';
+import { useApi } from '../hooks/useApi';
 
-interface AgentModalProps {
-  isOpen: boolean;
-  onClose: () => void;
-  onSuccess: (agent: any) => void;
-  agent?: any;
+const ALL_TOOLS = [
+  { id: 'createFile', label: 'Crear archivo', icon: '📄', desc: 'Crea y sobreescribe archivos en el workspace' },
+  { id: 'createFolder', label: 'Crear carpeta', icon: '📁', desc: 'Crea directorios en el workspace' },
+  { id: 'readFile', label: 'Leer archivo', icon: '👁', desc: 'Lee contenido de archivos del workspace' },
+  { id: 'listFiles', label: 'Listar archivos', icon: '📋', desc: 'Lista el contenido de una carpeta' },
+  { id: 'deleteFile', label: 'Eliminar archivo', icon: '🗑', desc: 'Borra archivos del workspace' },
+  { id: 'executeCode', label: 'Ejecutar código', icon: '⚡', desc: 'Sandbox E2B — Node.js / Python' },
+  { id: 'busqueda_web', label: 'Búsqueda web', icon: '🌐', desc: 'Busca información actualizada en internet' },
+  { id: 'abrirTerminalLinux', label: 'Terminal Linux', icon: '💻', desc: 'Terminal real en la nube (E2B)' },
+  { id: 'controlarOrdenador', label: 'Ordenador virtual', icon: '🖥', desc: 'Escritorio virtual con navegador' },
+  { id: 'gestionarPlan', label: 'Gestionar plan', icon: '📌', desc: 'Organiza tareas en pasos secuenciales' },
+];
+
+const MODELOS = [
+  { value: 'zoco-flash', label: 'Zoco-Flash — Rápido' },
+  { value: 'zoco-plus', label: 'Zoco-Plus — Equilibrado' },
+  { value: 'zoco-max', label: 'Zoco-Max — Potente' },
+  { value: 'zoco-lab', label: 'Zoco-Lab — Experimental' },
+];
+
+interface AgentData {
+  tipo?: string;
+  systemPrompt?: string;
+  modelo?: string;
+  temperature?: number;
+  num_predict?: number;
+  num_ctx?: number;
+  busquedaWeb?: boolean;
+  allowedTools?: string[];
 }
 
-export default function AgentModal({ isOpen, onClose, onSuccess, agent }: AgentModalProps) {
-  const { token } = useAuth();
+interface Props {
+  open: boolean;
+  onClose: () => void;
+  agente?: { id: string; name: string; data: AgentData } | null;
+  onSaved: () => void;
+}
+
+export default function AgentModal({ open, onClose, agente, onSaved }: Props) {
+  const { post, put } = useApi();
+  const isEdit = !!agente;
+
   const [name, setName] = useState('');
   const [systemPrompt, setSystemPrompt] = useState('');
-  const [temperatura, setTemperatura] = useState(0.7);
-  const [contexto, setContexto] = useState(4096);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
+  const [modelo, setModelo] = useState('zoco-plus');
+  const [temperature, setTemperature] = useState(0.7);
+  const [numPredict, setNumPredict] = useState(4096);
+  const [numCtx, setNumCtx] = useState(8192);
+  const [busquedaWeb, setBusquedaWeb] = useState(false);
+  const [allowedTools, setAllowedTools] = useState<string[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [activeTab, setActiveTab] = useState<'prompt' | 'params' | 'tools'>('prompt');
 
   useEffect(() => {
-    if (agent) {
-      setName(agent.name || '');
-      const data = typeof agent.data === 'string' ? JSON.parse(agent.data) : agent.data || {};
-      setSystemPrompt(data.systemPrompt || '');
-      setTemperatura(data.temperatura || 0.7);
-      setContexto(data.contexto || 4096);
+    if (agente) {
+      setName(agente.name);
+      const d = agente.data || {};
+      setSystemPrompt(d.systemPrompt || '');
+      setModelo(d.modelo || 'zoco-plus');
+      setTemperature(d.temperature ?? 0.7);
+      setNumPredict(d.num_predict ?? 4096);
+      setNumCtx(d.num_ctx ?? 8192);
+      setBusquedaWeb(d.busquedaWeb ?? false);
+      setAllowedTools(d.allowedTools || []);
     } else {
-      setName('');
-      setSystemPrompt('');
-      setTemperatura(0.7);
-      setContexto(4096);
+      setName(''); setSystemPrompt(''); setModelo('zoco-plus');
+      setTemperature(0.7); setNumPredict(4096); setNumCtx(8192);
+      setBusquedaWeb(false); setAllowedTools([]);
     }
-    setError('');
-  }, [agent, isOpen]);
+    setActiveTab('prompt');
+  }, [agente, open]);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!name.trim()) {
-      setError('El nombre del agente es requerido');
-      return;
-    }
+  const toggleTool = (id: string) =>
+    setAllowedTools(p => p.includes(id) ? p.filter(t => t !== id) : [...p, id]);
 
-    setLoading(true);
-    setError('');
-
+  const handleSave = async () => {
+    if (!name.trim()) { toast('error', 'El nombre es obligatorio'); return; }
+    setSaving(true);
+    const data: AgentData = {
+      tipo: 'prompted',
+      systemPrompt: systemPrompt.trim(),
+      modelo,
+      temperature,
+      num_predict: numPredict,
+      num_ctx: numCtx,
+      busquedaWeb,
+      allowedTools,
+    };
     try {
-      const method = agent ? 'PUT' : 'POST';
-      const url = agent ? `/api/resources/${agent.id}` : '/api/resources';
-      const body = {
-        type: 'agente',
-        name: name.trim(),
-        data: {
-          systemPrompt,
-          temperatura,
-          contexto,
-          herramientasAsociadas: [],
-        },
-      };
-
-      const response = await fetch(`${API_BASE}${url}`, {
-        method,
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify(body),
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || 'Error al guardar el agente');
+      if (isEdit) {
+        await put(`/api/resources/${agente!.id}`, { name: name.trim(), data });
+        toast('success', 'Agente actualizado');
+      } else {
+        await post('/api/resources', { type: 'agente', name: name.trim(), data });
+        toast('success', 'Agente creado');
       }
-
-      const result = await response.json();
-      onSuccess(result);
+      onSaved();
       onClose();
-    } catch (err: any) {
-      setError(err.message || 'Error desconocido');
+    } catch (e: any) {
+      toast('error', e.message || 'Error al guardar');
     } finally {
-      setLoading(false);
+      setSaving(false);
     }
   };
 
-  if (!isOpen) return null;
+  const tabs = [
+    { id: 'prompt', label: 'System Prompt' },
+    { id: 'params', label: 'Hiperparámetros' },
+    { id: 'tools', label: `Herramientas (${allowedTools.length})` },
+  ] as const;
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-      <div className="bg-[#1e1e1e] rounded-lg shadow-xl max-w-2xl w-full mx-4 max-h-[90vh] overflow-y-auto border border-[#333]">
-        {/* Header */}
-        <div className="sticky top-0 bg-[#252525] border-b border-[#333] px-6 py-4 flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-white">
-            {agent ? 'Editar Agente' : 'Crear Nuevo Agente'}
-          </h2>
-          <button
-            onClick={onClose}
-            className="text-gray-400 hover:text-gray-200 text-2xl leading-none"
-          >
-            ×
-          </button>
-        </div>
-
-        {/* Content */}
-        <form onSubmit={handleSubmit} className="p-6 space-y-6">
-          {error && (
-            <div className="bg-red-900 bg-opacity-30 border border-red-700 text-red-200 px-4 py-3 rounded">
-              {error}
-            </div>
-          )}
-
-          {/* Nombre del Agente */}
-          <div>
-            <label className="block text-sm font-medium text-gray-300 mb-2">
-              Nombre del Agente
-            </label>
-            <input
-              type="text"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="ej: Mi Agente de IA"
-              className="w-full px-4 py-2 bg-[#2a2a2a] border border-[#444] rounded text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-            />
-          </div>
-
-          {/* System Prompt */}
-          <div>
-            <label className="block text-sm font-medium text-gray-300 mb-2">
-              System Prompt
-            </label>
-            <textarea
-              value={systemPrompt}
-              onChange={(e) => setSystemPrompt(e.target.value)}
-              placeholder="Define el comportamiento y personalidad del agente..."
-              rows={6}
-              className="w-full px-4 py-2 bg-[#2a2a2a] border border-[#444] rounded text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 font-mono text-sm"
-            />
-          </div>
-
-          {/* Hiperparámetros */}
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                Temperatura: {temperatura.toFixed(2)}
-              </label>
-              <input
-                type="range"
-                min="0"
-                max="2"
-                step="0.1"
-                value={temperatura}
-                onChange={(e) => setTemperatura(parseFloat(e.target.value))}
-                className="w-full"
-              />
-              <p className="text-xs text-gray-500 mt-1">Controla la creatividad (0=determinista, 2=muy creativo)</p>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                Tamaño de Contexto: {contexto}
-              </label>
-              <input
-                type="number"
-                min="512"
-                max="32768"
-                step="512"
-                value={contexto}
-                onChange={(e) => setContexto(parseInt(e.target.value))}
-                className="w-full px-4 py-2 bg-[#2a2a2a] border border-[#444] rounded text-white focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-              />
-            </div>
-          </div>
-
-          {/* Botones de Acción */}
-          <div className="flex gap-3 justify-end pt-4 border-t border-[#333]">
-            <button
-              type="button"
-              onClick={onClose}
-              disabled={loading}
-              className="px-4 py-2 bg-[#2a2a2a] border border-[#444] text-gray-300 rounded hover:bg-[#333] disabled:opacity-50"
-            >
-              Cancelar
-            </button>
-            <button
-              type="submit"
-              disabled={loading}
-              className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 flex items-center gap-2"
-            >
-              {loading ? (
-                <>
-                  <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                  Guardando...
-                </>
-              ) : (
-                agent ? 'Actualizar' : 'Crear Agente'
-              )}
-            </button>
-          </div>
-        </form>
+    <Modal open={open} onClose={onClose}
+      title={isEdit ? `Configurar: ${agente!.name}` : 'Nuevo agente'}
+      subtitle={isEdit ? 'Los cambios se aplican en caliente sin reiniciar el servidor' : 'Crea un agente con memoria persistente y herramientas propias'}
+      size="lg">
+      {/* Nombre */}
+      <div className="mb-5">
+        <label className="block text-xs text-gray-500 mb-1.5">Nombre del agente</label>
+        <Input value={name} onChange={e => setName(e.target.value)} placeholder="Ej: Agente de Investigación" />
       </div>
-    </div>
+
+      {/* Modelo */}
+      <div className="mb-5">
+        <label className="block text-xs text-gray-500 mb-1.5">Modelo base</label>
+        <select value={modelo} onChange={e => setModelo(e.target.value)}
+          className="w-full bg-[#111] border border-[#333] rounded-lg text-gray-200 text-sm px-3 py-2.5 focus:outline-none focus:border-purple-500">
+          {MODELOS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+        </select>
+      </div>
+
+      {/* Tabs */}
+      <div className="flex space-x-1 bg-[#111] p-1 rounded-lg mb-5 border border-[#222]">
+        {tabs.map(t => (
+          <button key={t.id} onClick={() => setActiveTab(t.id)}
+            className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-colors ${activeTab === t.id ? 'bg-[#2a2a2a] text-white' : 'text-gray-500 hover:text-gray-300'}`}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {/* System Prompt */}
+      {activeTab === 'prompt' && (
+        <div>
+          <div className="flex items-center justify-between mb-1.5">
+            <label className="text-xs text-gray-500">System prompt</label>
+            <span className="text-[10px] text-gray-600">{systemPrompt.length} chars</span>
+          </div>
+          <Textarea value={systemPrompt} onChange={e => setSystemPrompt(e.target.value)}
+            rows={10} placeholder="Eres un asistente especializado en... Describe aquí el rol, las capacidades y las restricciones del agente." />
+          <p className="text-[10px] text-gray-600 mt-2">La regla de formato DeepSeek-R1 se añade automáticamente al guardar.</p>
+        </div>
+      )}
+
+      {/* Hiperparámetros */}
+      {activeTab === 'params' && (
+        <div className="space-y-6">
+          <Slider label="Temperatura" value={temperature} min={0} max={1.2} step={0.01} onChange={setTemperature} />
+          <div>
+            <div className="flex justify-between mb-1.5">
+              <span className="text-xs text-gray-400">Tokens máximos (num_predict)</span>
+              <span className="text-xs font-mono text-purple-400">{numPredict}</span>
+            </div>
+            <input type="range" min={256} max={8192} step={256} value={numPredict}
+              onChange={e => setNumPredict(Number(e.target.value))}
+              className="w-full h-1.5 bg-[#333] rounded-full appearance-none cursor-pointer accent-purple-500" />
+            <div className="flex justify-between text-[10px] text-gray-600 mt-1"><span>256</span><span>8192</span></div>
+          </div>
+          <div>
+            <div className="flex justify-between mb-1.5">
+              <span className="text-xs text-gray-400">Ventana de contexto (num_ctx)</span>
+              <span className="text-xs font-mono text-purple-400">{numCtx.toLocaleString()}</span>
+            </div>
+            <input type="range" min={2048} max={16384} step={1024} value={numCtx}
+              onChange={e => setNumCtx(Number(e.target.value))}
+              className="w-full h-1.5 bg-[#333] rounded-full appearance-none cursor-pointer accent-purple-500" />
+            <div className="flex justify-between text-[10px] text-gray-600 mt-1"><span>2k</span><span>16k</span></div>
+          </div>
+          <Toggle checked={busquedaWeb} onChange={setBusquedaWeb} label="Activar búsqueda web automática" />
+        </div>
+      )}
+
+      {/* Herramientas */}
+      {activeTab === 'tools' && (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between mb-3">
+            <p className="text-xs text-gray-500">Activa las herramientas que este agente puede usar</p>
+            <div className="flex gap-2">
+              <button onClick={() => setAllowedTools(ALL_TOOLS.map(t => t.id))} className="text-[10px] text-purple-400 hover:underline">Todas</button>
+              <button onClick={() => setAllowedTools([])} className="text-[10px] text-gray-500 hover:underline">Ninguna</button>
+            </div>
+          </div>
+          {ALL_TOOLS.map(tool => {
+            const active = allowedTools.includes(tool.id);
+            return (
+              <div key={tool.id} onClick={() => toggleTool(tool.id)}
+                className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition-all ${active ? 'border-purple-700/50 bg-purple-950/20' : 'border-[#222] hover:border-[#333] bg-[#111]'}`}>
+                <span className="text-lg w-6 text-center shrink-0">{tool.icon}</span>
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs font-medium text-white">{tool.label}</p>
+                  <p className="text-[10px] text-gray-500 truncate">{tool.desc}</p>
+                </div>
+                <div className={`w-4 h-4 rounded border flex items-center justify-center shrink-0 transition-all ${active ? 'bg-purple-500 border-purple-500' : 'border-[#444]'}`}>
+                  {active && <span className="text-[9px] text-white font-bold">✓</span>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <div className="flex justify-end gap-3 mt-6 pt-5 border-t border-[#222]">
+        <Button variant="secondary" onClick={onClose}>Cancelar</Button>
+        <Button onClick={handleSave} loading={saving}>{isEdit ? 'Guardar cambios' : 'Crear agente'}</Button>
+      </div>
+    </Modal>
   );
 }
