@@ -310,7 +310,45 @@ try { seedSeoGeoAgent(); } catch (e) { console.error('[SEED] seedSeoGeoAgent fal
 
 // ─── Utilidades ───────────────────────────────────────────────────────────────
 
-app.use(cors());
+// ─── CORS ───────────────────────────────────────────────────────────────────
+// Orígenes permitidos: se leen de ALLOWED_ORIGINS o CORS_ALLOWED_ORIGINS
+// (lista separada por comas), con un fallback fijo por si la variable de
+// entorno no llega a estar definida en Coolify.
+const DEFAULT_ALLOWED_ORIGINS = [
+  'https://zocoia.es',
+  'https://www.zocoia.es',
+];
+
+function parseOriginsList(raw) {
+  if (!raw) return [];
+  return raw.split(',').map(o => o.trim()).filter(Boolean);
+}
+
+const ENV_ALLOWED_ORIGINS = [
+  ...parseOriginsList(process.env.ALLOWED_ORIGINS),
+  ...parseOriginsList(process.env.CORS_ALLOWED_ORIGINS),
+];
+
+const ALLOWED_ORIGINS = ENV_ALLOWED_ORIGINS.length > 0
+  ? ENV_ALLOWED_ORIGINS
+  : DEFAULT_ALLOWED_ORIGINS;
+
+console.log('🌐 CORS — orígenes permitidos:', ALLOWED_ORIGINS.join(', '));
+
+app.use(cors({
+  origin(origin, callback) {
+    // Peticiones sin cabecera Origin (curl, health checks, server-to-server)
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    console.warn(`🚫 CORS bloqueado para origen: ${origin}`);
+    return callback(new Error(`Origen no permitido por CORS: ${origin}`));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+// Responder explícitamente a las peticiones preflight en todas las rutas
+app.options('*', cors());
 app.use(express.json());
 
 function signToken(user) {
