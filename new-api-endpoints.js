@@ -84,11 +84,24 @@ export function registerNewApiEndpoints(app, db, authMiddleware) {
     }
   });
 
-  // ==================== ENDPOINTS DE API KEYS ====================
+  // ==================== ENDPOINTS DE API KEYS (CLAVES EXTERNAS) ====================
+  // IMPORTANTE: estos endpoints gestionan claves de API de PROVEEDORES EXTERNOS
+  // que el propio usuario aporta (ej. su propia clave de OpenAI/Anthropic/etc.),
+  // NO las claves de Zoco IA que genera el propio sistema (esas viven en
+  // server.js bajo la misma ruta base /api/keys, sin /external).
+  //
+  // CORREGIDO: antes este archivo registraba también POST /api/keys (sin
+  // /external), colisionando con la definición real de server.js que crea
+  // las claves sk-zoco-... a partir de { name, type }. Como este módulo se
+  // registra ANTES en server.js, Express usaba SIEMPRE esta versión (que
+  // exige { name, apiKey, provider }), y el formulario real del frontend
+  // (que solo envía "name" y "type") recibía el error "Nombre, API Key y
+  // proveedor son requeridos" sin poder crear nunca una clave de Zoco IA.
+  // Renombrado a /api/keys/external para eliminar el conflicto de rutas.
 
   /**
    * POST /api/keys/validate
-   * Valida una API Key antes de guardarla
+   * Valida una API Key de un proveedor externo antes de guardarla
    */
   app.post('/api/keys/validate', authMiddleware, async (req, res) => {
     try {
@@ -112,10 +125,12 @@ export function registerNewApiEndpoints(app, db, authMiddleware) {
   });
 
   /**
-   * POST /api/keys
-   * Crea una nueva API Key con validación
+   * POST /api/keys/external
+   * Guarda una API Key de un proveedor externo (traída por el propio usuario),
+   * validándola primero. Distinto de POST /api/keys (server.js), que genera
+   * claves propias de Zoco IA (sk-zoco-...).
    */
-  app.post('/api/keys', authMiddleware, async (req, res) => {
+  app.post('/api/keys/external', authMiddleware, async (req, res) => {
     try {
       const { name, apiKey, provider } = req.body;
 
@@ -164,8 +179,8 @@ export function registerNewApiEndpoints(app, db, authMiddleware) {
         createdAt: new Date().toISOString(),
       });
     } catch (err) {
-      console.error('Error creating API key:', err);
-      res.status(500).json({ error: 'Error al crear la API Key' });
+      console.error('Error creating external API key:', err);
+      res.status(500).json({ error: 'Error al crear la API Key externa' });
     }
   });
 
