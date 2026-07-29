@@ -3,6 +3,7 @@ import path from 'path';
 import { execFile } from 'child_process';
 import { Sandbox as CodeSandbox } from '@e2b/code-interpreter';
 import { Sandbox as DesktopSandbox } from '@e2b/desktop';
+import { CONTROLAR_ORDENADOR_TOOL_SCHEMA } from './ollama-tools-schema.js';
 
 /**
  * Raíz donde viven los "workspaces" de cada agente (uno por agentId).
