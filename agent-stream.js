@@ -5,7 +5,8 @@
  * Permite ejecutar comandos reales en un sandbox seguro y transmitir la salida en vivo.
  */
 
-import { DesktopSandbox } from '@e2b/desktop';
+import pkg from '@e2b/desktop';
+const { Sandbox: DesktopSandbox } = pkg;
 import { logger } from './logger.js';
 
 /**
