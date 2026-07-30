@@ -6,6 +6,7 @@ import ToolboxPanel from '../components/ToolboxPanel';
 import OrdenadorZocoPanel from '../components/OrdenadorZocoPanel';
 import ApiKeyTable from '../components/ApiKeyTable';
 import ApiKeyModal from '../components/ApiKeyModal';
+import BillingPanel from '../components/BillingPanel';
 
 interface Recurso { id: string; type: string; name: string; data: Record<string, any>; createdAt: string; }
 interface ApiKey { id: string; name: string; display: string; revoked: boolean; createdAt: string; }
@@ -350,6 +351,8 @@ export default function Dashboard() {
               <ApiKeyTable keys={keys} onDelete={handleDeleteKey} onCopy={handleCopyKey} />
             </div>
           )}
+
+          {activeTab === 'billing' && <BillingPanel />}
 
           {activeTab === 'habilidad' && <ToolboxPanel />}
           {activeTab === 'manus-agent' && <ManusAgentPanel />}
