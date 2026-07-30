@@ -6,6 +6,7 @@ import './index.css';
 import { AuthProvider } from './src/context/AuthContext';
 import ProtectedRoute from './src/components/ProtectedRoute';
 import Dashboard from './src/pages/Dashboard';
+import ZocoComputer from './src/pages/ZocoComputer';
 import LoginPage from './src/pages/LoginPage';
 import RegisterPage from './src/pages/RegisterPage';
 import ForgotPasswordPage from './src/pages/ForgotPasswordPage';
@@ -19,6 +20,14 @@ function AppRouter() {
         <Route path="/registro" element={<RegisterPage />} />
         <Route path="/olvide-password" element={<ForgotPasswordPage />} />
         <Route path="/restablecer-password" element={<ResetPasswordPage />} />
+        <Route
+          path="/computer"
+          element={
+            <ProtectedRoute>
+              <ZocoComputer />
+            </ProtectedRoute>
+          }
+        />
         <Route
           path="/"
           element={

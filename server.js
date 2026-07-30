@@ -43,6 +43,13 @@ try {
   const m = await import('./new-api-endpoints.js');
   registerNewApiEndpoints = m.default || m.registerNewApiEndpoints || null;
 } catch {}
+let registerComputerRoutes = null;
+try {
+  const m = await import('./zoco-computer.js');
+  registerComputerRoutes = m.registerComputerRoutes;
+} catch (err) {
+  console.warn('⚠️  zoco-computer.js no disponible:', err?.message);
+}
 
 dotenv.config();
 
@@ -1170,6 +1177,41 @@ app.put('/admin/clientes/:id', authMiddleware, requireAdmin, (req, res) => {
 
 registerBridgeAdminRoutes({ app, db, authMiddleware, requireAdmin, uuidv4 });
 registerSessionRoutes({ app, db, authMiddleware, uuidv4, serverSecret: JWT_SECRET, processChatCompletion });
+
+// ─── El Ordenador de Zoco: agente autónomo tipo Manus ──────────────────────
+if (registerComputerRoutes) {
+  registerComputerRoutes({
+    app,
+    db,
+    authMiddleware,
+    uuidv4,
+    jwt,
+    JWT_SECRET,
+    workspacesRoot: WORKSPACES_ROOT,
+    // Fábrica de callModel: cada tarea usa el motor y mapa de modelos del gateway
+    makeCallModel: ({ userId, model }) => {
+      const modeloFinal = OLLAMA_MODEL_MAP[model] || model;
+      return async (msgs, tools, toolChoice) => {
+        const userCheck = db.prepare('SELECT creditos, activo FROM users WHERE id = ?').get(userId);
+        if (!userCheck || !userCheck.activo) { const e = new Error('Cuenta desactivada'); e.status = 403; throw e; }
+        if (userCheck.creditos <= BALANCE_BLOCK_THRESHOLD) { const e = new Error('Créditos insuficientes'); e.status = 402; throw e; }
+        const data = await callChatModel({ ollamaUrl: OLLAMA_URL, ollamaModel: modeloFinal, messages: msgs, maxTokens: 4096, temperature: 0.7, tools, toolChoice, ollamaOptions: { num_predict: 4096, num_ctx: 16384 } });
+        const totalTokens = data.usage?.total_tokens || 0;
+        const coste = totalTokens * 0.000002;
+        if (coste > 0) {
+          db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)').run(uuidv4(), userId, coste, 'gasto', `Ordenador de Zoco · ${modeloFinal}`);
+          db.prepare('UPDATE users SET creditos = creditos - ? WHERE id = ?').run(coste, userId);
+        }
+        return data;
+      };
+    },
+    getUserTavilyKey: (userId) => {
+      const row = db.prepare("SELECT data FROM resources WHERE user_id = ? AND type IN ('credencial','habilidad') AND name = 'TAVILY_API_KEY'").get(userId);
+      if (!row) return null;
+      try { return JSON.parse(row.data || '{}').valor || null; } catch { return null; }
+    },
+  });
+}
 registerConsoleRoutes({ app, db, authMiddleware, uuidv4, processChatCompletion });
 resumeInterruptedBatches(db, processChatCompletion);
 
