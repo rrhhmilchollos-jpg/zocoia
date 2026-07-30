@@ -3,6 +3,7 @@ import { useAuth, API_BASE } from '../context/AuthContext';
 import { ToastProvider, toast, CopyButton, Button, Badge, Spinner } from '../components/ui';
 import AgentModal from '../components/AgentModal';
 import ApiKeyModal from '../components/ApiKeyModal';
+import OrdenadorZoco from './OrdenadorZoco';
 import SkillsPanel from '../components/SkillsPanel';
 import { useApi } from '../hooks/useApi';
 
@@ -316,7 +317,11 @@ export default function Dashboard() {
                   <NavItem tab="admin" label="Panel Admin" icon="🛡️" />
                 </div>
               )}
-              <div className="pt-2"><NavItem tab="docs" label="Documentación" icon="📖" /></div>
+              <div className="pt-2">
+              <div className="px-3 py-1.5 text-[11px] font-bold text-purple-500/70 uppercase tracking-wider">Ordenador</div>
+              <NavItem tab="ordenador" label="Ordenador de Zoco" icon="🖥️" />
+            </div>
+            <div className="pt-2"><NavItem tab="docs" label="Documentación" icon="📖" /></div>
             </nav>
           )}
 
@@ -753,6 +758,9 @@ export default function Dashboard() {
                 </div>
               </div>
             )}
+
+            {/* ── ORDENADOR DE ZOCO ── */}
+            {activeTab === 'ordenador' && <OrdenadorZoco />}
 
             {/* ── DOCS ── */}
             {activeTab === 'docs' && (
