@@ -244,6 +244,43 @@ const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || 'ollama';
 // VRAM puede tardar; los modelos locales son más lentos que la nube).
 const OLLAMA_TIMEOUT_MS = parseInt(process.env.OLLAMA_TIMEOUT_MS || '300000', 10);
 
+// ─── PROVEEDOR ALTERNATIVO OPENAI (migración a Hetzner) ───────────────────
+// En el servidor nuevo (Hetzner) NO hay acceso a la red privada donde vive
+// Ollama (10.19.0.5:11434). Cuando AI_PROVIDER=openai (o USE_OLLAMA=false) y
+// existe OPENAI_API_KEY, el motor llama a api.openai.com con el MISMO formato
+// OpenAI-compatible que ya usa callChatModel. Los modelos comerciales zoco-*/
+// maris-* se traducen a modelos reales de OpenAI. Si Ollama vuelve a estar
+// accesible, basta poner AI_PROVIDER=ollama (o quitar la variable) sin tocar
+// código: el flujo Ollama queda intacto.
+const AI_PROVIDER = (process.env.AI_PROVIDER || (String(process.env.USE_OLLAMA).toLowerCase() === 'false' ? 'openai' : 'ollama')).toLowerCase();
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || 'https://api.openai.com';
+const USE_OPENAI_ENGINE = AI_PROVIDER === 'openai' && !!OPENAI_API_KEY;
+const OPENAI_DEFAULT_MODEL = process.env.MODEL_NAME || process.env.GENERATION_MODEL || 'gpt-4o-mini';
+const OPENAI_MODEL_MAP = {
+  'zoco-flash': process.env.OPENAI_MODEL_FLASH || 'gpt-4o-mini',
+  'zoco-plus':  process.env.OPENAI_MODEL_PLUS  || OPENAI_DEFAULT_MODEL,
+  'zoco-max':   process.env.OPENAI_MODEL_MAX   || 'gpt-4o',
+  'zoco-lab':   process.env.OPENAI_MODEL_LAB   || OPENAI_DEFAULT_MODEL,
+  'maris-velox': process.env.OPENAI_MODEL_FLASH || 'gpt-4o-mini', 'maris-velox-1b': process.env.OPENAI_MODEL_FLASH || 'gpt-4o-mini',
+  'maris-core':  process.env.OPENAI_MODEL_PLUS  || OPENAI_DEFAULT_MODEL, 'maris-core-7b': process.env.OPENAI_MODEL_PLUS || OPENAI_DEFAULT_MODEL,
+  'maris-pro':   process.env.OPENAI_MODEL_MAX   || 'gpt-4o', 'maris-pro-32b': process.env.OPENAI_MODEL_MAX || 'gpt-4o',
+  'maris-beta':  process.env.OPENAI_MODEL_MAX   || 'gpt-4o', 'maris-beta-70b': process.env.OPENAI_MODEL_MAX || 'gpt-4o',
+};
+// Traduce cualquier identificador (comercial, de Ollama o ya de OpenAI) a un
+// modelo válido de OpenAI. Los nombres locales tipo "Zoco-Max:latest" o
+// "deepseek-r1" no existen en OpenAI → caen al modelo por defecto.
+function resolveOpenAiModel(modelId) {
+  if (OPENAI_MODEL_MAP[modelId]) return OPENAI_MODEL_MAP[modelId];
+  if (/^(gpt-|o[0-9]|chatgpt-)/i.test(String(modelId))) return modelId;
+  return OPENAI_DEFAULT_MODEL;
+}
+if (USE_OPENAI_ENGINE) {
+  console.log(`🧠 Motor de IA: OpenAI (${OPENAI_BASE_URL}) — modelo por defecto ${OPENAI_DEFAULT_MODEL}`);
+} else {
+  console.log(`🧠 Motor de IA: Ollama (${OLLAMA_URL})`);
+}
+
 async function webSearch(query) {
   try {
     const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
@@ -709,7 +746,39 @@ async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temp
     }
   }
 
-  // FLUJO EXCLUSIVO OLLAMA — sin fallback a proveedores en la nube. Si Ollama
+  // MOTOR OPENAI (migración Hetzner): cuando AI_PROVIDER=openai, la llamada va
+  // directa a api.openai.com con el mismo cuerpo OpenAI-compatible, sin las
+  // options propietarias de Ollama y con el modelo traducido a uno real.
+  if (USE_OPENAI_ENGINE) {
+    const openaiEndpoint = `${OPENAI_BASE_URL.replace(/\/+$/, '')}/v1/chat/completions`;
+    const openaiModel = resolveOpenAiModel(ollamaModel);
+    const MAX_ATTEMPTS_OAI = 2;
+    let lastErrOai;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS_OAI; attempt++) {
+      try {
+        return await doFetch(openaiEndpoint, `Bearer ${OPENAI_API_KEY}`, openaiModel, null);
+      } catch (err) {
+        lastErrOai = err;
+        if (err.name === 'AbortError') {
+          const e = new Error(`Timeout: el modelo ${openaiModel} tardó demasiado en responder en OpenAI`);
+          e.status = 504;
+          throw e;
+        }
+        const transient = !err.status || err.status >= 500 || err.status === 429;
+        if (transient && attempt < MAX_ATTEMPTS_OAI - 1) {
+          console.warn(`[OpenAI] fallo transitorio (${err.message}) — reintentando...`);
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
+        if (err.status) throw err;
+        const e = new Error(`Error de conexión con OpenAI: ${err.message}`);
+        e.status = 502;
+        throw e;
+      }
+    }
+    throw lastErrOai;
+  }
+  // FLUJO OLLAMA — sin fallback automático. Si Ollama
   // tarda o falla, se hace UN reintento local (el primer intento puede fallar
   // mientras el modelo se carga en memoria) y después se devuelve el error
   // real: la petición nace y muere en el servidor local de Ollama.
@@ -856,7 +925,9 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   // agente/petición trae directamente un nombre de modelo de Ollama (p.ej.
   // "deepseek-r1", "qwen2.5-coder"), se usa tal cual.
   const modeloFinal = OLLAMA_MODEL_MAP[modeloZocoia] || modeloZocoia;
-  console.log(`[IA] ${modeloZocoia} → ${modeloFinal} via Ollama (${OLLAMA_URL})`);
+  console.log(USE_OPENAI_ENGINE
+    ? `[IA] ${modeloZocoia} → ${resolveOpenAiModel(modeloFinal)} via OpenAI (${OPENAI_BASE_URL})`
+    : `[IA] ${modeloZocoia} → ${modeloFinal} via Ollama (${OLLAMA_URL})`);
 
   // Parámetros avanzados de IA por agente (num_predict / num_ctx / temperature),
   // con límites de seguridad y valores por defecto si el agente no los define.
