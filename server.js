@@ -930,6 +930,13 @@ app.get('/api/keys', authMiddleware, (req, res) => {
 });
 
 app.post('/api/keys', authMiddleware, (req, res) => {
+  // ── DEBUG TEMPORAL — a petición explícita del usuario, para diagnosticar
+  // por qué sigue apareciendo "Nombre, API Key y proveedor son requeridos"
+  // pese a que esta ruta (la correcta, {name, type}) ya no tiene conflicto
+  // de registro con new-api-endpoints.js. Quitar estas 2 líneas una vez
+  // resuelto el diagnóstico. ──────────────────────────────────────────────
+  console.log('[DEBUG /api/keys] body recibido:', JSON.stringify(req.body));
+  console.log('[DEBUG /api/keys] content-type:', req.headers['content-type']);
   const { name, type } = req.body || {};
   if (!name || !name.trim()) return res.status(400).json({ error: 'El nombre es obligatorio' });
   const keyType = type === 'gratuita' ? 'gratuita' : 'pago';
