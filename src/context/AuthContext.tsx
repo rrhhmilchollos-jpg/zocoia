@@ -1,7 +1,10 @@
 import React, { createContext, useContext, useEffect, useState, ReactNode } from 'react';
 
-// En producción, VITE_API_URL debe ser la URL de tu servicio en Coolify (https://zocoia.es)
-export const API_BASE = import.meta.env.VITE_API_URL || 'https://zocoia.es';
+// Prioridad: 1. Env Var, 2. Subdominio api, 3. Localhost
+export const API_BASE = import.meta.env.VITE_API_BASE || 
+  (typeof window !== 'undefined' && window.location.hostname.includes('zocoia.es') 
+    ? 'https://api.zocoia.es' 
+    : 'http://localhost:8080');
 
 export interface AuthUser {
   id: string;
@@ -46,6 +49,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           const data = await res.json();
           setUser(data.user);
         } else {
+          // Si el token es inválido o expiró, limpiar pero no bloquear la app
           localStorage.removeItem(TOKEN_STORAGE_KEY);
           setToken(null);
           setUser(null);
@@ -113,3 +117,5 @@ export function useAuth() {
   if (!ctx) throw new Error('useAuth debe usarse dentro de AuthProvider');
   return ctx;
 }
+
+export default AuthProvider;
