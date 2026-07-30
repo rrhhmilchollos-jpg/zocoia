@@ -1,8 +1,10 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { execFile } from 'child_process';
-import { Sandbox as CodeSandbox } from '@e2b/code-interpreter';
-import { Sandbox as DesktopSandbox } from '@e2b/desktop';
+import pkgCode from '@e2b/code-interpreter';
+import pkgDesktop from '@e2b/desktop';
+const { Sandbox: CodeSandbox } = pkgCode;
+const { Sandbox: DesktopSandbox } = pkgDesktop;
 
 /**
  * Raíz donde viven los "workspaces" de cada agente (uno por agentId).

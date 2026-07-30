@@ -4,7 +4,8 @@
  * Controlador para el control del ordenador virtual utilizando E2B Desktop.
  */
 
-import { DesktopSandbox } from '@e2b/desktop';
+import pkg from '@e2b/desktop';
+const { Sandbox: DesktopSandbox } = pkg;
 
 /**
  * Maneja una acción en el ordenador virtual de Zoco
