@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useEffect, useState, ReactNode } from 'react';
 
-export const API_BASE = import.meta.env.VITE_API_URL || window.location.origin;
+// En producción, VITE_API_URL debe ser la URL de tu servicio en Coolify (https://zocoia.es)
+export const API_BASE = import.meta.env.VITE_API_URL || 'https://zocoia.es';
 
 export interface AuthUser {
   id: string;
@@ -47,6 +48,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         } else {
           localStorage.removeItem(TOKEN_STORAGE_KEY);
           setToken(null);
+          setUser(null);
         }
       } catch (err) {
         console.error('Error cargando sesión:', err);

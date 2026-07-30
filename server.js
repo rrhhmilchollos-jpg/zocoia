@@ -15,6 +15,10 @@ import { runDeterministicAgent, resolveTemplatePrompt, registerBridgeAdminRoutes
 import { seedOwnerAgentsIfEmpty, seedBasicAgentsForUser, isOwnerUser, DEEPSEEK_SAFE_FORMAT_RULE, ENTERPRISE_REQUIRED_MESSAGE } from './seed-owner-agents.js';
 import { registerSessionRoutes, validateZocoApiKey } from './zoco-sessions.js';
 import { registerConsoleRoutes, resumeInterruptedBatches, buildEnvironmentContext } from './zoco-console.js';
+import { handleOrdenadorZocoAction } from './ordenadorZoco.js';
+import registerNewApiEndpoints from './new-api-endpoints.js';
+import { registerAgentStreamRoutes } from './agent-stream.js';
+import { registerEventStreamRoute, emitirEventoAgente } from './eventos-agente.js';
 
 dotenv.config();
 
@@ -488,8 +492,23 @@ try {
   console.error('[SEED ERROR] Falló seedSeoGeoAgent, pero el servidor sigue vivo:', error);
 }
 
-app.use(cors());
+app.use(cors({
+  origin: [
+    'https://zocoia.es',
+    'https://www.zocoia.es',
+    /\.vercel\.app$/,
+    'http://localhost:5173',
+    'http://localhost:8080'
+  ],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
+
+registerNewApiEndpoints(app, db, authMiddleware);
+registerAgentStreamRoutes(app, authMiddleware);
+registerEventStreamRoute({ app, jwt, JWT_SECRET, db });
 
 function signToken(user) {
   return jwt.sign(
@@ -1706,6 +1725,63 @@ app.post('/v1/messages', authMiddleware, async (req, res) => {
     const status = err.status || 500;
     const errorType = status === 402 ? 'permission_error' : status === 401 ? 'authentication_error' : status === 404 ? 'invalid_request_error' : 'api_error';
     res.status(status).json({ type: 'error', error: { type: errorType, message: err.message || 'Error interno' } });
+  }
+});
+
+// ── Endpoint de Ordenador de Zoco ──────────────────────────────────────
+app.post('/api/ordenador-zoco', authMiddleware, async (req, res) => {
+  try {
+    const { action, params } = req.body;
+    const result = await handleOrdenadorZocoAction(action, params);
+    res.json(result);
+  } catch (err) {
+    console.error('Error en /api/ordenador-zoco:', err);
+    res.status(500).json({ error: err.message || 'Error en el ordenador de Zoco' });
+  }
+});
+
+// ── Endpoint compatible con OpenAI (Chat Completions API) ────────────
+app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
+  try {
+    const { messages, model, temperature, max_tokens, stream, tools, tool_choice } = req.body || {};
+    const result = await processChatCompletion(req.auth.sub, {
+      messages,
+      model,
+      temperature,
+      max_tokens: max_tokens,
+      tools,
+      tool_choice,
+      apiKeyId: req.auth.viaApiKey ? req.auth.apiKeyId : undefined,
+      apiKeyType: req.auth.viaApiKey ? req.auth.apiKeyType : undefined,
+    });
+
+    if (!stream) {
+      return res.json(result);
+    }
+
+    // Streaming SSE (simulado para compatibilidad)
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    
+    const chunk = {
+      id: `chatcmpl-${uuidv4()}`,
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      model: result.model,
+      choices: [{
+        index: 0,
+        delta: { content: result.choices[0].message.content },
+        finish_reason: 'stop'
+      }]
+    };
+    
+    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } catch (err) {
+    console.error('Error en /v1/chat/completions:', err);
+    res.status(err.status || 500).json({ error: { message: err.message } });
   }
 });
 
