@@ -4,7 +4,11 @@ FROM node:20-slim AS frontend-builder
 WORKDIR /app
 RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
 COPY package*.json ./
-RUN npm install
+# Coolify inyecta NODE_ENV=production como build-arg, lo que hace que npm omita
+# las devDependencies (vite, typescript...). Se fuerza NODE_ENV=development y
+# --include=dev SOLO en esta etapa de build del frontend.
+ENV NODE_ENV=development
+RUN npm install --include=dev
 COPY . .
 RUN npm run build
 
@@ -14,6 +18,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies for the server
+ENV NODE_ENV=production
 COPY package*.json ./
 RUN npm install --omit=dev
 
