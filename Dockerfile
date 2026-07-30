@@ -24,7 +24,7 @@ COPY --from=frontend-builder /app/dist ./public
 # IMPORTANTE: cada módulo .js que server.js importa DEBE estar en esta lista.
 # (El despliegue del 18/07 crasheó con ERR_MODULE_NOT_FOUND porque
 # zoco-sessions.js no estaba incluído aquí.)
-COPY server.js tools.js bridge-marisai.js bridge-marisai-prompts.js seed-owner-agents.js zoco-sessions.js zoco-console.js parchear.js ./
+COPY server.js tools.js bridge-marisai.js bridge-marisai-prompts.js seed-owner-agents.js zoco-sessions.js zoco-console.js parchear.js new-api-endpoints.js eventos-agente.js logger.js ordenadorZoco.js revolut-controller.js usage-billing.js agent-stream.js ./
 
 # Set environment variables
 ENV NODE_ENV=production
