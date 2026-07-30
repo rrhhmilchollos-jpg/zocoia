@@ -17,6 +17,8 @@ import { registerSessionRoutes, validateZocoApiKey } from './zoco-sessions.js';
 import { registerConsoleRoutes, resumeInterruptedBatches, buildEnvironmentContext } from './zoco-console.js';
 import { handleOrdenadorZocoAction } from './ordenadorZoco.js';
 import registerNewApiEndpoints from './new-api-endpoints.js';
+import { registerRevolutRoutes } from './revolut-controller.js';
+import { registerBillingRoutes } from './usage-billing.js';
 import { registerAgentStreamRoutes } from './agent-stream.js';
 import { registerEventStreamRoute, emitirEventoAgente } from './eventos-agente.js';
 
@@ -496,6 +498,8 @@ app.use(cors({
   origin: [
     'https://zocoia.es',
     'https://www.zocoia.es',
+    'https://marisai.es',
+    'https://www.marisai.es',
     /\.vercel\.app$/,
     'http://localhost:5173',
     'http://localhost:8080'
@@ -507,8 +511,10 @@ app.use(cors({
 app.use(express.json());
 
 registerNewApiEndpoints(app, db, authMiddleware);
+registerRevolutRoutes(app, db, authMiddleware);
+registerBillingRoutes(app, db, authMiddleware);
 registerAgentStreamRoutes(app, authMiddleware);
-registerEventStreamRoute({ app, jwt, JWT_SECRET, db });
+registerEventStreamRoute({ app, jwt, JWT_SECRET: process.env.JWT_SECRET || JWT_SECRET, db });
 
 function signToken(user) {
   return jwt.sign(
