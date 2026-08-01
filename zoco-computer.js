@@ -1,736 +1,640 @@
-// zoco-computer.js — "El Ordenador de Zoco": sistema completo de agente
-// autónomo estilo Manus para zocoia.es.
-// -----------------------------------------------------------------------------
-// Replica el flujo de trabajo de un agente general autónomo de 0 a 100%:
-//
-//   1. PLANIFICACIÓN   — al recibir una tarea, el agente genera un plan de
-//                        fases (visible y actualizable en vivo).
-//   2. BUCLE AGÉNTICO  — itera: pensar → elegir herramienta → ejecutar →
-//                        observar resultado → seguir, hasta completar la tarea.
-//   3. HERRAMIENTAS    — shell (sandbox), archivos (workspace por tarea),
-//                        búsqueda web, lectura de páginas web, gestión del
-//                        plan y mensajes al usuario.
-//   4. EVENTOS EN VIVO — cada acción se retransmite por SSE al frontend
-//                        (panel "Ordenador de Zoco" tipo Manus: terminal,
-//                        editor, navegador).
-//   5. PERSISTENCIA    — tareas, mensajes, eventos y plan en SQLite; el
-//                        historial sobrevive a recargas y reinicios.
-//
-// Sin dependencias nuevas: usa fetch nativo de Node 18+, child_process,
-// better-sqlite3 (ya presente) y SSE estándar de Express.
-// -----------------------------------------------------------------------------
+/**
+ * zoco-computer.js — El Ordenador de Zoco
+ * Agente autónomo estilo Manus.im
+ *
+ * Usa Claude de Anthropic como motor de razonamiento con tool-calling nativo.
+ * Emite eventos SSE en tiempo real al panel derecho (terminal, editor, navegador).
+ * Ejecuta comandos reales en un sandbox seguro dentro del propio contenedor.
+ *
+ * Herramientas disponibles (igual que Manus):
+ *   - bash        → ejecutar comandos de terminal
+ *   - read_file   → leer un archivo
+ *   - write_file  → escribir/crear un archivo
+ *   - browser     → abrir una URL y obtener el contenido
+ *   - finish      → finalizar la tarea con un resumen
+ */
 
-import { spawn } from 'child_process';
-import path from 'path';
-import fs from 'fs';
-import fsp from 'fs/promises';
-import { buildComputerSystemPrompt } from './zoco-prompt.js';
-import { applyFileEdits, browserAction, exposePort } from './zoco-tools-extra.js';
-import { runAgentLoop as runLoop, recoverOrphanTasks } from './zoco-loop.js';
+import Anthropic from "@anthropic-ai/sdk";
+import { exec } from "child_process";
+import { promisify } from "util";
+import fs from "fs";
+import path from "path";
+import fetch from "node-fetch";
 
-export { buildComputerSystemPrompt };
+const execAsync = promisify(exec);
 
-// ─── Configuración ───────────────────────────────────────────────────────────
+// ─── Configuración ────────────────────────────────────────────────────────────
 
-// El límite de iteraciones lo gestiona ahora ./zoco-loop.js (COMPUTER_MAX_ITERATIONS).
-const SHELL_TIMEOUT_MS = parseInt(process.env.COMPUTER_SHELL_TIMEOUT_MS || '120000', 10);
-const MAX_OUTPUT_CHARS = 12000;
-const MODEL_TIMEOUT_MS = parseInt(process.env.COMPUTER_MODEL_TIMEOUT_MS || '300000', 10);
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_COMPUTER_MODEL || "claude-sonnet-4-6";
+const MAX_ITERATIONS = parseInt(process.env.COMPUTER_MAX_ITERATIONS || "30", 10);
+const TOOL_TIMEOUT_MS = parseInt(process.env.COMPUTER_TOOL_TIMEOUT_MS || "30000", 10);
+const SANDBOX_DIR = process.env.COMPUTER_SANDBOX_DIR || "/tmp/zoco-sandbox";
+const MAX_OUTPUT_CHARS = 8000;
 
-// ─── Prompt de sistema del agente ────────────────────────────────────────────
+// ─── Cliente Anthropic ────────────────────────────────────────────────────────
 
-// El prompt de sistema vive ahora en ./zoco-prompt.js (reexportado arriba).
+let _anthropic = null;
+function getAnthropic() {
+  if (!_anthropic) {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) throw new Error("ANTHROPIC_API_KEY no configurada.");
+    _anthropic = new Anthropic({ apiKey });
+  }
+  return _anthropic;
+}
 
-// ─── Definición de herramientas (formato OpenAI function calling) ────────────
+// ─── Herramientas (tool-calling nativo de Anthropic) ─────────────────────────
 
-export const COMPUTER_TOOLS = [
+const TOOLS = [
   {
-    type: 'function',
-    function: {
-      name: 'gestionar_plan',
-      description: 'Crea o actualiza el plan de fases de la tarea. Úsalo al empezar y cada vez que completes una fase.',
-      parameters: {
-        type: 'object',
-        properties: {
-          fases: {
-            type: 'array',
-            description: 'Lista completa de fases del plan',
-            items: {
-              type: 'object',
-              properties: {
-                titulo: { type: 'string', description: 'Título breve de la fase' },
-                estado: { type: 'string', enum: ['pendiente', 'en_curso', 'completada'], description: 'Estado actual de la fase' },
-              },
-              required: ['titulo', 'estado'],
-            },
-          },
+    name: "bash",
+    description: "Ejecuta un comando de bash en el sandbox seguro. Úsalo para leer directorios, instalar paquetes, ejecutar scripts, hacer git, curl, etc. El directorio de trabajo por defecto es el sandbox.",
+    input_schema: {
+      type: "object",
+      properties: {
+        command: {
+          type: "string",
+          description: "El comando bash a ejecutar. Puede ser multi-línea usando &&, pipes, etc.",
         },
-        required: ['fases'],
+        timeout_ms: {
+          type: "number",
+          description: "Timeout en milisegundos (opcional, máx 60000).",
+        },
       },
+      required: ["command"],
     },
   },
   {
-    type: 'function',
-    function: {
-      name: 'ejecutar_terminal',
-      description: 'Ejecuta un comando bash en el terminal del workspace de la tarea y devuelve stdout/stderr reales.',
-      parameters: {
-        type: 'object',
-        properties: {
-          comando: { type: 'string', description: 'Comando bash no interactivo a ejecutar' },
+    name: "read_file",
+    description: "Lee el contenido completo de un archivo. Úsalo para leer código, configuraciones, logs, etc.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Ruta absoluta o relativa al sandbox del archivo a leer.",
         },
-        required: ['comando'],
       },
+      required: ["path"],
     },
   },
   {
-    type: 'function',
-    function: {
-      name: 'escribir_archivo',
-      description: 'Crea o sobreescribe un archivo de texto en el workspace de la tarea.',
-      parameters: {
-        type: 'object',
-        properties: {
-          ruta: { type: 'string', description: 'Ruta relativa del archivo, ej: "informe.md"' },
-          contenido: { type: 'string', description: 'Contenido completo del archivo' },
+    name: "write_file",
+    description: "Escribe o sobreescribe un archivo con el contenido especificado. Crea directorios intermedios si no existen.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Ruta del archivo a escribir (relativa al sandbox o absoluta).",
         },
-        required: ['ruta', 'contenido'],
+        content: {
+          type: "string",
+          description: "Contenido completo a escribir en el archivo.",
+        },
       },
+      required: ["path", "content"],
     },
   },
   {
-    type: 'function',
-    function: {
-      name: 'editar_archivo',
-      description: 'Edita un archivo existente por búsqueda y reemplazo exacto. Más eficiente que reescribir archivos largos. Es atómico: si alguna búsqueda no coincide o es ambigua, no se aplica ningún cambio.',
-      parameters: {
-        type: 'object',
-        properties: {
-          ruta: { type: 'string', description: 'Ruta relativa del archivo a editar' },
-          ediciones: {
-            type: 'array',
-            description: 'Lista de ediciones a aplicar en orden',
-            items: {
-              type: 'object',
-              properties: {
-                buscar: { type: 'string', description: 'Texto exacto a localizar, incluidos espacios y saltos de línea. Debe ser único en el archivo salvo que uses "todas".' },
-                reemplazar: { type: 'string', description: 'Texto que sustituye al buscado. Cadena vacía para borrar.' },
-                todas: { type: 'boolean', description: 'true para reemplazar todas las apariciones en lugar de solo la primera' },
-              },
-              required: ['buscar', 'reemplazar'],
-            },
-          },
+    name: "browser",
+    description: "Obtiene el contenido de una URL (texto plano, sin JavaScript). Úsalo para buscar documentación, APIs, páginas web, etc.",
+    input_schema: {
+      type: "object",
+      properties: {
+        url: {
+          type: "string",
+          description: "URL completa a visitar (debe empezar por http:// o https://).",
         },
-        required: ['ruta', 'ediciones'],
       },
+      required: ["url"],
     },
   },
   {
-    type: 'function',
-    function: {
-      name: 'leer_archivo',
-      description: 'Lee el contenido de un archivo del workspace.',
-      parameters: {
-        type: 'object',
-        properties: {
-          ruta: { type: 'string', description: 'Ruta relativa del archivo' },
+    name: "finish",
+    description: "Finaliza la tarea con un resumen de lo que se hizo y el resultado final. SIEMPRE usa esta herramienta al terminar.",
+    input_schema: {
+      type: "object",
+      properties: {
+        summary: {
+          type: "string",
+          description: "Resumen completo de lo que se hizo, en español, con el resultado final de la tarea.",
         },
-        required: ['ruta'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'listar_archivos',
-      description: 'Lista los archivos del workspace de la tarea (recursivo).',
-      parameters: { type: 'object', properties: {}, required: [] },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'busqueda_web',
-      description: 'Busca información actualizada en la web. Devuelve títulos, URLs y extractos.',
-      parameters: {
-        type: 'object',
-        properties: {
-          consulta: { type: 'string', description: 'Consulta de búsqueda' },
+        result: {
+          type: "string",
+          description: "El resultado o artefacto principal generado (código, informe, respuesta, etc.).",
         },
-        required: ['consulta'],
       },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'leer_pagina',
-      description: 'Descarga una URL y devuelve su contenido como texto plano legible.',
-      parameters: {
-        type: 'object',
-        properties: {
-          url: { type: 'string', description: 'URL completa con https://' },
-        },
-        required: ['url'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'navegador',
-      description: 'Controla un navegador visual real con capturas de pantalla. Úsalo cuando la página necesite JavaScript, interacción, inicio de sesión o inspección visual. Para extraer solo texto es más rápido "leer_pagina".',
-      parameters: {
-        type: 'object',
-        properties: {
-          accion: { type: 'string', enum: ['navegar', 'clic', 'escribir', 'tecla', 'scroll', 'captura'], description: 'Acción a ejecutar en el navegador' },
-          url: { type: 'string', description: 'URL completa (solo para accion=navegar)' },
-          x: { type: 'number', description: 'Coordenada X del clic (solo accion=clic)' },
-          y: { type: 'number', description: 'Coordenada Y del clic (solo accion=clic)' },
-          texto: { type: 'string', description: 'Texto a teclear (solo accion=escribir)' },
-          tecla: { type: 'string', description: 'Tecla a pulsar, ej: Return, Tab, Escape (solo accion=tecla)' },
-          direccion: { type: 'string', enum: ['arriba', 'abajo'], description: 'Dirección del scroll' },
-          cantidad: { type: 'number', description: 'Intensidad del scroll, 1-20' },
-        },
-        required: ['accion'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'exponer_puerto',
-      description: 'Publica un servicio que ya esté escuchando en un puerto local del ordenador y devuelve una URL pública para que el usuario la abra. Arranca antes el servidor en segundo plano con "ejecutar_terminal".',
-      parameters: {
-        type: 'object',
-        properties: {
-          puerto: { type: 'number', description: 'Puerto local donde escucha el servicio (1024-65535)' },
-        },
-        required: ['puerto'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'mensaje_usuario',
-      description: 'Envía un mensaje breve de progreso al usuario sin terminar la tarea.',
-      parameters: {
-        type: 'object',
-        properties: {
-          texto: { type: 'string', description: 'Mensaje de progreso (1-3 frases)' },
-        },
-        required: ['texto'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'entregar_resultado',
-      description: 'Finaliza la tarea entregando el resultado final al usuario. Llámala solo cuando todo esté completo.',
-      parameters: {
-        type: 'object',
-        properties: {
-          resumen: { type: 'string', description: 'Resumen completo del resultado en Markdown' },
-          archivos: { type: 'array', items: { type: 'string' }, description: 'Rutas relativas de los archivos entregables' },
-        },
-        required: ['resumen'],
-      },
+      required: ["summary", "result"],
     },
   },
 ];
 
-// ─── SSE: suscriptores por tarea ─────────────────────────────────────────────
+// ─── Prompt del sistema ───────────────────────────────────────────────────────
 
-const subscribers = new Map(); // taskId -> Set<res>
+const SYSTEM_PROMPT = `Eres el Ordenador de Zoco, un agente de IA autónomo estilo Manus.im. Eres capaz de realizar cualquier tarea usando herramientas reales: ejecutar comandos de terminal, leer y escribir archivos, navegar por internet, y mucho más.
 
-function broadcast(taskId, event) {
-  const set = subscribers.get(taskId);
-  if (!set) return;
-  // El campo `id:` es lo que el navegador guarda como Last-Event-ID; al
-  // reconectar lo reenvía y el servidor solo repite los eventos perdidos.
-  const linea = event?.id ? `id: ${event.id}\n` : '';
-  const payload = `${linea}data: ${JSON.stringify(event)}\n\n`;
-  for (const res of set) {
-    try { res.write(payload); } catch { /* conexión cerrada */ }
-  }
-}
+COMPORTAMIENTO:
+- Trabaja de forma autónoma, paso a paso, hasta completar la tarea.
+- Usa las herramientas de forma secuencial y razonada.
+- Después de cada herramienta, analiza el resultado y decide el siguiente paso.
+- Si algo falla, adapta tu estrategia y prueba alternativas.
+- Siempre finaliza con la herramienta "finish" cuando la tarea esté completa.
 
-// ─── Persistencia ────────────────────────────────────────────────────────────
+REGLAS:
+- Responde SIEMPRE en español.
+- Nunca ejecutes comandos destructivos (rm -rf /, format, etc.) sin confirmación explícita.
+- El directorio de trabajo es ${SANDBOX_DIR} — trabaja dentro de él.
+- Si necesitas clonar repos, instalar paquetes o crear archivos, hazlo en el sandbox.
+- Para tareas de investigación, usa la herramienta browser para buscar información real.
+- Muestra tu razonamiento antes de usar cada herramienta.
 
-export function ensureComputerTables(db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS computer_tasks (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      title TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pendiente',
-      plan TEXT,
-      result TEXT,
-      model TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS computer_events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      task_id TEXT NOT NULL,
-      type TEXT NOT NULL,
-      payload TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE INDEX IF NOT EXISTS idx_computer_events_task ON computer_events(task_id, id);
-    CREATE TABLE IF NOT EXISTS computer_messages (
-      id TEXT PRIMARY KEY,
-      task_id TEXT NOT NULL,
-      role TEXT NOT NULL,
-      content TEXT NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
-}
+FORMATO DE RESPUESTA:
+- Antes de usar una herramienta, explica brevemente QUÉ vas a hacer y POR QUÉ.
+- Después de recibir el resultado de una herramienta, analiza lo que encontraste.
+- Sé conciso pero informativo en tus explicaciones.`;
 
-// Persiste el evento y lo retransmite. Es CRÍTICO incluir el `id` de la fila en
-// el broadcast: el frontend lo usa como `lastEventId` para pedir solo los
-// eventos perdidos al reconectar. Sin `id`, tras cada reconexión se reenviaba
-// todo el historial y el panel mostraba acciones duplicadas.
-function recordEvent(db, taskId, type, payload) {
-  const info = db.prepare('INSERT INTO computer_events (task_id, type, payload) VALUES (?, ?, ?)')
-    .run(taskId, type, JSON.stringify(payload || {}));
-  broadcast(taskId, {
-    id: Number(info.lastInsertRowid),
-    type,
-    ...payload,
-    ts: new Date().toISOString(),
-  });
-}
+// ─── Ejecutores de herramientas ───────────────────────────────────────────────
 
-// ─── Implementación de herramientas ──────────────────────────────────────────
+async function executeBash(command, timeoutMs = TOOL_TIMEOUT_MS) {
+  // Asegura que el sandbox existe
+  fs.mkdirSync(SANDBOX_DIR, { recursive: true });
 
-function safePath(workspaceDir, rel) {
-  const abs = path.resolve(workspaceDir, rel || '.');
-  if (!abs.startsWith(path.resolve(workspaceDir))) {
-    throw new Error('Ruta fuera del workspace no permitida');
-  }
-  return abs;
-}
+  const timeout = Math.min(timeoutMs || TOOL_TIMEOUT_MS, 60000);
 
-function truncate(text, max = MAX_OUTPUT_CHARS) {
-  const s = String(text || '');
-  return s.length > max ? s.slice(0, max) + `\n... [truncado, ${s.length} caracteres en total]` : s;
-}
-
-function runShell(workspaceDir, comando) {
-  return new Promise((resolve) => {
-    const child = spawn('bash', ['-lc', comando], {
-      cwd: workspaceDir,
-      env: { ...process.env, DEBIAN_FRONTEND: 'noninteractive', HOME: workspaceDir },
-      timeout: SHELL_TIMEOUT_MS,
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (d) => { stdout += d.toString(); });
-    child.stderr.on('data', (d) => { stderr += d.toString(); });
-    child.on('error', (err) => resolve({ exitCode: -1, stdout, stderr: `${stderr}\n${err.message}` }));
-    child.on('close', (code, signal) => {
-      resolve({ exitCode: code ?? -1, stdout, stderr: signal === 'SIGTERM' ? `${stderr}\n[Timeout tras ${SHELL_TIMEOUT_MS / 1000}s]` : stderr });
-    });
-  });
-}
-
-async function webSearchTool(consulta, tavilyApiKey) {
-  // 1) Tavily si hay API key (del entorno global o del usuario)
-  const key = tavilyApiKey || process.env.TAVILY_API_KEY;
-  if (key) {
-    try {
-      const resp = await fetch('https://api.tavily.com/search', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ api_key: key, query: consulta, max_results: 6, include_answer: true }),
-        signal: AbortSignal.timeout(20000),
-      });
-      if (resp.ok) {
-        const data = await resp.json();
-        const items = (data.results || []).map((r, i) => `${i + 1}. ${r.title}\n   URL: ${r.url}\n   ${r.content}`).join('\n\n');
-        return `${data.answer ? `Respuesta directa: ${data.answer}\n\n` : ''}${items}` || 'Sin resultados.';
-      }
-    } catch { /* cae al fallback */ }
-  }
-  // 2) Fallback sin API key: DuckDuckGo HTML
   try {
-    const resp = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(consulta)}`, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) ZocoComputer/1.0' },
-      signal: AbortSignal.timeout(20000),
+    const { stdout, stderr } = await execAsync(command, {
+      cwd: SANDBOX_DIR,
+      timeout,
+      maxBuffer: 1024 * 1024 * 5, // 5MB
+      shell: "/bin/bash",
     });
-    const html = await resp.text();
-    const results = [];
-    const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-    let m;
-    while ((m = re.exec(html)) && results.length < 6) {
-      const url = decodeURIComponent((m[1].match(/uddg=([^&]+)/) || [])[1] || m[1]);
-      const title = m[2].replace(/<[^>]+>/g, '').trim();
-      if (title && url.startsWith('http')) results.push(`${results.length + 1}. ${title}\n   URL: ${url}`);
+
+    let output = "";
+    if (stdout) output += stdout;
+    if (stderr) output += stderr ? `\n[stderr]: ${stderr}` : "";
+    if (!output.trim()) output = "(sin salida)";
+
+    // Truncar si es muy largo
+    if (output.length > MAX_OUTPUT_CHARS) {
+      output = output.slice(0, MAX_OUTPUT_CHARS) + `\n...[salida truncada, ${output.length} chars totales]`;
     }
-    return results.join('\n\n') || 'Sin resultados de búsqueda.';
+
+    return { success: true, output };
   } catch (err) {
-    return `Error en la búsqueda: ${err.message}`;
+    const errMsg = err.killed
+      ? `Timeout (${timeout}ms): el comando tardó demasiado.`
+      : err.stderr || err.message || String(err);
+    return { success: false, output: `Error: ${errMsg}` };
   }
 }
 
-async function readPageTool(url) {
-  const resp = await fetch(url, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) ZocoComputer/1.0' },
-    redirect: 'follow',
-    signal: AbortSignal.timeout(25000),
-  });
-  const contentType = resp.headers.get('content-type') || '';
-  const body = await resp.text();
-  if (!contentType.includes('html')) return truncate(body);
-  // Extracción de texto simple sin dependencias
-  const text = body
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<nav[\s\S]*?<\/nav>/gi, ' ')
-    .replace(/<footer[\s\S]*?<\/footer>/gi, ' ')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/(p|div|h[1-6]|li|tr)>/gi, '\n')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
-    .replace(/[ \t]+/g, ' ')
-    .replace(/\n\s*\n\s*\n+/g, '\n\n')
-    .trim();
-  return truncate(text);
-}
+async function executeReadFile(filePath) {
+  try {
+    const resolvedPath = path.isAbsolute(filePath)
+      ? filePath
+      : path.join(SANDBOX_DIR, filePath);
 
-async function listFilesRecursive(dir, base = dir, depth = 0) {
-  if (depth > 5) return [];
-  let out = [];
-  const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
-  for (const e of entries) {
-    if (e.name.startsWith('.') || e.name === 'node_modules') continue;
-    const full = path.join(dir, e.name);
-    const rel = path.relative(base, full);
-    if (e.isDirectory()) {
-      out.push(`${rel}/`);
-      out = out.concat(await listFilesRecursive(full, base, depth + 1));
-    } else {
-      const st = await fsp.stat(full).catch(() => null);
-      out.push(`${rel} (${st ? st.size : '?'} bytes)`);
+    if (!fs.existsSync(resolvedPath)) {
+      return { success: false, output: `Archivo no encontrado: ${resolvedPath}` };
     }
+
+    const stat = fs.statSync(resolvedPath);
+    if (stat.size > 1024 * 1024) {
+      return { success: false, output: `Archivo demasiado grande (${Math.round(stat.size / 1024)}KB). Usa bash con head/tail para leer partes.` };
+    }
+
+    let content = fs.readFileSync(resolvedPath, "utf-8");
+    if (content.length > MAX_OUTPUT_CHARS) {
+      content = content.slice(0, MAX_OUTPUT_CHARS) + `\n...[truncado, ${content.length} chars totales]`;
+    }
+
+    return { success: true, output: content };
+  } catch (err) {
+    return { success: false, output: `Error leyendo archivo: ${err.message}` };
   }
-  return out;
 }
 
-// ─── Ejecución de una herramienta ────────────────────────────────────────────
+async function executeWriteFile(filePath, content) {
+  try {
+    const resolvedPath = path.isAbsolute(filePath)
+      ? filePath
+      : path.join(SANDBOX_DIR, filePath);
 
-async function executeTool(db, task, workspaceDir, name, args, context) {
-  switch (name) {
-    case 'gestionar_plan': {
-      const fases = Array.isArray(args.fases) ? args.fases : [];
-      db.prepare('UPDATE computer_tasks SET plan = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-        .run(JSON.stringify(fases), task.id);
-      recordEvent(db, task.id, 'plan', { fases });
-      return `Plan actualizado con ${fases.length} fases.`;
+    fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
+    fs.writeFileSync(resolvedPath, content, "utf-8");
+
+    return {
+      success: true,
+      output: `Archivo escrito correctamente: ${resolvedPath} (${content.length} chars)`,
+    };
+  } catch (err) {
+    return { success: false, output: `Error escribiendo archivo: ${err.message}` };
+  }
+}
+
+async function executeBrowser(url) {
+  try {
+    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+      return { success: false, output: "URL inválida. Debe empezar por http:// o https://" };
     }
-    case 'ejecutar_terminal': {
-      recordEvent(db, task.id, 'terminal_start', { comando: args.comando });
-      const { exitCode, stdout, stderr } = await runShell(workspaceDir, args.comando);
-      const salida = truncate(`${stdout}${stderr ? `\n[stderr]\n${stderr}` : ''}`.trim() || '(sin salida)');
-      recordEvent(db, task.id, 'terminal_output', { comando: args.comando, exitCode, salida });
-      return `[exit code: ${exitCode}]\n${salida}`;
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; ZocoBot/1.0)",
+        Accept: "text/html,text/plain,application/json",
+      },
+    });
+
+    clearTimeout(timeout);
+
+    const contentType = response.headers.get("content-type") || "";
+    let text = await response.text();
+
+    // Limpiar HTML básico
+    if (contentType.includes("text/html")) {
+      text = text
+        .replace(/<script[\s\S]*?<\/script>/gi, "")
+        .replace(/<style[\s\S]*?<\/style>/gi, "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s{3,}/g, "\n\n")
+        .trim();
     }
-    case 'escribir_archivo': {
-      const abs = safePath(workspaceDir, args.ruta);
-      await fsp.mkdir(path.dirname(abs), { recursive: true });
-      await fsp.writeFile(abs, String(args.contenido ?? ''), 'utf8');
-      recordEvent(db, task.id, 'file_write', { ruta: args.ruta, contenido: truncate(String(args.contenido ?? ''), 4000) });
-      return `Archivo escrito: ${args.ruta} (${String(args.contenido ?? '').length} caracteres)`;
+
+    if (text.length > MAX_OUTPUT_CHARS) {
+      text = text.slice(0, MAX_OUTPUT_CHARS) + `\n...[truncado, ${text.length} chars totales]`;
     }
-    case 'editar_archivo': {
-      const abs = safePath(workspaceDir, args.ruta);
-      const ediciones = Array.isArray(args.ediciones) ? args.ediciones : [];
-      if (!ediciones.length) return 'No se indicó ninguna edición. Incluye al menos un objeto en "ediciones".';
-      const { resumen, contenido } = await applyFileEdits(abs, ediciones);
-      recordEvent(db, task.id, 'file_edit', {
-        ruta: args.ruta,
-        ediciones: ediciones.length,
-        contenido: truncate(contenido, 4000),
+
+    return {
+      success: true,
+      output: `[${response.status} ${response.statusText}] ${url}\n\n${text}`,
+    };
+  } catch (err) {
+    if (err.name === "AbortError") {
+      return { success: false, output: `Timeout al cargar ${url}` };
+    }
+    return { success: false, output: `Error cargando URL: ${err.message}` };
+  }
+}
+
+// ─── Dispatcher de herramientas ───────────────────────────────────────────────
+
+async function executeTool(toolName, toolInput) {
+  switch (toolName) {
+    case "bash":
+      return executeBash(toolInput.command, toolInput.timeout_ms);
+    case "read_file":
+      return executeReadFile(toolInput.path);
+    case "write_file":
+      return executeWriteFile(toolInput.path, toolInput.content);
+    case "browser":
+      return executeBrowser(toolInput.url);
+    case "finish":
+      return {
+        success: true,
+        output: toolInput.summary,
+        result: toolInput.result,
+        finished: true,
+      };
+    default:
+      return { success: false, output: `Herramienta desconocida: ${toolName}` };
+  }
+}
+
+// ─── Emisor de eventos SSE ────────────────────────────────────────────────────
+
+function sendSSE(res, eventType, data) {
+  if (res.writableEnded) return;
+  const payload = typeof data === "string" ? data : JSON.stringify(data);
+  res.write(`event: ${eventType}\ndata: ${payload}\n\n`);
+}
+
+// ─── Motor del agente ─────────────────────────────────────────────────────────
+
+async function runAgent(taskId, task, userId, db, res) {
+  const anthropic = getAnthropic();
+
+  // Estado del agente
+  const messages = [];
+  let iteration = 0;
+  let finished = false;
+  let finalResult = null;
+
+  // Inicializar sandbox
+  fs.mkdirSync(SANDBOX_DIR, { recursive: true });
+
+  // Notificar inicio
+  sendSSE(res, "status", { type: "started", taskId, task, timestamp: Date.now() });
+
+  // Agregar tarea inicial
+  messages.push({ role: "user", content: task });
+
+  while (!finished && iteration < MAX_ITERATIONS) {
+    iteration++;
+
+    sendSSE(res, "thinking", {
+      type: "thinking",
+      iteration,
+      message: `Iteración ${iteration}: analizando estado y decidiendo siguiente acción...`,
+    });
+
+    let response;
+    try {
+      response = await anthropic.messages.create({
+        model: ANTHROPIC_MODEL,
+        max_tokens: 4096,
+        system: SYSTEM_PROMPT,
+        tools: TOOLS,
+        tool_choice: { type: "auto" },
+        messages,
       });
-      return resumen;
-    }
-    case 'navegador': {
-      recordEvent(db, task.id, 'browser_action', { accion: args.accion, url: args.url || null });
-      const r = await browserAction({
-        taskId: task.id,
-        apiKey: context.e2bApiKey,
-        accion: args.accion,
-        url: args.url,
-        x: args.x,
-        y: args.y,
-        texto: args.texto,
-        tecla: args.tecla,
-        direccion: args.direccion,
-        cantidad: args.cantidad,
+    } catch (err) {
+      sendSSE(res, "error", {
+        type: "error",
+        message: `Error llamando a Anthropic: ${err.message}`,
       });
-      // La captura viaja al frontend como data URL para verse en el panel, pero
-      // NO se devuelve al modelo como texto (serían cientos de miles de tokens).
-      recordEvent(db, task.id, 'browser_screenshot', {
-        accion: args.accion,
-        descripcion: r.texto,
-        captura: r.captura ? `data:image/png;base64,${r.captura}` : null,
-        streamUrl: r.streamUrl || null,
-      });
-      return r.disponible === false
-        ? r.texto
-        : `${r.texto}\nLa captura se ha mostrado al usuario en el panel del ordenador.` +
-          (r.streamUrl ? `\nStream en vivo: ${r.streamUrl}` : '');
+      throw err;
     }
-    case 'exponer_puerto': {
-      const { url, texto } = exposePort({
-        puerto: args.puerto,
-        publicBase: context.publicBase,
-        taskId: task.id,
-      });
-      recordEvent(db, task.id, 'port_exposed', { puerto: args.puerto, url: url || null, mensaje: texto });
-      return texto;
-    }
-    case 'leer_archivo': {
-      const abs = safePath(workspaceDir, args.ruta);
-      const contenido = await fsp.readFile(abs, 'utf8');
-      recordEvent(db, task.id, 'file_read', { ruta: args.ruta });
-      return truncate(contenido);
-    }
-    case 'listar_archivos': {
-      const files = await listFilesRecursive(workspaceDir);
-      recordEvent(db, task.id, 'file_list', { total: files.length });
-      return files.join('\n') || '(workspace vacío)';
-    }
-    case 'busqueda_web': {
-      recordEvent(db, task.id, 'web_search', { consulta: args.consulta });
-      const resultado = await webSearchTool(args.consulta, context.tavilyApiKey);
-      recordEvent(db, task.id, 'web_search_result', { consulta: args.consulta, resultado: truncate(resultado, 3000) });
-      return resultado;
-    }
-    case 'leer_pagina': {
-      recordEvent(db, task.id, 'browse', { url: args.url });
-      try {
-        const texto = await readPageTool(args.url);
-        recordEvent(db, task.id, 'browse_result', { url: args.url, extracto: truncate(texto, 2000) });
-        return texto;
-      } catch (err) {
-        recordEvent(db, task.id, 'browse_result', { url: args.url, error: err.message });
-        return `Error al leer la página: ${err.message}`;
+
+    // Procesar bloques de respuesta
+    const assistantContent = [];
+
+    for (const block of response.content) {
+      if (block.type === "text" && block.text.trim()) {
+        // Texto/razonamiento del agente — mostrar en el chat principal
+        assistantContent.push(block);
+
+        sendSSE(res, "message", {
+          type: "text",
+          content: block.text,
+          iteration,
+        });
+      } else if (block.type === "tool_use") {
+        assistantContent.push(block);
+
+        // Notificar qué herramienta se va a usar
+        sendSSE(res, "tool_start", {
+          type: "tool_start",
+          tool: block.name,
+          input: block.input,
+          iteration,
+        });
+
+        // Ejecutar la herramienta
+        let toolResult;
+        try {
+          toolResult = await executeTool(block.name, block.input);
+        } catch (err) {
+          toolResult = { success: false, output: `Error ejecutando ${block.name}: ${err.message}` };
+        }
+
+        // Notificar resultado al panel derecho (terminal/editor/navegador)
+        sendSSE(res, "tool_result", {
+          type: "tool_result",
+          tool: block.name,
+          input: block.input,
+          output: toolResult.output,
+          success: toolResult.success,
+          iteration,
+          // Determinar qué panel mostrar
+          panel: block.name === "bash" ? "terminal"
+            : block.name === "browser" ? "browser"
+            : block.name === "write_file" || block.name === "read_file" ? "editor"
+            : "terminal",
+        });
+
+        // Agregar resultado al historial para el siguiente turno
+        messages.push({ role: "assistant", content: assistantContent });
+        assistantContent.length = 0; // Limpiar para el próximo bloque
+
+        messages.push({
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: block.id,
+              content: toolResult.output,
+            },
+          ],
+        });
+
+        // Verificar si la tarea terminó
+        if (toolResult.finished) {
+          finished = true;
+          finalResult = toolResult.result;
+          break;
+        }
       }
     }
-    case 'mensaje_usuario': {
-      const msgId = context.uuidv4();
-      db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)')
-        .run(msgId, task.id, 'assistant', String(args.texto || ''));
-      recordEvent(db, task.id, 'assistant_message', { texto: String(args.texto || '') });
-      return 'Mensaje enviado al usuario. Continúa con la tarea.';
+
+    // Si quedaron bloques de asistente sin procesar
+    if (assistantContent.length > 0) {
+      messages.push({ role: "assistant", content: assistantContent });
     }
-    case 'entregar_resultado': {
-      return { __finish: true, resumen: String(args.resumen || ''), archivos: Array.isArray(args.archivos) ? args.archivos : [] };
+
+    // Verificar stop_reason
+    if (response.stop_reason === "end_turn" && !finished) {
+      // El modelo terminó sin usar finish — crear un resumen automático
+      const lastText = response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
+      finished = true;
+      finalResult = lastText || "Tarea completada.";
     }
-    default:
-      return `Herramienta desconocida: ${name}`;
   }
-}
 
-// ─── Bucle principal del agente ──────────────────────────────────────────────
+  // Timeout de iteraciones
+  if (!finished) {
+    finalResult = `Tarea detenida tras ${MAX_ITERATIONS} iteraciones. Último estado: en progreso.`;
+    sendSSE(res, "warning", {
+      type: "warning",
+      message: `Se alcanzó el límite de ${MAX_ITERATIONS} iteraciones.`,
+    });
+  }
 
-// El bucle vive en ./zoco-loop.js. Aquí solo se ensambla el contexto de
-// ejecución (claves, rutas, callbacks) y se delega. Mantener el motor separado
-// permite modificar el comportamiento del agente sin tocar las rutas HTTP.
-async function runAgentLoop({ db, uuidv4, task, workspaceDir, callModel, tavilyApiKey }) {
-  const e2bApiKey = process.env.E2B_API_KEY || null;
-  const publicBase = process.env.COMPUTER_PUBLIC_BASE || null;
+  // Guardar en BD
+  try {
+    if (db && taskId) {
+      db.prepare(
+        "UPDATE computer_tasks SET status = 'completed', result = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?"
+      ).run(finalResult, taskId);
+    }
+  } catch {}
 
-  const context = { uuidv4, tavilyApiKey, e2bApiKey, publicBase };
-
-  await runLoop({
-    db,
-    uuidv4,
-    task,
-    workspaceDir,
-    callModel,
-    recordEvent,
-    executeTool,
-    tools: COMPUTER_TOOLS,
-    context,
-    buildSystemPrompt: () => buildComputerSystemPrompt({
-      taskTitle: task.title,
-      workspaceDir,
-      tieneNavegador: Boolean(e2bApiKey),
-    }),
+  // Evento de finalización
+  sendSSE(res, "completed", {
+    type: "completed",
+    taskId,
+    result: finalResult,
+    iterations: iteration,
+    timestamp: Date.now(),
   });
+
+  return finalResult;
 }
 
-// ─── Registro de rutas Express ───────────────────────────────────────────────
+// ─── Registro de rutas Express ────────────────────────────────────────────────
 
-export function registerComputerRoutes({ app, db, authMiddleware, uuidv4, jwt, JWT_SECRET, workspacesRoot, makeCallModel, getUserTavilyKey }) {
-  ensureComputerTables(db);
+export function registerComputerRoutes({ app, db, authMiddleware, uuidv4 }) {
+  // Asegurar que la tabla existe
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS computer_tasks (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        task TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        result TEXT,
+        agent_model TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        completed_at TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      );
+    `);
+  } catch {}
 
-  // Coolify reinicia el contenedor en cada despliegue. Sin esto, las tareas que
-  // estaban corriendo quedan "en_curso" eternamente y el panel gira sin fin.
-  recoverOrphanTasks(db, recordEvent);
+  // GET /api/computer/tasks — listar tareas del usuario
+  app.get("/api/computer/tasks", authMiddleware, (req, res) => {
+    try {
+      const tasks = db
+        .prepare(
+          "SELECT id, task, status, result, agent_model, created_at, completed_at FROM computer_tasks WHERE user_id = ? ORDER BY created_at DESC LIMIT 50"
+        )
+        .all(req.auth.sub);
+      res.json(tasks);
+    } catch (err) {
+      res.status(500).json({ error: "Error obteniendo tareas" });
+    }
+  });
 
-  const computerRoot = path.join(workspacesRoot, 'computer');
-  fs.mkdirSync(computerRoot, { recursive: true });
+  // POST /api/computer/tasks — crear nueva tarea y ejecutarla en streaming SSE
+  app.post("/api/computer/tasks", authMiddleware, async (req, res) => {
+    const { task, model } = req.body || {};
 
-  function taskWorkspace(taskId) {
-    const dir = path.join(computerRoot, taskId);
-    fs.mkdirSync(dir, { recursive: true });
-    return dir;
-  }
+    if (!task || !String(task).trim()) {
+      return res.status(400).json({ error: "La tarea es obligatoria" });
+    }
 
-  function getTask(taskId, userId) {
-    return db.prepare('SELECT * FROM computer_tasks WHERE id = ? AND user_id = ?').get(taskId, userId);
-  }
-
-  // Crear tarea y lanzar el agente
-  app.post('/api/computer/tasks', authMiddleware, async (req, res) => {
-    const { prompt, model } = req.body || {};
-    if (!prompt || !String(prompt).trim()) return res.status(400).json({ error: 'Falta el prompt de la tarea' });
+    // Verificar API key de Anthropic
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return res.status(503).json({
+        error: "ANTHROPIC_API_KEY no configurada. Añade tu clave de API de Anthropic en las variables de entorno.",
+      });
+    }
 
     const taskId = uuidv4();
-    const title = String(prompt).trim().slice(0, 200);
-    const modelo = model || 'zoco-max';
-    db.prepare('INSERT INTO computer_tasks (id, user_id, title, status, model) VALUES (?, ?, ?, ?, ?)')
-      .run(taskId, req.auth.sub, title, 'en_curso', modelo);
-    db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)')
-      .run(uuidv4(), taskId, 'user', String(prompt).trim());
+    const selectedModel = model || ANTHROPIC_MODEL;
 
-    const task = getTask(taskId, req.auth.sub);
-    res.json({ id: taskId, title, status: 'en_curso' });
-
-    // Ejecutar el agente en segundo plano (no bloquea la respuesta HTTP)
-    setImmediate(async () => {
-      try {
-        recordEvent(db, taskId, 'task_started', { titulo: title });
-        const callModel = makeCallModel({ userId: req.auth.sub, model: modelo });
-        const tavilyApiKey = getUserTavilyKey ? getUserTavilyKey(req.auth.sub) : null;
-        await runAgentLoop({ db, uuidv4, task, workspaceDir: taskWorkspace(taskId), callModel, tavilyApiKey });
-      } catch (err) {
-        console.error('[ZocoComputer] Error en el bucle del agente:', err);
-        db.prepare("UPDATE computer_tasks SET status = 'error', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(taskId);
-        recordEvent(db, taskId, 'error', { mensaje: err.message });
-      }
-    });
-  });
-
-  // Enviar mensaje a una tarea existente (reanuda el bucle)
-  app.post('/api/computer/tasks/:id/messages', authMiddleware, async (req, res) => {
-    const task = getTask(req.params.id, req.auth.sub);
-    if (!task) return res.status(404).json({ error: 'Tarea no encontrada' });
-    const { content } = req.body || {};
-    if (!content || !String(content).trim()) return res.status(400).json({ error: 'Mensaje vacío' });
-
-    db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)')
-      .run(uuidv4(), task.id, 'user', String(content).trim());
-    recordEvent(db, task.id, 'user_message', { texto: String(content).trim() });
-
-    if (task.status === 'en_curso') {
-      // El bucle en marcha leerá el mensaje en la siguiente reconstrucción
-      return res.json({ ok: true, status: task.status });
-    }
-
-    db.prepare("UPDATE computer_tasks SET status = 'en_curso', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(task.id);
-    res.json({ ok: true, status: 'en_curso' });
-
-    setImmediate(async () => {
-      try {
-        const fresh = getTask(task.id, req.auth.sub);
-        const callModel = makeCallModel({ userId: req.auth.sub, model: fresh.model || 'zoco-max' });
-        const tavilyApiKey = getUserTavilyKey ? getUserTavilyKey(req.auth.sub) : null;
-        await runAgentLoop({ db, uuidv4, task: fresh, workspaceDir: taskWorkspace(task.id), callModel, tavilyApiKey });
-      } catch (err) {
-        console.error('[ZocoComputer] Error al reanudar:', err);
-        db.prepare("UPDATE computer_tasks SET status = 'error', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(task.id);
-        recordEvent(db, task.id, 'error', { mensaje: err.message });
-      }
-    });
-  });
-
-  // Detener una tarea
-  app.post('/api/computer/tasks/:id/stop', authMiddleware, (req, res) => {
-    const task = getTask(req.params.id, req.auth.sub);
-    if (!task) return res.status(404).json({ error: 'Tarea no encontrada' });
-    db.prepare("UPDATE computer_tasks SET status = 'detenida', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(task.id);
-    recordEvent(db, task.id, 'stopped', {});
-    res.json({ ok: true });
-  });
-
-  // Listar tareas del usuario
-  app.get('/api/computer/tasks', authMiddleware, (req, res) => {
-    const tasks = db.prepare('SELECT id, title, status, model, created_at, updated_at FROM computer_tasks WHERE user_id = ? ORDER BY updated_at DESC LIMIT 100').all(req.auth.sub);
-    res.json(tasks);
-  });
-
-  // Detalle de una tarea: estado, plan, mensajes y eventos recientes
-  app.get('/api/computer/tasks/:id', authMiddleware, (req, res) => {
-    const task = getTask(req.params.id, req.auth.sub);
-    if (!task) return res.status(404).json({ error: 'Tarea no encontrada' });
-    const messages = db.prepare('SELECT role, content, created_at FROM computer_messages WHERE task_id = ? ORDER BY created_at ASC').all(task.id);
-    const events = db.prepare('SELECT id, type, payload, created_at FROM computer_events WHERE task_id = ? ORDER BY id ASC LIMIT 500').all(task.id)
-      .map(e => ({ id: e.id, type: e.type, ...(JSON.parse(e.payload || '{}')), ts: e.created_at }));
-    res.json({ ...task, plan: task.plan ? JSON.parse(task.plan) : [], messages, events });
-  });
-
-  // Descargar un archivo del workspace de la tarea
-  app.get('/api/computer/tasks/:id/files', authMiddleware, async (req, res) => {
-    const task = getTask(req.params.id, req.auth.sub);
-    if (!task) return res.status(404).json({ error: 'Tarea no encontrada' });
-    const rel = String(req.query.path || '');
-    if (!rel) {
-      const files = await listFilesRecursive(taskWorkspace(task.id));
-      return res.json({ files });
-    }
+    // Guardar tarea en BD
     try {
-      const abs = safePath(taskWorkspace(task.id), rel);
-      const contenido = await fsp.readFile(abs, 'utf8');
-      res.json({ path: rel, content: contenido });
+      db.prepare(
+        "INSERT INTO computer_tasks (id, user_id, task, status, agent_model) VALUES (?, ?, ?, 'running', ?)"
+      ).run(taskId, req.auth.sub, task.trim(), selectedModel);
     } catch (err) {
-      res.status(404).json({ error: `No se pudo leer: ${err.message}` });
+      console.error("Error guardando tarea:", err);
     }
-  });
 
-  // Stream SSE de eventos en vivo (EventSource no soporta headers → token por query)
-  app.get('/api/computer/tasks/:id/events', (req, res) => {
-    const token = req.query.token || (req.headers.authorization || '').replace('Bearer ', '');
-    let auth;
-    try { auth = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).end(); }
-    const task = db.prepare('SELECT id FROM computer_tasks WHERE id = ? AND user_id = ?').get(req.params.id, auth.sub);
-    if (!task) return res.status(404).end();
+    // Configurar SSE
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no"); // Desactiva buffering en Nginx/Traefik
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.flushHeaders();
 
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    // Sin esto, el proxy inverso (Traefik/Nginx en Coolify) puede bufferizar el
-    // stream y el panel no mostraría nada "en vivo" hasta el final de la tarea.
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders?.();
-
-    // Reemitir eventos posteriores a lastEventId si el cliente se reconecta.
-    // Se acepta tanto por query como por la cabecera estándar Last-Event-ID que
-    // EventSource envía automáticamente al reconectar.
-    const lastId = parseInt(req.query.lastEventId || req.headers['last-event-id'] || '0', 10);
-    if (lastId > 0) {
-      const missed = db.prepare('SELECT id, type, payload, created_at FROM computer_events WHERE task_id = ? AND id > ? ORDER BY id ASC').all(req.params.id, lastId);
-      for (const e of missed) {
-        // El campo `id:` permite al navegador reanudar solo desde el último visto.
-        res.write(`id: ${e.id}\ndata: ${JSON.stringify({ id: e.id, type: e.type, ...(JSON.parse(e.payload || '{}')), ts: e.created_at })}\n\n`);
+    // Keepalive para evitar que Traefik corte la conexión
+    const keepalive = setInterval(() => {
+      if (!res.writableEnded) {
+        res.write(": keepalive\n\n");
+      } else {
+        clearInterval(keepalive);
       }
-    }
+    }, 15000);
 
-    if (!subscribers.has(req.params.id)) subscribers.set(req.params.id, new Set());
-    subscribers.get(req.params.id).add(res);
-    const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 20000);
-    req.on('close', () => {
-      clearInterval(ping);
-      subscribers.get(req.params.id)?.delete(res);
+    // Detectar desconexión del cliente
+    req.on("close", () => {
+      clearInterval(keepalive);
     });
+
+    // Ejecutar el agente
+    try {
+      await runAgent(taskId, task.trim(), req.auth.sub, db, res);
+    } catch (err) {
+      console.error(`[computer] Error en tarea ${taskId}:`, err);
+      sendSSE(res, "error", {
+        type: "error",
+        message: err.message || "Error interno del agente",
+      });
+
+      // Marcar como fallida en BD
+      try {
+        db.prepare(
+          "UPDATE computer_tasks SET status = 'failed', result = ? WHERE id = ?"
+        ).run(err.message, taskId);
+      } catch {}
+    } finally {
+      clearInterval(keepalive);
+      if (!res.writableEnded) res.end();
+    }
   });
 
-  console.log('🖥️  El Ordenador de Zoco (agente tipo Manus) montado en /api/computer');
+  // GET /api/computer/tasks/:id — obtener una tarea específica
+  app.get("/api/computer/tasks/:id", authMiddleware, (req, res) => {
+    try {
+      const task = db
+        .prepare(
+          "SELECT * FROM computer_tasks WHERE id = ? AND user_id = ?"
+        )
+        .get(req.params.id, req.auth.sub);
+
+      if (!task) return res.status(404).json({ error: "Tarea no encontrada" });
+      res.json(task);
+    } catch (err) {
+      res.status(500).json({ error: "Error obteniendo tarea" });
+    }
+  });
+
+  // DELETE /api/computer/tasks/:id — eliminar una tarea
+  app.delete("/api/computer/tasks/:id", authMiddleware, (req, res) => {
+    try {
+      const task = db
+        .prepare("SELECT id FROM computer_tasks WHERE id = ? AND user_id = ?")
+        .get(req.params.id, req.auth.sub);
+
+      if (!task) return res.status(404).json({ error: "Tarea no encontrada" });
+
+      db.prepare("DELETE FROM computer_tasks WHERE id = ?").run(req.params.id);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Error eliminando tarea" });
+    }
+  });
+
+  // GET /api/computer/models — modelos disponibles
+  app.get("/api/computer/models", authMiddleware, (req, res) => {
+    res.json([
+      {
+        id: "claude-sonnet-4-6",
+        name: "Zoco Plus",
+        description: "Equilibrio perfecto entre velocidad y capacidad. Ideal para la mayoría de tareas.",
+        tier: "standard",
+      },
+      {
+        id: "claude-opus-4-8",
+        name: "Zoco Max",
+        description: "El modelo más potente. Mejor para tareas complejas, código avanzado y análisis profundo.",
+        tier: "max",
+      },
+      {
+        id: "claude-haiku-4-5-20251001",
+        name: "Zoco Flash",
+        description: "El más rápido y económico. Ideal para tareas simples y respuestas rápidas.",
+        tier: "flash",
+      },
+    ]);
+  });
+
+  console.log("✅ El Ordenador de Zoco registrado (Claude Anthropic + tool-calling nativo)");
 }
