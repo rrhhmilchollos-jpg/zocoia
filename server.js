@@ -573,14 +573,67 @@ function openAIToolChoiceToAnthropic(toolChoice) {
   return { type: 'auto' };
 }
 
+// Convierte un array de mensajes en formato OpenAI (el que construye
+// runToolLoop en tools.js: role 'user'/'assistant'/'tool', con
+// tool_calls en los mensajes assistant y tool_call_id en los tool) al
+// formato nativo que exige la API de Anthropic:
+//   - Anthropic NO tiene role "tool" — un resultado de tool se envía como
+//     un mensaje role:"user" con un bloque {type:"tool_result", tool_use_id, content}.
+//   - Un mensaje assistant con tool_calls se envía con content en forma de
+//     bloques [{type:"text",...}?, {type:"tool_use", id, name, input}, ...].
+// Sin esta conversión, la API devuelve 400 "Unexpected role `tool`.
+// Allowed roles are `user` or `assistant`" — error real visto en producción.
+function convertMessagesToAnthropic(messages) {
+  const out = [];
+  for (const m of messages) {
+    if (!m || m.role === 'system') continue;
+
+    if (m.role === 'tool') {
+      const toolResultBlock = {
+        type: 'tool_result',
+        tool_use_id: m.tool_call_id,
+        content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? ''),
+      };
+      // Varios tool_calls del mismo turno assistant generan varios mensajes
+      // 'tool' seguidos — Anthropic los espera FUSIONADOS en un único
+      // mensaje user con varios bloques tool_result, no como mensajes
+      // user separados.
+      const last = out[out.length - 1];
+      if (last && last.role === 'user' && Array.isArray(last.content) && last.content.every(b => b && b.type === 'tool_result')) {
+        last.content.push(toolResultBlock);
+      } else {
+        out.push({ role: 'user', content: [toolResultBlock] });
+      }
+      continue;
+    }
+
+    if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      const blocks = [];
+      if (m.content) blocks.push({ type: 'text', text: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) });
+      for (const tc of m.tool_calls) {
+        let input = {};
+        try { input = JSON.parse(tc.function?.arguments || '{}'); } catch { input = {}; }
+        blocks.push({ type: 'tool_use', id: tc.id, name: tc.function?.name, input });
+      }
+      out.push({ role: 'assistant', content: blocks });
+      continue;
+    }
+
+    // user / assistant normales (sin tool_calls)
+    out.push({
+      role: m.role,
+      content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? ''),
+    });
+  }
+  return out;
+}
+
 async function callChatModel({ claudeModel, messages, maxTokens, temperature, tools, toolChoice }) {
   const anthropic = getAnthropicClient();
 
   // Separar el mensaje de sistema del resto
   const systemMsg = messages.find(m => m.role === 'system');
-  const userMessages = messages
-    .filter(m => m.role !== 'system')
-    .map(m => ({ role: m.role, content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) }));
+  const userMessages = convertMessagesToAnthropic(messages);
 
   const anthropicTools = tools && tools.length ? openAIToolsToAnthropic(tools) : undefined;
   const anthropicToolChoice = anthropicTools ? openAIToolChoiceToAnthropic(toolChoice) : undefined;
