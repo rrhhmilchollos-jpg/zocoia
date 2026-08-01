@@ -10,11 +10,76 @@ import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
+import Anthropic from '@anthropic-ai/sdk';
 import { TOOL_DEFINITIONS, ALL_TOOL_NAMES, runToolLoop, makeWorkspacesRoot } from './tools.js';
 import { runDeterministicAgent, resolveTemplatePrompt, registerBridgeAdminRoutes } from './bridge-marisai.js';
-import { seedOwnerAgentsIfEmpty, seedBasicAgentsForUser, isOwnerUser, DEEPSEEK_SAFE_FORMAT_RULE, ENTERPRISE_REQUIRED_MESSAGE } from './seed-owner-agents.js';
+import { seedOwnerAgentsIfEmpty, seedBasicAgentsForUser, isOwnerUser, ENTERPRISE_REQUIRED_MESSAGE } from './seed-owner-agents.js';
 import { registerSessionRoutes, validateZocoApiKey } from './zoco-sessions.js';
 import { registerConsoleRoutes, resumeInterruptedBatches, buildEnvironmentContext } from './zoco-console.js';
+
+// DEEPSEEK_SAFE_FORMAT_RULE ya no se importa — Claude no la necesita.
+// Se mantiene como string vacío para no romper módulos que la referencien.
+const DEEPSEEK_SAFE_FORMAT_RULE = '';
+
+// ─── CLIENTE ANTHROPIC ───────────────────────────────────────────────────────
+let _anthropicClient = null;
+function getAnthropicClient() {
+  if (!_anthropicClient) {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) throw Object.assign(new Error('ANTHROPIC_API_KEY no configurada en variables de entorno'), { status: 503 });
+    _anthropicClient = new Anthropic({ apiKey });
+  }
+  return _anthropicClient;
+}
+
+// ─── MAPA DE MODELOS: nombres internos → IDs reales de Claude Anthropic ──────
+// Modelos verificados en docs.anthropic.com (agosto 2026):
+const CLAUDE_MODEL_MAP = {
+  'zoco-flash':     'claude-haiku-4-5-20251001',   // Rápido y barato
+  'zoco-plus':      'claude-sonnet-4-6',            // Equilibrado (default)
+  'zoco-max':       'claude-opus-4-8',              // Máxima capacidad
+  'zoco-lab':       'claude-opus-4-8',              // Experimental
+  'maris-velox':    'claude-haiku-4-5-20251001',
+  'maris-velox-1b': 'claude-haiku-4-5-20251001',
+  'maris-core':     'claude-sonnet-4-6',
+  'maris-core-7b':  'claude-sonnet-4-6',
+  'maris-pro':      'claude-opus-4-8',
+  'maris-pro-32b':  'claude-opus-4-8',
+  'maris-beta':     'claude-opus-4-8',
+  'maris-beta-70b': 'claude-opus-4-8',
+};
+
+// Resuelve nombre interno → ID real de Claude. Si ya es un ID de Claude, lo pasa tal cual.
+function resolveClaudeModel(modeloZocoia) {
+  if (!modeloZocoia) return 'claude-sonnet-4-6';
+  if (String(modeloZocoia).startsWith('claude-')) return modeloZocoia;
+  return CLAUDE_MODEL_MAP[modeloZocoia] || 'claude-sonnet-4-6';
+}
+
+// ─── CÓDIGO OLLAMA COMENTADO (por si se necesita volver atrás) ───────────────
+/*
+const OLLAMA_MODEL_MAP = {
+  'zoco-flash': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash',
+  'zoco-plus':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',
+  'zoco-max':   process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
+  'zoco-lab':   process.env.OLLAMA_MODEL_LAB   || 'Zoco-Lab',
+  'maris-velox': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash',
+  'maris-velox-1b': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash',
+  'maris-core':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',
+  'maris-core-7b':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',
+  'maris-pro':   process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
+  'maris-pro-32b':  process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
+  'maris-beta':  process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
+  'maris-beta-70b': process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
+};
+const OLLAMA_URL = process.env.OLLAMA_BASE_URL || process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
+const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || 'ollama';
+const OLLAMA_TIMEOUT_MS = parseInt(process.env.OLLAMA_TIMEOUT_MS || '300000', 10);
+*/
+// ─── FIN CÓDIGO OLLAMA ────────────────────────────────────────────────────────
+
+const ANTHROPIC_TIMEOUT_MS = parseInt(process.env.ANTHROPIC_TIMEOUT_MS || '120000', 10);
+const PROMPT_CACHE_TTL_MS = 5 * 60 * 1000;
 
 // Módulos opcionales — si no existen en el repo, el servidor sigue arrancando
 let construirSystemPrompt = null;
@@ -207,26 +272,6 @@ const MODELOS_VALIDOS = [
   'maris-velox-1b', 'maris-core-7b', 'maris-pro-32b', 'maris-beta-70b',
 ];
 
-const OLLAMA_MODEL_MAP = {
-  'zoco-flash': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash',
-  'zoco-plus':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',
-  'zoco-max':   process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
-  'zoco-lab':   process.env.OLLAMA_MODEL_LAB   || 'Zoco-Lab',
-  'maris-velox': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash',
-  'maris-velox-1b': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash',
-  'maris-core':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',
-  'maris-core-7b':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',
-  'maris-pro':   process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
-  'maris-pro-32b':  process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
-  'maris-beta':  process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
-  'maris-beta-70b': process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
-};
-
-const OLLAMA_URL = process.env.OLLAMA_BASE_URL || process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
-const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || 'ollama';
-const OLLAMA_TIMEOUT_MS = parseInt(process.env.OLLAMA_TIMEOUT_MS || '300000', 10);
-const PROMPT_CACHE_TTL_MS = 5 * 60 * 1000;
-
 // ─── Seeds ────────────────────────────────────────────────────────────────────
 
 function seedAdminAccount() {
@@ -317,14 +362,7 @@ try { seedSeoGeoAgent(); } catch (e) { console.error('[SEED] seedSeoGeoAgent fal
 
 // ─── Utilidades ───────────────────────────────────────────────────────────────
 
-// ─── CORS ───────────────────────────────────────────────────────────────────
-// Orígenes permitidos: se leen de ALLOWED_ORIGINS o CORS_ALLOWED_ORIGINS
-// (lista separada por comas), con un fallback fijo por si la variable de
-// entorno no llega a estar definida en Coolify.
-const DEFAULT_ALLOWED_ORIGINS = [
-  'https://zocoia.es',
-  'https://www.zocoia.es',
-];
+const DEFAULT_ALLOWED_ORIGINS = ['https://zocoia.es', 'https://www.zocoia.es'];
 
 function parseOriginsList(raw) {
   if (!raw) return [];
@@ -336,15 +374,11 @@ const ENV_ALLOWED_ORIGINS = [
   ...parseOriginsList(process.env.CORS_ALLOWED_ORIGINS),
 ];
 
-const ALLOWED_ORIGINS = ENV_ALLOWED_ORIGINS.length > 0
-  ? ENV_ALLOWED_ORIGINS
-  : DEFAULT_ALLOWED_ORIGINS;
-
+const ALLOWED_ORIGINS = ENV_ALLOWED_ORIGINS.length > 0 ? ENV_ALLOWED_ORIGINS : DEFAULT_ALLOWED_ORIGINS;
 console.log('🌐 CORS — orígenes permitidos:', ALLOWED_ORIGINS.join(', '));
 
 app.use(cors({
   origin(origin, callback) {
-    // Peticiones sin cabecera Origin (curl, health checks, server-to-server)
     if (!origin) return callback(null, true);
     if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
     console.warn(`🚫 CORS bloqueado para origen: ${origin}`);
@@ -354,7 +388,6 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
-// Responder explícitamente a las peticiones preflight en todas las rutas
 app.options('*', cors());
 app.use(express.json());
 
@@ -368,13 +401,9 @@ function signToken(user) {
 
 function publicUser(user) {
   return {
-    id: user.id,
-    email: user.email,
-    nombre: user.nombre,
-    isAdmin: !!user.is_admin,
-    isSupport: !!user.is_support,
-    creditos: user.creditos,
-    activo: !!user.activo,
+    id: user.id, email: user.email, nombre: user.nombre,
+    isAdmin: !!user.is_admin, isSupport: !!user.is_support,
+    creditos: user.creditos, activo: !!user.activo,
     modeloActivo: user.modelo_activo || 'zoco-plus',
     createdAt: user.created_at,
   };
@@ -405,8 +434,6 @@ function checkAndUpdatePromptCache(userId, agentId, systemPromptText) {
   return { hit: false, cachedTokens: 0 };
 }
 
-// ─── authMiddleware — DEBE definirse ANTES de usarse en cualquier ruta ────────
-
 function authMiddleware(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
@@ -415,30 +442,18 @@ function authMiddleware(req, res, next) {
   if (token.startsWith('sk-zoco-')) {
     const check = validateZocoApiKey(db, token);
     if (!check.valid) return res.status(401).json({ error: `API Key inválida: ${check.reason}` });
-
     const keyRow = db.prepare('SELECT key_type, monthly_tokens_used, usage_month FROM api_keys WHERE id = ?').get(check.keyId);
     if (keyRow?.key_type === 'gratuita') {
       const month = currentUsageMonth();
       const usedThisMonth = keyRow.usage_month === month ? keyRow.monthly_tokens_used : 0;
       if (usedThisMonth >= FREE_KEY_MONTHLY_TOKEN_LIMIT) {
-        return res.status(402).json({
-          error: `Límite mensual alcanzado (${FREE_KEY_MONTHLY_TOKEN_LIMIT} tokens/mes). Genera una clave de pago o espera al próximo mes.`,
-          code: 'free_key_limit_reached',
-        });
+        return res.status(402).json({ error: `Límite mensual alcanzado (${FREE_KEY_MONTHLY_TOKEN_LIMIT} tokens/mes).`, code: 'free_key_limit_reached' });
       }
     }
-
     try { db.prepare('UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(check.keyId); } catch {}
     const owner = db.prepare('SELECT id, is_admin, is_support FROM users WHERE id = ?').get(check.ownerId);
     if (!owner) return res.status(401).json({ error: 'La cuenta propietaria de la clave no existe' });
-    req.auth = {
-      sub: owner.id,
-      isAdmin: !!owner.is_admin,
-      isSupport: !!owner.is_support,
-      viaApiKey: true,
-      apiKeyId: check.keyId,
-      apiKeyType: keyRow?.key_type || 'pago',
-    };
+    req.auth = { sub: owner.id, isAdmin: !!owner.is_admin, isSupport: !!owner.is_support, viaApiKey: true, apiKeyId: check.keyId, apiKeyType: keyRow?.key_type || 'pago' };
     return next();
   }
 
@@ -517,8 +532,108 @@ function needsWebSearch(text) {
   return keywords.some(k => lower.includes(k));
 }
 
-// ─── Modelo de IA ─────────────────────────────────────────────────────────────
+// ─── Motor de IA: Claude Anthropic ───────────────────────────────────────────
+// Sustituye completamente a callChatModel (Ollama).
+// Mantiene la misma firma de retorno para no romper el resto del código:
+// { choices: [{ message: { role, content, tool_calls? } }], usage: {...} }
 
+// Convierte tools en formato OpenAI ({type:'function', function:{name, description, parameters}})
+// —el formato en el que están definidas en tools.js/TOOL_DEFINITIONS, pensado
+// originalmente para Groq/Ollama /v1/chat/completions— al formato nativo que
+// espera la API de Anthropic ({name, description, input_schema}). Sin esta
+// conversión, anthropic.messages.create() ignoraría o rechazaría las tools.
+function openAIToolsToAnthropic(tools) {
+  if (!Array.isArray(tools)) return undefined;
+  return tools.map(t => {
+    // Ya viene en formato Anthropic (tiene input_schema) — no tocar.
+    if (t && t.input_schema) return t;
+    const fn = t?.function || t;
+    return {
+      name: fn.name,
+      description: fn.description || '',
+      input_schema: fn.parameters || { type: 'object', properties: {} },
+    };
+  });
+}
+
+// Convierte tool_choice en formato OpenAI ('auto' | 'required' | {type:'function',...})
+// al formato Anthropic ({type:'auto'} | {type:'any'} | {type:'tool', name}).
+function openAIToolChoiceToAnthropic(toolChoice) {
+  if (!toolChoice) return undefined;
+  if (toolChoice === 'auto') return { type: 'auto' };
+  if (toolChoice === 'required') return { type: 'any' };
+  if (toolChoice === 'none') return undefined;
+  if (typeof toolChoice === 'object') {
+    if (toolChoice.type === 'function' && toolChoice.function?.name) {
+      return { type: 'tool', name: toolChoice.function.name };
+    }
+    // Ya viene en formato Anthropic
+    if (toolChoice.type) return toolChoice;
+  }
+  return { type: 'auto' };
+}
+
+async function callChatModel({ claudeModel, messages, maxTokens, temperature, tools, toolChoice }) {
+  const anthropic = getAnthropicClient();
+
+  // Separar el mensaje de sistema del resto
+  const systemMsg = messages.find(m => m.role === 'system');
+  const userMessages = messages
+    .filter(m => m.role !== 'system')
+    .map(m => ({ role: m.role, content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) }));
+
+  const anthropicTools = tools && tools.length ? openAIToolsToAnthropic(tools) : undefined;
+  const anthropicToolChoice = anthropicTools ? openAIToolChoiceToAnthropic(toolChoice) : undefined;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), ANTHROPIC_TIMEOUT_MS);
+
+  try {
+    const params = {
+      model: claudeModel,
+      max_tokens: maxTokens || 4096,
+      temperature: temperature ?? 0.7,
+      messages: userMessages,
+      ...(systemMsg ? { system: systemMsg.content } : {}),
+      ...(anthropicTools ? { tools: anthropicTools } : {}),
+      ...(anthropicTools && anthropicToolChoice ? { tool_choice: anthropicToolChoice } : {}),
+    };
+
+    const response = await anthropic.messages.create(params, { signal: controller.signal });
+
+    // Convertir respuesta de Anthropic al formato OpenAI que espera el resto del código
+    const textContent = response.content
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('');
+
+    const toolUses = response.content.filter(b => b.type === 'tool_use');
+    const tool_calls = toolUses.length > 0
+      ? toolUses.map(tu => ({ id: tu.id, type: 'function', function: { name: tu.name, arguments: JSON.stringify(tu.input || {}) } }))
+      : undefined;
+
+    return {
+      choices: [{
+        message: {
+          role: 'assistant',
+          content: textContent,
+          ...(tool_calls ? { tool_calls } : {}),
+        },
+        finish_reason: response.stop_reason === 'tool_use' ? 'tool_calls' : 'stop',
+      }],
+      usage: {
+        prompt_tokens: response.usage?.input_tokens || 0,
+        completion_tokens: response.usage?.output_tokens || 0,
+        total_tokens: (response.usage?.input_tokens || 0) + (response.usage?.output_tokens || 0),
+      },
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+// ─── CÓDIGO ANTIGUO callChatModel (Ollama) COMENTADO ─────────────────────────
+/*
 async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temperature, tools, toolChoice, ollamaOptions }) {
   async function doFetch(url, auth, model, extraOllamaOptions) {
     const controller = new AbortController();
@@ -528,10 +643,7 @@ async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temp
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: auth },
         body: JSON.stringify({
-          model,
-          messages,
-          max_tokens: maxTokens,
-          temperature,
+          model, messages, max_tokens: maxTokens, temperature,
           ...(tools && tools.length ? { tools } : {}),
           ...(tools && tools.length && toolChoice ? { tool_choice: toolChoice } : {}),
           ...(extraOllamaOptions ? { options: extraOllamaOptions } : {}),
@@ -549,7 +661,6 @@ async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temp
       clearTimeout(timeoutId);
     }
   }
-
   const endpoint = `${ollamaUrl.replace(/\/+$/, '')}/v1/chat/completions`;
   const MAX_ATTEMPTS = 2;
   let lastErr;
@@ -560,8 +671,7 @@ async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temp
       lastErr = err;
       if (err.name === 'AbortError') {
         const e = new Error(`Timeout: el modelo ${ollamaModel} tardó más de ${Math.round(OLLAMA_TIMEOUT_MS / 1000)}s`);
-        e.status = 504;
-        throw e;
+        e.status = 504; throw e;
       }
       const transient = !err.status || err.status >= 500;
       if (transient && attempt < MAX_ATTEMPTS - 1) {
@@ -571,18 +681,15 @@ async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temp
       }
       if (err.status) throw err;
       const e = new Error(`Error de conexión con Ollama (${ollamaUrl}): ${err.message}`);
-      e.status = 502;
-      throw e;
+      e.status = 502; throw e;
     }
   }
   throw lastErr;
 }
+*/
+// ─── FIN CÓDIGO ANTIGUO ───────────────────────────────────────────────────────
 
 async function processChatCompletion(authSub, { agentId, messages, model, temperature: temperatureInput, max_tokens: maxTokensInput, sessionSkills, tools: requestTools, tool_choice: requestToolChoice, apiKeyId, apiKeyType }) {
-  if (!OLLAMA_URL) {
-    const e = new Error('OLLAMA_BASE_URL no configurada'); e.status = 503; throw e;
-  }
-
   const userCheck = db.prepare('SELECT creditos, activo FROM users WHERE id = ?').get(authSub);
   if (!userCheck || !userCheck.activo) {
     const e = new Error('Cuenta desactivada'); e.status = 403; throw e;
@@ -599,7 +706,7 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   let agente = null;
   let agenteData = {};
   let cacheResult = { hit: false, cachedTokens: 0 };
-  let mensajesParaGroq = [];
+  let mensajesParaClaude = [];
   let systemPromptText = '';
 
   if (agentId) {
@@ -617,7 +724,6 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
 
     const historial = db.prepare('SELECT role, content FROM agent_memory WHERE agente_id = ? ORDER BY created_at ASC LIMIT 50').all(agentId);
 
-    // Si existe sistema-prompt.js lo usa, si no cae al systemPrompt del agente
     if (construirSystemPrompt) {
       systemPromptText = await construirSystemPrompt({ db, agente, agenteData, authSub });
     } else {
@@ -626,55 +732,57 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
         : (agenteData.systemPrompt || `Eres ${agente.name}, un asistente de IA útil y preciso.`);
     }
 
-    if (!String(systemPromptText).includes('DeepSeek-R1/OpenAI compatible endpoint')) {
-      systemPromptText += DEEPSEEK_SAFE_FORMAT_RULE;
-    }
+    // Claude no necesita la regla DeepSeek — no la inyectamos
     systemPromptText += buildEnvironmentContext(db, authSub);
-    mensajesParaGroq.push({ role: 'system', content: systemPromptText });
-    mensajesParaGroq = mensajesParaGroq.concat(historial);
-    if (userMessage) mensajesParaGroq.push({ role: 'user', content: String(userMessage.content) });
+    mensajesParaClaude.push({ role: 'system', content: systemPromptText });
+    mensajesParaClaude = mensajesParaClaude.concat(historial);
+    if (userMessage) mensajesParaClaude.push({ role: 'user', content: String(userMessage.content) });
     cacheResult = checkAndUpdatePromptCache(authSub, agentId, systemPromptText);
   } else {
-    mensajesParaGroq = Array.isArray(messages) ? messages : [{ role: 'user', content: 'Hola' }];
+    mensajesParaClaude = Array.isArray(messages) ? messages : [{ role: 'user', content: 'Hola' }];
     const envCtx = buildEnvironmentContext(db, authSub);
-    if (envCtx && !mensajesParaGroq.some(m => m.role === 'system')) {
-      mensajesParaGroq = [{ role: 'system', content: `Eres Zoco IA, un asistente de IA útil y preciso.${envCtx}` }, ...mensajesParaGroq];
+    if (envCtx && !mensajesParaClaude.some(m => m.role === 'system')) {
+      mensajesParaClaude = [{ role: 'system', content: `Eres Zoco IA, un asistente de IA útil y preciso.${envCtx}` }, ...mensajesParaClaude];
     } else if (envCtx) {
-      mensajesParaGroq = mensajesParaGroq.map(m => m.role === 'system' ? { ...m, content: m.content + envCtx } : m);
+      mensajesParaClaude = mensajesParaClaude.map(m => m.role === 'system' ? { ...m, content: m.content + envCtx } : m);
     }
   }
 
-  const lastUserMsg = mensajesParaGroq.filter(m => m.role === 'user').slice(-1)[0]?.content || '';
+  const lastUserMsg = mensajesParaClaude.filter(m => m.role === 'user').slice(-1)[0]?.content || '';
   const skillForcesWeb = !!(sessionSkills && sessionSkills.busquedaWeb);
   if (skillForcesWeb || needsWebSearch(lastUserMsg)) {
     const searchResults = await webSearch(lastUserMsg);
     if (searchResults) {
       const webCtx = `\n\n[CONTEXTO WEB - ${new Date().toLocaleDateString('es-ES')}]\n${searchResults}\n[FIN CONTEXTO WEB]\nUsa este contexto para responder con información actualizada.`;
-      const sysIdx = mensajesParaGroq.findIndex(m => m.role === 'system');
+      const sysIdx = mensajesParaClaude.findIndex(m => m.role === 'system');
       if (sysIdx >= 0) {
-        mensajesParaGroq[sysIdx] = { ...mensajesParaGroq[sysIdx], content: mensajesParaGroq[sysIdx].content + webCtx };
+        mensajesParaClaude[sysIdx] = { ...mensajesParaClaude[sysIdx], content: mensajesParaClaude[sysIdx].content + webCtx };
       } else {
-        mensajesParaGroq.unshift({ role: 'system', content: `Eres Zoco IA, un asistente útil y preciso.${webCtx}` });
+        mensajesParaClaude.unshift({ role: 'system', content: `Eres Zoco IA, un asistente útil y preciso.${webCtx}` });
       }
     }
   }
 
-  const modeloFinal = OLLAMA_MODEL_MAP[modeloZocoia] || modeloZocoia;
-  console.log(`[IA] ${modeloZocoia} → ${modeloFinal} via Ollama (${OLLAMA_URL})`);
+  const claudeModel = resolveClaudeModel(modeloZocoia);
+  console.log(`[IA] ${modeloZocoia} → ${claudeModel} via Claude Anthropic`);
 
   const clamp = (v, min, max, fallback) => { const n = Number(v); if (!Number.isFinite(n)) return fallback; return Math.min(max, Math.max(min, n)); };
-  const numPredict = clamp(agenteData.num_predict, 256, 8192, 4096);
-  const numCtx = clamp(agenteData.num_ctx, 2048, 16384, 8192);
-  const temperature = clamp(temperatureInput ?? agenteData.temperature, 0, 1.2, 0.7);
-  const maxTokens = maxTokensInput || numPredict;
-  const ollamaOptions = { num_predict: numPredict, num_ctx: numCtx };
+  const maxTokens = clamp(maxTokensInput || agenteData.num_predict, 256, 8192, 4096);
+  const temperature = clamp(temperatureInput ?? agenteData.temperature, 0, 1, 0.7);
 
   const skillTools = Array.isArray(sessionSkills?.allowedTools) ? sessionSkills.allowedTools.filter(t => ALL_TOOL_NAMES.includes(t)) : [];
   const agentTools = agentId ? (Array.isArray(agenteData.allowedTools) ? agenteData.allowedTools : ALL_TOOL_NAMES) : [];
   let allowedTools = [...new Set([...agentTools, ...skillTools])];
   if (allowedTools.length > 0 && !isOwnerUser(db, authSub)) allowedTools = [];
 
-  const callModel = (msgs, tools, toolChoice) => callChatModel({ ollamaUrl: OLLAMA_URL, ollamaModel: modeloFinal, messages: msgs, maxTokens, temperature, tools, toolChoice, ollamaOptions });
+  const callModel = (msgs, tools, toolChoice) => callChatModel({
+    claudeModel,
+    messages: msgs,
+    maxTokens,
+    temperature,
+    tools,
+    toolChoice,
+  });
 
   let respuesta;
   let usage;
@@ -683,7 +791,7 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   const clientTools = Array.isArray(requestTools) && requestTools.length > 0 && requestTools.every(t => t && t.type === 'function' && t.function?.name) ? requestTools : null;
 
   if (clientTools) {
-    const data = await callModel(mensajesParaGroq, clientTools, requestToolChoice || 'auto');
+    const data = await callModel(mensajesParaClaude, clientTools, requestToolChoice || 'auto');
     const msg = data.choices?.[0]?.message || {};
     respuesta = stripThink(msg.content || '');
     if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) clientToolCalls = msg.tool_calls;
@@ -697,11 +805,11 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
     let e2bApiKey = null;
     if (e2bRow) { try { e2bApiKey = JSON.parse(e2bRow.data || '{}').valor || null; } catch {} }
 
-    const result = await runToolLoop({ messages: mensajesParaGroq, callModel, allowedTools, workspacesRoot: WORKSPACES_ROOT, workspaceId: agentId, context: { tavilyApiKey, e2bApiKey, workspaceId: agentId } });
+    const result = await runToolLoop({ messages: mensajesParaClaude, callModel, allowedTools, workspacesRoot: WORKSPACES_ROOT, workspaceId: agentId, context: { tavilyApiKey, e2bApiKey, workspaceId: agentId } });
     respuesta = stripThink(result.finalMessage);
     usage = result.usage;
   } else {
-    const data = await callModel(mensajesParaGroq, undefined);
+    const data = await callModel(mensajesParaClaude, undefined);
     respuesta = stripThink(data.choices?.[0]?.message?.content || '');
     usage = data.usage || {};
   }
@@ -709,14 +817,12 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   if (agentId && userMessage?.content) {
     db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)').run(uuidv4(), agentId, authSub, 'user', String(userMessage.content));
     db.prepare('INSERT INTO agent_memory (id, agente_id, user_id, role, content) VALUES (?, ?, ?, ?, ?)').run(uuidv4(), agentId, authSub, 'assistant', respuesta);
-
-    // Emitir evento en vivo si el módulo está disponible
     if (emitirEventoAgente) {
       try { emitirEventoAgente(agentId, { type: 'message', content: respuesta }); } catch {}
     }
   }
 
-  const totalTokens = usage.total_tokens || 0;
+  const totalTokens = usage.total_tokens || (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
 
   if (apiKeyId && apiKeyType === 'gratuita') {
     const month = currentUsageMonth();
@@ -728,14 +834,14 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   const tokensConDescuento = cacheResult.hit ? Math.max(0, totalTokens - Math.round(cacheResult.cachedTokens * 0.9)) : totalTokens;
   const costeEuros = tokensConDescuento * 0.000002;
   if (costeEuros > 0) {
-    db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)').run(uuidv4(), authSub, costeEuros, 'gasto', `Ollama ${modeloFinal}${cacheResult.hit ? ' (caché)' : ''}`);
+    db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)').run(uuidv4(), authSub, costeEuros, 'gasto', `Claude ${claudeModel}${cacheResult.hit ? ' (caché)' : ''}`);
     db.prepare('UPDATE users SET creditos = creditos - ? WHERE id = ?').run(costeEuros, authSub);
   }
 
   return {
     choices: [{ message: { role: 'assistant', content: respuesta, ...(clientToolCalls ? { tool_calls: clientToolCalls } : {}) }, finish_reason: clientToolCalls ? 'tool_calls' : 'stop' }],
     usage: { input_tokens: usage.prompt_tokens || 0, output_tokens: usage.completion_tokens || 0, total_tokens: totalTokens, cache_read_tokens: cacheResult.hit ? cacheResult.cachedTokens : 0, prompt_tokens: usage.prompt_tokens || 0, completion_tokens: usage.completion_tokens || 0 },
-    model: modeloFinal,
+    model: claudeModel,
   };
 }
 
@@ -743,7 +849,6 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
 
 app.get(['/health', '/salud'], (req, res) => res.json({ status: 'ok', message: 'Zoco IA conectado con éxito' }));
 
-// Módulos de rutas opcionales — se registran DESPUÉS de definir authMiddleware
 if (registerEventStreamRoute) {
   try { registerEventStreamRoute(app, authMiddleware); } catch (e) { console.warn('[eventos-agente] No se pudo registrar:', e.message); }
 }
@@ -752,7 +857,6 @@ if (registerNewApiEndpoints) {
   try { registerNewApiEndpoints(app, db, authMiddleware); } catch (e) { console.warn('[new-api-endpoints] No se pudo registrar:', e.message); }
 }
 
-// Ordenador de Zoco
 if (handleOrdenadorZocoAction) {
   app.post('/api/ordenador-zoco', authMiddleware, async (req, res) => {
     try {
@@ -937,11 +1041,6 @@ app.get('/api/keys', authMiddleware, (req, res) => {
 });
 
 app.post('/api/keys', authMiddleware, (req, res) => {
-  // ── DEBUG TEMPORAL — a petición explícita del usuario, para diagnosticar
-  // por qué sigue apareciendo "Nombre, API Key y proveedor son requeridos"
-  // pese a que esta ruta (la correcta, {name, type}) ya no tiene conflicto
-  // de registro con new-api-endpoints.js. Quitar estas 2 líneas una vez
-  // resuelto el diagnóstico. ──────────────────────────────────────────────
   console.log('[DEBUG /api/keys] body recibido:', JSON.stringify(req.body));
   console.log('[DEBUG /api/keys] content-type:', req.headers['content-type']);
   const { name, type } = req.body || {};
@@ -1128,13 +1227,21 @@ app.get('/api/payments/success', authMiddleware, (req, res) => {
   res.json({ ok: false, message: 'Pago pendiente de confirmación' });
 });
 
+// ─── Sistema: estado del motor IA ─────────────────────────────────────────────
+// Antes chequeaba Ollama (/api/tags). Ahora reporta el estado de Claude Anthropic.
 app.get('/api/system/ollama', authMiddleware, async (req, res) => {
   try {
-    const resp = await fetch(`${OLLAMA_URL}/api/tags`, { signal: AbortSignal.timeout(3000) });
-    if (!resp.ok) return res.json({ online: false });
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) return res.json({ online: false, motor: 'Claude Anthropic', error: 'ANTHROPIC_API_KEY no configurada' });
+    // Verificación ligera: intentamos listar modelos
+    const resp = await fetch('https://api.anthropic.com/v1/models', {
+      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!resp.ok) return res.json({ online: false, motor: 'Claude Anthropic' });
     const data = await resp.json();
-    res.json({ online: true, models: (data.models || []).map(m => m.name) });
-  } catch { res.json({ online: false }); }
+    res.json({ online: true, motor: 'Claude Anthropic', models: (data.data || []).map(m => m.id).slice(0, 8) });
+  } catch { res.json({ online: false, motor: 'Claude Anthropic' }); }
 });
 
 app.get('/admin/stats', authMiddleware, requireAdmin, (req, res) => {
@@ -1145,7 +1252,10 @@ app.get('/admin/stats', authMiddleware, requireAdmin, (req, res) => {
     llamadasHoy: db.prepare("SELECT COUNT(*) as n FROM usage_log WHERE kind='gasto' AND created_at >= date('now')").get().n,
     ultimosPagos: db.prepare('SELECT p.*, u.email as user_email FROM payments p LEFT JOIN users u ON u.id = p.user_id ORDER BY p.created_at DESC LIMIT 50').all(),
     vivaConfigurado: !!(VIVA_CLIENT_ID && VIVA_CLIENT_SECRET),
-    ollamaOnline: !!OLLAMA_URL,
+    // ollamaOnline renombrado a motorOnline para el frontend — Claude siempre disponible si hay API key
+    ollamaOnline: !!process.env.ANTHROPIC_API_KEY,
+    motorOnline: !!process.env.ANTHROPIC_API_KEY,
+    motor: 'Claude Anthropic',
   });
 });
 
@@ -1181,25 +1291,19 @@ registerSessionRoutes({ app, db, authMiddleware, uuidv4, serverSecret: JWT_SECRE
 // ─── El Ordenador de Zoco: agente autónomo tipo Manus ──────────────────────
 if (registerComputerRoutes) {
   registerComputerRoutes({
-    app,
-    db,
-    authMiddleware,
-    uuidv4,
-    jwt,
-    JWT_SECRET,
+    app, db, authMiddleware, uuidv4, jwt, JWT_SECRET,
     workspacesRoot: WORKSPACES_ROOT,
-    // Fábrica de callModel: cada tarea usa el motor y mapa de modelos del gateway
     makeCallModel: ({ userId, model }) => {
-      const modeloFinal = OLLAMA_MODEL_MAP[model] || model;
+      const claudeModel = resolveClaudeModel(model || 'zoco-plus');
       return async (msgs, tools, toolChoice) => {
         const userCheck = db.prepare('SELECT creditos, activo FROM users WHERE id = ?').get(userId);
         if (!userCheck || !userCheck.activo) { const e = new Error('Cuenta desactivada'); e.status = 403; throw e; }
         if (userCheck.creditos <= BALANCE_BLOCK_THRESHOLD) { const e = new Error('Créditos insuficientes'); e.status = 402; throw e; }
-        const data = await callChatModel({ ollamaUrl: OLLAMA_URL, ollamaModel: modeloFinal, messages: msgs, maxTokens: 4096, temperature: 0.7, tools, toolChoice, ollamaOptions: { num_predict: 4096, num_ctx: 16384 } });
+        const data = await callChatModel({ claudeModel, messages: msgs, maxTokens: 4096, temperature: 0.7, tools, toolChoice });
         const totalTokens = data.usage?.total_tokens || 0;
         const coste = totalTokens * 0.000002;
         if (coste > 0) {
-          db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)').run(uuidv4(), userId, coste, 'gasto', `Ordenador de Zoco · ${modeloFinal}`);
+          db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)').run(uuidv4(), userId, coste, 'gasto', `Ordenador de Zoco · ${claudeModel}`);
           db.prepare('UPDATE users SET creditos = creditos - ? WHERE id = ?').run(coste, userId);
         }
         return data;
@@ -1215,7 +1319,7 @@ if (registerComputerRoutes) {
 registerConsoleRoutes({ app, db, authMiddleware, uuidv4, processChatCompletion });
 resumeInterruptedBatches(db, processChatCompletion);
 
-// ─── Anthropic-compatible endpoint (/v1/messages) ────────────────────────────
+// ─── Endpoint compatible con Anthropic (/v1/messages) ────────────────────────
 
 app.post('/v1/messages', authMiddleware, async (req, res) => {
   try {
@@ -1270,5 +1374,5 @@ if (fs.existsSync(publicDir)) {
 }
 
 app.listen(port, () => {
-  console.log(`🚀 Zoco IA Console corriendo en puerto ${port}`);
+  console.log(`🚀 Zoco IA Console corriendo en puerto ${port} — Motor: Claude Anthropic`);
 });
