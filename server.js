@@ -573,85 +573,14 @@ function openAIToolChoiceToAnthropic(toolChoice) {
   return { type: 'auto' };
 }
 
-// Convierte un historial en formato OpenAI (roles system/user/assistant/tool con
-// `tool_calls` y `tool_call_id`) al formato NATIVO de Anthropic, donde:
-//   - solo existen los roles `user` y `assistant`;
-//   - la llamada a herramienta es un bloque `tool_use` {id, name, input} dentro
-//     del turno `assistant`;
-//   - el resultado es un bloque `tool_result` {tool_use_id, content} dentro del
-//     turno `user` inmediatamente siguiente.
-// Sin esta conversión Anthropic rechaza el historial (400) o el modelo pierde el
-// canal de tool use y "imita" la llamada escribiendo el JSON como texto plano.
-// Además fusiona los `tool_result` consecutivos en un único turno `user`, como
-// exige la API cuando hubo varias tool calls en paralelo.
-function openAIMessagesToAnthropic(messages) {
-  const out = [];
-
-  const pushBlock = (role, block) => {
-    const last = out[out.length - 1];
-    if (last && last.role === role && Array.isArray(last.content)) {
-      last.content.push(block);
-    } else {
-      out.push({ role, content: [block] });
-    }
-  };
-
-  for (const m of messages) {
-    if (!m || m.role === 'system') continue;
-
-    // Resultado de herramienta → bloque tool_result en un turno `user`
-    if (m.role === 'tool') {
-      pushBlock('user', {
-        type: 'tool_result',
-        tool_use_id: m.tool_call_id || m.toolCallId || '',
-        content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? ''),
-        ...(m.is_error ? { is_error: true } : {}),
-      });
-      continue;
-    }
-
-    // Turno del asistente: puede llevar texto y/o bloques tool_use
-    if (m.role === 'assistant') {
-      const blocks = [];
-      if (Array.isArray(m.content)) {
-        // Ya viene en bloques nativos de Anthropic — respetarlos tal cual
-        blocks.push(...m.content);
-      } else if (typeof m.content === 'string' && m.content.trim()) {
-        blocks.push({ type: 'text', text: m.content });
-      }
-      for (const tc of (Array.isArray(m.tool_calls) ? m.tool_calls : [])) {
-        let input = {};
-        const raw = tc.function?.arguments ?? tc.input ?? '{}';
-        if (typeof raw === 'string') { try { input = JSON.parse(raw || '{}'); } catch { input = {}; } }
-        else if (raw && typeof raw === 'object') { input = raw; }
-        blocks.push({ type: 'tool_use', id: tc.id, name: tc.function?.name || tc.name, input });
-      }
-      // Anthropic no admite turnos vacíos
-      if (!blocks.length) continue;
-      out.push({ role: 'assistant', content: blocks });
-      continue;
-    }
-
-    // Turno del usuario
-    if (Array.isArray(m.content)) {
-      out.push({ role: 'user', content: m.content });
-    } else {
-      const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
-      if (text.trim()) pushBlock('user', { type: 'text', text });
-    }
-  }
-
-  // La API exige que el historial empiece por un turno `user`
-  while (out.length && out[0].role !== 'user') out.shift();
-  return out;
-}
-
 async function callChatModel({ claudeModel, messages, maxTokens, temperature, tools, toolChoice }) {
   const anthropic = getAnthropicClient();
 
-  // Separar el mensaje de sistema del resto y convertir al protocolo nativo
+  // Separar el mensaje de sistema del resto
   const systemMsg = messages.find(m => m.role === 'system');
-  const userMessages = openAIMessagesToAnthropic(messages);
+  const userMessages = messages
+    .filter(m => m.role !== 'system')
+    .map(m => ({ role: m.role, content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) }));
 
   const anthropicTools = tools && tools.length ? openAIToolsToAnthropic(tools) : undefined;
   const anthropicToolChoice = anthropicTools ? openAIToolChoiceToAnthropic(toolChoice) : undefined;
@@ -663,7 +592,13 @@ async function callChatModel({ claudeModel, messages, maxTokens, temperature, to
     const params = {
       model: claudeModel,
       max_tokens: maxTokens || 4096,
-      temperature: temperature ?? 0.7,
+      // NOTA CRÍTICA: NO se envía "temperature". Anthropic deprecó los
+      // parámetros de sampling (temperature/top_p/top_k) en los modelos de
+      // nueva generación (Sonnet 4.6+, Opus 4.7+) — la API devuelve 400
+      // "temperature is deprecated for this model" si el campo está
+      // presente, incluso con el valor por defecto (0.7). Se omite por
+      // completo en vez de intentar mandar 1.0 "por compatibilidad", para
+      // no depender de comportamiento específico de cada versión de modelo.
       messages: userMessages,
       ...(systemMsg ? { system: systemMsg.content } : {}),
       ...(anthropicTools ? { tools: anthropicTools } : {}),
@@ -689,14 +624,9 @@ async function callChatModel({ claudeModel, messages, maxTokens, temperature, to
           role: 'assistant',
           content: textContent,
           ...(tool_calls ? { tool_calls } : {}),
-          // Bloques nativos de Anthropic intactos: permiten reinyectar el turno
-          // del asistente en el historial sin pérdida de información (ids de
-          // tool_use, thinking, etc.). Los usa el bucle de zoco-computer.js.
-          _anthropicBlocks: response.content,
         },
         finish_reason: response.stop_reason === 'tool_use' ? 'tool_calls' : 'stop',
       }],
-      stop_reason: response.stop_reason,
       usage: {
         prompt_tokens: response.usage?.input_tokens || 0,
         completion_tokens: response.usage?.output_tokens || 0,
@@ -926,10 +856,7 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
 app.get(['/health', '/salud'], (req, res) => res.json({ status: 'ok', message: 'Zoco IA conectado con éxito' }));
 
 if (registerEventStreamRoute) {
-  // La firma real es registerEventStreamRoute({ app, jwt, JWT_SECRET, db }).
-  // Se estaba llamando con argumentos posicionales (app, authMiddleware), por lo
-  // que db llegaba undefined y la ruta de eventos en vivo nunca se registraba.
-  try { registerEventStreamRoute({ app, jwt, JWT_SECRET, db }); } catch (e) { console.warn('[eventos-agente] No se pudo registrar:', e.message); }
+  try { registerEventStreamRoute(app, authMiddleware); } catch (e) { console.warn('[eventos-agente] No se pudo registrar:', e.message); }
 }
 
 if (registerNewApiEndpoints) {
@@ -1378,7 +1305,7 @@ if (registerComputerRoutes) {
         const userCheck = db.prepare('SELECT creditos, activo FROM users WHERE id = ?').get(userId);
         if (!userCheck || !userCheck.activo) { const e = new Error('Cuenta desactivada'); e.status = 403; throw e; }
         if (userCheck.creditos <= BALANCE_BLOCK_THRESHOLD) { const e = new Error('Créditos insuficientes'); e.status = 402; throw e; }
-        const data = await callChatModel({ claudeModel, messages: msgs, maxTokens: 4096, temperature: 0.7, tools, toolChoice });
+        const data = await callChatModel({ claudeModel, messages: msgs, maxTokens: 4096, tools, toolChoice });
         const totalTokens = data.usage?.total_tokens || 0;
         const coste = totalTokens * 0.000002;
         if (coste > 0) {
