@@ -15,7 +15,10 @@
 // -----------------------------------------------------------------------------
 
 import Docker from 'dockerode';
-import fetch from 'node-fetch';
+// Node 18+ incluye fetch nativo (undici) en el ámbito global, así que no hace
+// falta la dependencia externa 'node-fetch'. Además NO estaba declarada en
+// package.json, por lo que este import hacía caer el servidor al arrancar con
+// ERR_MODULE_NOT_FOUND antes de atender ninguna petición.
 import { randomUUID } from 'crypto';
 
 const docker = new Docker(); // usa /var/run/docker.sock por defecto

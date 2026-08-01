@@ -24,51 +24,22 @@ import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import fsp from 'fs/promises';
+import { buildComputerSystemPrompt } from './zoco-prompt.js';
+import { applyFileEdits, browserAction, exposePort } from './zoco-tools-extra.js';
+import { runAgentLoop as runLoop, recoverOrphanTasks } from './zoco-loop.js';
+
+export { buildComputerSystemPrompt };
 
 // ─── Configuración ───────────────────────────────────────────────────────────
 
-const MAX_ITERATIONS = parseInt(process.env.COMPUTER_MAX_ITERATIONS || '30', 10);
+// El límite de iteraciones lo gestiona ahora ./zoco-loop.js (COMPUTER_MAX_ITERATIONS).
 const SHELL_TIMEOUT_MS = parseInt(process.env.COMPUTER_SHELL_TIMEOUT_MS || '120000', 10);
 const MAX_OUTPUT_CHARS = 12000;
 const MODEL_TIMEOUT_MS = parseInt(process.env.COMPUTER_MODEL_TIMEOUT_MS || '300000', 10);
 
 // ─── Prompt de sistema del agente ────────────────────────────────────────────
 
-export function buildComputerSystemPrompt({ taskTitle }) {
-  const fecha = new Date().toLocaleDateString('es-ES', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-  return `Eres Zoco, un agente de IA general y autónomo creado por Zoco IA (zocoia.es).
-
-Operas dentro de "El Ordenador de Zoco": un entorno de trabajo aislado con
-acceso a terminal Linux, sistema de archivos, búsqueda web y lector de páginas.
-
-Fecha actual: ${fecha}. Idioma de trabajo: español.
-
-<bucle_de_agente>
-Trabajas en un bucle iterativo hasta completar la tarea:
-1. Analiza el estado actual y el objetivo.
-2. Si la tarea es compleja, crea/actualiza un plan de fases con "gestionar_plan".
-3. Ejecuta UNA herramienta por iteración y observa su resultado real.
-4. Itera con paciencia: corrige errores, prueba alternativas, nunca inventes resultados.
-5. Cuando la tarea esté completa, llama a "entregar_resultado" con el resumen
-   final y las rutas de los archivos generados.
-</bucle_de_agente>
-
-<reglas>
-- SIEMPRE responde llamando a una herramienta. Nunca respondas solo con texto.
-- Crea un plan con "gestionar_plan" al inicio de cualquier tarea no trivial y
-  marca las fases como completadas a medida que avanzas.
-- Usa "mensaje_usuario" para informar de avances importantes (breve, 1-2 frases).
-- Los comandos de terminal deben ser no interactivos (flags -y, --yes, etc.).
-- Guarda los entregables como archivos en el workspace (informes en .md,
-  código en su extensión, datos en .csv/.json).
-- Si un comando falla, lee el error real y corrige; no repitas lo mismo.
-- Usa "busqueda_web" + "leer_pagina" para información actualizada; cita fuentes.
-- Al terminar llama SIEMPRE a "entregar_resultado". Es la única forma de
-  finalizar la tarea correctamente.
-</reglas>
-
-Tarea actual: ${taskTitle}`;
-}
+// El prompt de sistema vive ahora en ./zoco-prompt.js (reexportado arriba).
 
 // ─── Definición de herramientas (formato OpenAI function calling) ────────────
 
@@ -130,6 +101,33 @@ export const COMPUTER_TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'editar_archivo',
+      description: 'Edita un archivo existente por búsqueda y reemplazo exacto. Más eficiente que reescribir archivos largos. Es atómico: si alguna búsqueda no coincide o es ambigua, no se aplica ningún cambio.',
+      parameters: {
+        type: 'object',
+        properties: {
+          ruta: { type: 'string', description: 'Ruta relativa del archivo a editar' },
+          ediciones: {
+            type: 'array',
+            description: 'Lista de ediciones a aplicar en orden',
+            items: {
+              type: 'object',
+              properties: {
+                buscar: { type: 'string', description: 'Texto exacto a localizar, incluidos espacios y saltos de línea. Debe ser único en el archivo salvo que uses "todas".' },
+                reemplazar: { type: 'string', description: 'Texto que sustituye al buscado. Cadena vacía para borrar.' },
+                todas: { type: 'boolean', description: 'true para reemplazar todas las apariciones en lugar de solo la primera' },
+              },
+              required: ['buscar', 'reemplazar'],
+            },
+          },
+        },
+        required: ['ruta', 'ediciones'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'leer_archivo',
       description: 'Lee el contenido de un archivo del workspace.',
       parameters: {
@@ -180,6 +178,41 @@ export const COMPUTER_TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'navegador',
+      description: 'Controla un navegador visual real con capturas de pantalla. Úsalo cuando la página necesite JavaScript, interacción, inicio de sesión o inspección visual. Para extraer solo texto es más rápido "leer_pagina".',
+      parameters: {
+        type: 'object',
+        properties: {
+          accion: { type: 'string', enum: ['navegar', 'clic', 'escribir', 'tecla', 'scroll', 'captura'], description: 'Acción a ejecutar en el navegador' },
+          url: { type: 'string', description: 'URL completa (solo para accion=navegar)' },
+          x: { type: 'number', description: 'Coordenada X del clic (solo accion=clic)' },
+          y: { type: 'number', description: 'Coordenada Y del clic (solo accion=clic)' },
+          texto: { type: 'string', description: 'Texto a teclear (solo accion=escribir)' },
+          tecla: { type: 'string', description: 'Tecla a pulsar, ej: Return, Tab, Escape (solo accion=tecla)' },
+          direccion: { type: 'string', enum: ['arriba', 'abajo'], description: 'Dirección del scroll' },
+          cantidad: { type: 'number', description: 'Intensidad del scroll, 1-20' },
+        },
+        required: ['accion'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'exponer_puerto',
+      description: 'Publica un servicio que ya esté escuchando en un puerto local del ordenador y devuelve una URL pública para que el usuario la abra. Arranca antes el servidor en segundo plano con "ejecutar_terminal".',
+      parameters: {
+        type: 'object',
+        properties: {
+          puerto: { type: 'number', description: 'Puerto local donde escucha el servicio (1024-65535)' },
+        },
+        required: ['puerto'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'mensaje_usuario',
       description: 'Envía un mensaje breve de progreso al usuario sin terminar la tarea.',
       parameters: {
@@ -215,7 +248,10 @@ const subscribers = new Map(); // taskId -> Set<res>
 function broadcast(taskId, event) {
   const set = subscribers.get(taskId);
   if (!set) return;
-  const payload = `data: ${JSON.stringify(event)}\n\n`;
+  // El campo `id:` es lo que el navegador guarda como Last-Event-ID; al
+  // reconectar lo reenvía y el servidor solo repite los eventos perdidos.
+  const linea = event?.id ? `id: ${event.id}\n` : '';
+  const payload = `${linea}data: ${JSON.stringify(event)}\n\n`;
   for (const res of set) {
     try { res.write(payload); } catch { /* conexión cerrada */ }
   }
@@ -254,10 +290,19 @@ export function ensureComputerTables(db) {
   `);
 }
 
+// Persiste el evento y lo retransmite. Es CRÍTICO incluir el `id` de la fila en
+// el broadcast: el frontend lo usa como `lastEventId` para pedir solo los
+// eventos perdidos al reconectar. Sin `id`, tras cada reconexión se reenviaba
+// todo el historial y el panel mostraba acciones duplicadas.
 function recordEvent(db, taskId, type, payload) {
-  db.prepare('INSERT INTO computer_events (task_id, type, payload) VALUES (?, ?, ?)')
+  const info = db.prepare('INSERT INTO computer_events (task_id, type, payload) VALUES (?, ?, ?)')
     .run(taskId, type, JSON.stringify(payload || {}));
-  broadcast(taskId, { type, ...payload, ts: new Date().toISOString() });
+  broadcast(taskId, {
+    id: Number(info.lastInsertRowid),
+    type,
+    ...payload,
+    ts: new Date().toISOString(),
+  });
 }
 
 // ─── Implementación de herramientas ──────────────────────────────────────────
@@ -401,6 +446,54 @@ async function executeTool(db, task, workspaceDir, name, args, context) {
       recordEvent(db, task.id, 'file_write', { ruta: args.ruta, contenido: truncate(String(args.contenido ?? ''), 4000) });
       return `Archivo escrito: ${args.ruta} (${String(args.contenido ?? '').length} caracteres)`;
     }
+    case 'editar_archivo': {
+      const abs = safePath(workspaceDir, args.ruta);
+      const ediciones = Array.isArray(args.ediciones) ? args.ediciones : [];
+      if (!ediciones.length) return 'No se indicó ninguna edición. Incluye al menos un objeto en "ediciones".';
+      const { resumen, contenido } = await applyFileEdits(abs, ediciones);
+      recordEvent(db, task.id, 'file_edit', {
+        ruta: args.ruta,
+        ediciones: ediciones.length,
+        contenido: truncate(contenido, 4000),
+      });
+      return resumen;
+    }
+    case 'navegador': {
+      recordEvent(db, task.id, 'browser_action', { accion: args.accion, url: args.url || null });
+      const r = await browserAction({
+        taskId: task.id,
+        apiKey: context.e2bApiKey,
+        accion: args.accion,
+        url: args.url,
+        x: args.x,
+        y: args.y,
+        texto: args.texto,
+        tecla: args.tecla,
+        direccion: args.direccion,
+        cantidad: args.cantidad,
+      });
+      // La captura viaja al frontend como data URL para verse en el panel, pero
+      // NO se devuelve al modelo como texto (serían cientos de miles de tokens).
+      recordEvent(db, task.id, 'browser_screenshot', {
+        accion: args.accion,
+        descripcion: r.texto,
+        captura: r.captura ? `data:image/png;base64,${r.captura}` : null,
+        streamUrl: r.streamUrl || null,
+      });
+      return r.disponible === false
+        ? r.texto
+        : `${r.texto}\nLa captura se ha mostrado al usuario en el panel del ordenador.` +
+          (r.streamUrl ? `\nStream en vivo: ${r.streamUrl}` : '');
+    }
+    case 'exponer_puerto': {
+      const { url, texto } = exposePort({
+        puerto: args.puerto,
+        publicBase: context.publicBase,
+        taskId: task.id,
+      });
+      recordEvent(db, task.id, 'port_exposed', { puerto: args.puerto, url: url || null, mensaje: texto });
+      return texto;
+    }
     case 'leer_archivo': {
       const abs = safePath(workspaceDir, args.ruta);
       const contenido = await fsp.readFile(abs, 'utf8');
@@ -446,93 +539,41 @@ async function executeTool(db, task, workspaceDir, name, args, context) {
 
 // ─── Bucle principal del agente ──────────────────────────────────────────────
 
+// El bucle vive en ./zoco-loop.js. Aquí solo se ensambla el contexto de
+// ejecución (claves, rutas, callbacks) y se delega. Mantener el motor separado
+// permite modificar el comportamiento del agente sin tocar las rutas HTTP.
 async function runAgentLoop({ db, uuidv4, task, workspaceDir, callModel, tavilyApiKey }) {
-  const messages = [
-    { role: 'system', content: buildComputerSystemPrompt({ taskTitle: task.title }) },
-  ];
+  const e2bApiKey = process.env.E2B_API_KEY || null;
+  const publicBase = process.env.COMPUTER_PUBLIC_BASE || null;
 
-  // Reconstruir contexto previo de la conversación (mensajes usuario/asistente)
-  const prevMsgs = db.prepare('SELECT role, content FROM computer_messages WHERE task_id = ? ORDER BY created_at ASC LIMIT 30').all(task.id);
-  for (const m of prevMsgs) messages.push({ role: m.role, content: m.content });
+  const context = { uuidv4, tavilyApiKey, e2bApiKey, publicBase };
 
-  const context = { uuidv4, tavilyApiKey };
-  let finished = false;
-
-  for (let i = 0; i < MAX_ITERATIONS && !finished; i++) {
-    // Comprobar si el usuario ha detenido la tarea
-    const current = db.prepare('SELECT status FROM computer_tasks WHERE id = ?').get(task.id);
-    if (!current || current.status === 'detenida') {
-      recordEvent(db, task.id, 'stopped', {});
-      return;
-    }
-
-    recordEvent(db, task.id, 'thinking', { iteracion: i + 1 });
-
-    let data;
-    try {
-      data = await callModel(messages, COMPUTER_TOOLS, 'auto');
-    } catch (err) {
-      recordEvent(db, task.id, 'error', { mensaje: `Error del modelo: ${err.message}` });
-      db.prepare("UPDATE computer_tasks SET status = 'error', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(task.id);
-      return;
-    }
-
-    const msg = data.choices?.[0]?.message || {};
-    const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
-
-    if (toolCalls.length === 0) {
-      // El modelo respondió con texto: lo tratamos como resultado final implícito
-      const texto = (msg.content || '').trim() || 'Tarea completada.';
-      db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)')
-        .run(uuidv4(), task.id, 'assistant', texto);
-      db.prepare("UPDATE computer_tasks SET status = 'completada', result = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(texto, task.id);
-      recordEvent(db, task.id, 'finished', { resumen: texto, archivos: [] });
-      return;
-    }
-
-    messages.push({ role: 'assistant', content: msg.content || '', tool_calls: toolCalls });
-
-    for (const tc of toolCalls) {
-      const name = tc.function?.name;
-      let args = {};
-      try { args = JSON.parse(tc.function?.arguments || '{}'); } catch {}
-      recordEvent(db, task.id, 'tool_call', { herramienta: name, argumentos: truncate(JSON.stringify(args), 1500) });
-
-      let result;
-      try {
-        result = await executeTool(db, task, workspaceDir, name, args, context);
-      } catch (err) {
-        result = `Error ejecutando ${name}: ${err.message}`;
-      }
-
-      if (result && typeof result === 'object' && result.__finish) {
-        const resumen = result.resumen;
-        db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)')
-          .run(uuidv4(), task.id, 'assistant', resumen);
-        db.prepare("UPDATE computer_tasks SET status = 'completada', result = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(resumen, task.id);
-        recordEvent(db, task.id, 'finished', { resumen, archivos: result.archivos });
-        finished = true;
-        messages.push({ role: 'tool', tool_call_id: tc.id, content: 'Resultado entregado.' });
-        break;
-      }
-
-      messages.push({ role: 'tool', tool_call_id: tc.id, content: String(result) });
-    }
-  }
-
-  if (!finished) {
-    const aviso = `He alcanzado el límite de ${MAX_ITERATIONS} iteraciones. Puedes enviarme un mensaje para continuar la tarea.`;
-    db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)')
-      .run(uuidv4(), task.id, 'assistant', aviso);
-    db.prepare("UPDATE computer_tasks SET status = 'pausada', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(task.id);
-    recordEvent(db, task.id, 'paused', { mensaje: aviso });
-  }
+  await runLoop({
+    db,
+    uuidv4,
+    task,
+    workspaceDir,
+    callModel,
+    recordEvent,
+    executeTool,
+    tools: COMPUTER_TOOLS,
+    context,
+    buildSystemPrompt: () => buildComputerSystemPrompt({
+      taskTitle: task.title,
+      workspaceDir,
+      tieneNavegador: Boolean(e2bApiKey),
+    }),
+  });
 }
 
 // ─── Registro de rutas Express ───────────────────────────────────────────────
 
 export function registerComputerRoutes({ app, db, authMiddleware, uuidv4, jwt, JWT_SECRET, workspacesRoot, makeCallModel, getUserTavilyKey }) {
   ensureComputerTables(db);
+
+  // Coolify reinicia el contenedor en cada despliegue. Sin esto, las tareas que
+  // estaban corriendo quedan "en_curso" eternamente y el panel gira sin fin.
+  recoverOrphanTasks(db, recordEvent);
 
   const computerRoot = path.join(workspacesRoot, 'computer');
   fs.mkdirSync(computerRoot, { recursive: true });
@@ -663,16 +704,22 @@ export function registerComputerRoutes({ app, db, authMiddleware, uuidv4, jwt, J
     if (!task) return res.status(404).end();
 
     res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
+    // Sin esto, el proxy inverso (Traefik/Nginx en Coolify) puede bufferizar el
+    // stream y el panel no mostraría nada "en vivo" hasta el final de la tarea.
+    res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders?.();
 
-    // Reemitir eventos posteriores a lastEventId si el cliente se reconecta
-    const lastId = parseInt(req.query.lastEventId || '0', 10);
+    // Reemitir eventos posteriores a lastEventId si el cliente se reconecta.
+    // Se acepta tanto por query como por la cabecera estándar Last-Event-ID que
+    // EventSource envía automáticamente al reconectar.
+    const lastId = parseInt(req.query.lastEventId || req.headers['last-event-id'] || '0', 10);
     if (lastId > 0) {
       const missed = db.prepare('SELECT id, type, payload, created_at FROM computer_events WHERE task_id = ? AND id > ? ORDER BY id ASC').all(req.params.id, lastId);
       for (const e of missed) {
-        res.write(`data: ${JSON.stringify({ id: e.id, type: e.type, ...(JSON.parse(e.payload || '{}')), ts: e.created_at })}\n\n`);
+        // El campo `id:` permite al navegador reanudar solo desde el último visto.
+        res.write(`id: ${e.id}\ndata: ${JSON.stringify({ id: e.id, type: e.type, ...(JSON.parse(e.payload || '{}')), ts: e.created_at })}\n\n`);
       }
     }
 

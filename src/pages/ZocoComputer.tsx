@@ -40,17 +40,22 @@ const EVENT_META: Record<string, { icon: string; label: string; panel: string }>
   terminal_start: { icon: 'fa-terminal', label: 'Terminal', panel: 'terminal' },
   terminal_output: { icon: 'fa-terminal', label: 'Terminal', panel: 'terminal' },
   file_write: { icon: 'fa-file-pen', label: 'Editor', panel: 'editor' },
+  file_edit: { icon: 'fa-pen-to-square', label: 'Edición', panel: 'editor' },
   file_read: { icon: 'fa-file-lines', label: 'Lectura', panel: 'editor' },
   file_list: { icon: 'fa-folder-open', label: 'Archivos', panel: 'editor' },
   web_search: { icon: 'fa-magnifying-glass', label: 'Búsqueda web', panel: 'browser' },
   web_search_result: { icon: 'fa-magnifying-glass', label: 'Resultados', panel: 'browser' },
   browse: { icon: 'fa-globe', label: 'Navegador', panel: 'browser' },
   browse_result: { icon: 'fa-globe', label: 'Página leída', panel: 'browser' },
+  browser_action: { icon: 'fa-arrow-pointer', label: 'Navegador', panel: 'browser' },
+  browser_screenshot: { icon: 'fa-camera', label: 'Captura', panel: 'browser' },
+  port_exposed: { icon: 'fa-link', label: 'Servicio publicado', panel: 'log' },
   assistant_message: { icon: 'fa-comment', label: 'Mensaje', panel: 'log' },
   user_message: { icon: 'fa-user', label: 'Usuario', panel: 'log' },
   finished: { icon: 'fa-flag-checkered', label: 'Completada', panel: 'log' },
   paused: { icon: 'fa-pause', label: 'Pausada', panel: 'log' },
   stopped: { icon: 'fa-stop', label: 'Detenida', panel: 'log' },
+  tool_error: { icon: 'fa-circle-exclamation', label: 'Fallo de herramienta', panel: 'log' },
   error: { icon: 'fa-triangle-exclamation', label: 'Error', panel: 'log' },
 };
 
@@ -418,7 +423,48 @@ export default function ZocoComputer() {
                     </span>
                   )}
                   {ev.type === 'tool_call' && <span className="text-gray-400">{ev.herramienta}({ev.argumentos})</span>}
-                  {ev.type === 'thinking' && <span className="text-gray-500 italic">Iteración {ev.iteracion}: analizando estado y decidiendo siguiente acción…</span>}
+                  {ev.type === 'tool_error' && <span className="text-orange-400">⚠ {ev.herramienta}: {ev.mensaje}</span>}
+                  {/* El razonamiento real del modelo llega en ev.texto; si aún no
+                      ha llegado (primer instante de la iteración) se muestra el
+                      indicador genérico con el número de iteración. */}
+                  {ev.type === 'thinking' && (
+                    ev.texto
+                      ? <span className="text-gray-300 italic whitespace-pre-wrap">{ev.texto}</span>
+                      : <span className="text-gray-500 italic">Iteración {ev.iteracion}: analizando el estado y decidiendo la siguiente acción…</span>
+                  )}
+                  {ev.type === 'file_edit' && (
+                    <>
+                      <span className="text-blue-400">✒ {ev.ruta} · {ev.ediciones} edición(es)</span>
+                      {'\n'}
+                      <span className="text-gray-400">{ev.contenido}</span>
+                    </>
+                  )}
+                  {ev.type === 'browser_action' && (
+                    <span className="text-cyan-300">→ {ev.accion}{ev.url ? `: ${ev.url}` : ''}</span>
+                  )}
+                  {ev.type === 'browser_screenshot' && (
+                    <div className="space-y-2">
+                      <span className="text-cyan-300 block">{ev.descripcion}</span>
+                      {ev.captura && (
+                        <img
+                          src={ev.captura}
+                          alt="Captura del navegador del agente"
+                          className="w-full rounded-md border border-gray-700"
+                          loading="lazy"
+                        />
+                      )}
+                      {ev.streamUrl && (
+                        <a href={ev.streamUrl} target="_blank" rel="noreferrer" className="text-blue-400 underline text-[11px] block">
+                          Ver el escritorio en vivo
+                        </a>
+                      )}
+                    </div>
+                  )}
+                  {ev.type === 'port_exposed' && (
+                    ev.url
+                      ? <a href={ev.url} target="_blank" rel="noreferrer" className="text-blue-400 underline">🔗 {ev.url}</a>
+                      : <span className="text-amber-400">{ev.mensaje}</span>
+                  )}
                   {ev.type === 'assistant_message' && <span className="text-emerald-300">{ev.texto}</span>}
                   {ev.type === 'user_message' && <span className="text-gray-300">{ev.texto}</span>}
                   {ev.type === 'finished' && <span className="text-green-400">✓ Tarea completada{Array.isArray(ev.archivos) && ev.archivos.length ? `\nArchivos: ${ev.archivos.join(', ')}` : ''}</span>}
