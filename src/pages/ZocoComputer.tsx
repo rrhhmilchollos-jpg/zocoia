@@ -107,9 +107,12 @@ export default function ZocoComputer() {
     es.onmessage = (e) => {
       try {
         const ev: Evento = JSON.parse(e.data);
-        if (ev.id) lastEventIdRef.current = Math.max(lastEventIdRef.current, ev.id);
-        setEvents(prev => [...prev.slice(-499), ev]);
-        if (ev.type === 'plan' && Array.isArray(ev.fases)) setPlan(ev.fases);
+        // El número de secuencia viaja en el campo `id:` del protocolo SSE, que
+        // el navegador expone como `lastEventId`; el cuerpo JSON no lo repite.
+        const seq = parseInt(e.lastEventId || '0', 10);
+        if (seq) lastEventIdRef.current = Math.max(lastEventIdRef.current, seq);
+        setEvents(prev => [...prev.slice(-499), { ...ev, id: seq || ev.id }]);
+        if ((ev.type === 'plan_updated' || ev.type === 'plan') && Array.isArray(ev.fases)) setPlan(ev.fases);
         if (ev.type === 'assistant_message') setMessages(prev => [...prev, { role: 'assistant', content: ev.texto }]);
         if (ev.type === 'finished') {
           setMessages(prev => [...prev, { role: 'assistant', content: ev.resumen }]);
@@ -134,10 +137,14 @@ export default function ZocoComputer() {
       if (!res.ok) return;
       const data = await res.json();
       setActiveTask({ id: data.id, title: data.title, status: data.status, model: data.model });
-      setMessages(data.messages || []);
+      setMessages(data.messages || data.mensajes || []);
       setPlan(data.plan || []);
-      setEvents(data.events || []);
-      lastEventIdRef.current = data.events?.length ? Math.max(...data.events.map((e: Evento) => e.id || 0)) : 0;
+      const evs = data.events || data.eventos || [];
+      setEvents(evs);
+      // El detalle devuelve el número de secuencia como `seq`.
+      lastEventIdRef.current = evs.length
+        ? Math.max(...evs.map((e: Evento & { seq?: number }) => e.seq || e.id || 0))
+        : 0;
       connectStream(taskId);
     } catch { /* silencioso */ }
   }, [headers, connectStream]);
