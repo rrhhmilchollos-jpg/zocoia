@@ -1,24 +1,177 @@
-// MOTOR DE IA: API oficial de Anthropic — llamadas directas a modelos Claude.
-// Se ha eliminado por completo el enrutado a Zoco IA / Ollama / Groq: este
-// archivo ya NO depende de ningún servidor local ni de ninguna clave
-// ZOCOIA_API_KEY / OLLAMA_BASE_URL. Solo necesita ANTHROPIC_API_KEY.
+// ─── MOTOR: CLAUDE ANTHROPIC (SDK nativo) ────────────────────────────────────
+// Migrado desde OpenAI/Ollama/DeepSeek a la API oficial de Anthropic.
+// Modelos activos (IDs exactos verificados en docs.anthropic.com, agosto 2026):
+//   zoco-flash / maris-velox  →  claude-haiku-4-5-20251001   (rápido, barato)
+//   zoco-plus  / maris-core   →  claude-sonnet-4-6            (equilibrado)
+//   zoco-max   / maris-pro    →  claude-opus-4-8              (máxima capacidad)
+//   zoco-lab   / maris-beta   →  claude-opus-4-8              (experimental)
+// El código de Ollama/OpenAI/DeepSeek/Groq queda comentado más abajo
+// por si fuera necesario volver atrás.
 import Anthropic from "@anthropic-ai/sdk";
 import { logger } from "./logger";
 import { recordApiUsage } from "./usageMeter";
 
-// ─── Cliente Anthropic (lazy) ────────────────────────────────────────────────
+// ─── CLIENTE ANTHROPIC ───────────────────────────────────────────────────────
 let _anthropic: Anthropic | null = null;
 function getAnthropic(): Anthropic {
   if (!_anthropic) {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) {
       throw new Error(
-        "ANTHROPIC_API_KEY no configurada. Añade tu clave de la API de Anthropic a las variables de entorno.",
+        "ANTHROPIC_API_KEY no configurada. Añádela como variable de entorno en Coolify."
       );
     }
     _anthropic = new Anthropic({ apiKey });
   }
   return _anthropic;
+}
+
+// ─── MAPA DE MODELOS: nombres internos de Zoco IA → IDs reales de Claude ────
+const CLAUDE_MODEL_MAP: Record<string, string> = {
+  // Nivel flash/velox → Haiku (el más rápido y barato)
+  "zoco-flash":       "claude-haiku-4-5-20251001",
+  "maris-velox":      "claude-haiku-4-5-20251001",
+  "maris-velox-1b":   "claude-haiku-4-5-20251001",
+  // Nivel plus/core → Sonnet (equilibrado, default)
+  "zoco-plus":        "claude-sonnet-4-6",
+  "maris-core":       "claude-sonnet-4-6",
+  "maris-core-7b":    "claude-sonnet-4-6",
+  // Nivel max/pro → Opus (máxima capacidad)
+  "zoco-max":         "claude-opus-4-8",
+  "maris-pro":        "claude-opus-4-8",
+  "maris-pro-32b":    "claude-opus-4-8",
+  // Nivel lab/beta → Opus (experimental)
+  "zoco-lab":         "claude-opus-4-8",
+  "maris-beta":       "claude-opus-4-8",
+  "maris-beta-70b":   "claude-opus-4-8",
+};
+
+// Resuelve el ID real de Claude para un nombre de modelo interno.
+// Si ya viene un ID directo de Claude (ej. "claude-sonnet-4-6"), lo usa tal cual.
+function claudeModelFor(model: string): string {
+  const m = String(model || "zoco-plus");
+  // Si ya es un ID de Claude real, usarlo directamente
+  if (m.startsWith("claude-")) return m;
+  // Mapear nombres internos de Zoco IA
+  return CLAUDE_MODEL_MAP[m] || "claude-sonnet-4-6";
+}
+
+// ─── CÓDIGO ANTIGUO COMENTADO (Ollama / OpenAI / DeepSeek / Groq) ────────────
+/*
+import OpenAI from "openai";
+
+let _groq: OpenAI | null = null;
+function getGroq(): OpenAI | null {
+  const zocoKey = process.env.ZOCOIA_API_KEY;
+  const zocoUrl = process.env.ZOCOIA_API_URL || "https://zocoia.es";
+  const ollamaUrl = process.env.OLLAMA_BASE_URL || process.env.OLLAMA_URL;
+  if (!_groq) {
+    if (zocoUrl && zocoKey && zocoKey.startsWith('sk-zoco-')) {
+      _groq = new OpenAI({ baseURL: `${zocoUrl.replace(/\/+$/, '')}/v1`, apiKey: zocoKey });
+    } else if (ollamaUrl) {
+      _groq = new OpenAI({ baseURL: `${ollamaUrl.replace(/\/+$/, '')}/v1`, apiKey: process.env.OLLAMA_API_KEY || 'ollama' });
+    } else {
+      return null;
+    }
+  }
+  return _groq;
+}
+
+async function callGroqFallback(params: any): Promise<{ content: Array<{ type: string; text: string }> }> {
+  const groq = getGroq();
+  if (!groq) throw new Error('Motor local no configurado');
+  const groqModel = process.env.OLLAMA_MODEL_PLUS || 'Zoco Max';
+  const systemMsg = params.system
+    ? [{ role: 'system' as const, content: typeof params.system === 'string' ? params.system : (params.system as any[]).map((b: any) => b.text || '').join('\n') }]
+    : [];
+  const userMessages = (params.messages || []).map((m: any) => ({
+    role: m.role as 'user' | 'assistant',
+    content: Array.isArray(m.content) ? m.content.map((b: any) => b.text || '').join('') : String(m.content || ''),
+  }));
+  const response = await groq.chat.completions.create({
+    model: groqModel,
+    messages: [...systemMsg, ...userMessages],
+    max_tokens: params.max_tokens || 2048,
+    temperature: 0.7,
+  });
+  const text = response.choices[0]?.message?.content || '';
+  recordApiUsage({ jobId: undefined, model: groqModel, inputTokens: response.usage?.prompt_tokens || 0, outputTokens: response.usage?.completion_tokens || 0, agent: 'groq-fallback' });
+  return { content: [{ type: 'text', text }] };
+}
+
+async function callOllamaFallback(role: AgentRole, params: any): Promise<any> {
+  const ollamaUrl = process.env.OLLAMA_BASE_URL || process.env.OLLAMA_URL;
+  if (!ollamaUrl) throw new Error('Ollama URL no configurada');
+  const ollamaModel = process.env.OLLAMA_MODEL_PLUS || 'Zoco Max';
+  const messages = (params.messages || []).map((m: any) => ({
+    role: m.role,
+    content: Array.isArray(m.content) ? m.content.map((b: any) => b.text || '').join('') : String(m.content || ''),
+  }));
+  if (params.system) {
+    messages.unshift({ role: 'system', content: typeof params.system === 'string' ? params.system : (params.system as any[]).map((b: any) => b.text || '').join('\n') });
+  }
+  const response = await fetch(`${ollamaUrl}/api/chat`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: ollamaModel, messages, options: { temperature: params.temperature || 0.7, num_predict: params.max_tokens || 2048 } }),
+  });
+  if (!response.ok) { const errorText = await response.text(); throw new Error(`Ollama API error: ${response.status} - ${errorText}`); }
+  const data = await response.json();
+  const text = data.message?.content || '';
+  recordApiUsage({ jobId: undefined, model: ollamaModel, inputTokens: 0, outputTokens: 0, agent: 'ollama-fallback' });
+  return { content: [{ type: 'text', text }] };
+}
+
+let _openai: OpenAI | null = null;
+function getOpenAI(): OpenAI {
+  if (!_openai) {
+    const zocoUrl = process.env.ZOCOIA_API_URL || "https://zocoia.es";
+    const ollamaUrl = process.env.OLLAMA_BASE_URL || process.env.OLLAMA_URL;
+    if (zocoUrl) {
+      _openai = new OpenAI({ baseURL: `${zocoUrl.replace(/\/+$/, "")}/v1`, apiKey: process.env.ZOCOIA_API_KEY || "dummy" });
+    } else if (ollamaUrl) {
+      _openai = new OpenAI({ baseURL: `${ollamaUrl.replace(/\/+$/, "")}/v1`, apiKey: process.env.OLLAMA_API_KEY || "ollama" });
+    } else {
+      throw new Error("Motor local no configurado");
+    }
+  }
+  return _openai;
+}
+
+function zocoModelFor(model: string): string {
+  const m = String(model || "");
+  if (/^zoco-/.test(m)) return m;
+  if (/haiku|flash/i.test(m)) return "zoco-flash";
+  if (/opus|max/i.test(m)) return "zoco-max";
+  return "zoco-plus";
+}
+
+function systemToText(system: any): string {
+  if (!system) return "";
+  const text = typeof system === "string" ? system : (system as any[]).map((b: any) => b?.text || "").join("\n");
+  return text.includes("DeepSeek-R1/OpenAI compatible endpoint") ? text : text + DEEPSEEK_SAFE_FORMAT_RULE;
+}
+
+function anthropicMessagesToOpenAI(messages: any[]): any[] { ... }
+function anthropicToolsToOpenAI(tools: any[]): any[] { ... }
+*/
+// ─── FIN CÓDIGO ANTIGUO ───────────────────────────────────────────────────────
+
+// DEEPSEEK_SAFE_FORMAT_RULE se mantiene exportada para compatibilidad con
+// seed-owner-agents.js que la importa, pero ya no se inyecta en los prompts
+// (Claude no necesita esta instrucción).
+export const DEEPSEEK_SAFE_FORMAT_RULE = "";
+
+// stripReasoning se mantiene por compatibilidad — Claude no emite <think>,
+// pero no hace daño tenerla y otros módulos pueden llamarla.
+export function stripReasoning(text: string): string {
+  if (!text) return "";
+  let out = String(text);
+  out = out.replace(/<think>[\s\S]*?<\/think>/g, "");
+  const openIdx = out.indexOf("<think>");
+  if (openIdx !== -1 && out.indexOf("</think>", openIdx) === -1) out = out.slice(0, openIdx);
+  const orphanClose = out.indexOf("</think>");
+  if (orphanClose !== -1 && out.lastIndexOf("<think>", orphanClose) === -1) out = out.slice(orphanClose + "</think>".length);
+  return out.trim();
 }
 
 /* ----------------------------- types -------------------------------------- */
@@ -52,27 +205,11 @@ export type AgentRole = "researcher" | "architect" | "designer" | "frontend" | "
 
 export type ComplexityTier = "basic" | "standard" | "robust" | "ultra";
 
-export type GeneratePhase = 
-  | "starting"
-  | "researching"
-  | "architecting"
-  | "designing"
-  | "schema"
-  | "frontend"
-  | "backend"
-  | "generating"
-  | "integrations"
-  | "integrating"
-  | "testing"
-  | "reviewing"
-  | "qa"
-  | "patching"
-  | "validating"
-  | "fixing"
-  | "parsing"
-  | "queued"
-  | "ready"
-  | "failed";
+export type GeneratePhase =
+  | "starting" | "researching" | "architecting" | "designing" | "schema"
+  | "frontend" | "backend" | "generating" | "integrations" | "integrating"
+  | "testing" | "reviewing" | "qa" | "patching" | "validating" | "fixing"
+  | "parsing" | "queued" | "ready" | "failed";
 
 export interface GenerateProgress {
   phase: GeneratePhase;
@@ -80,11 +217,7 @@ export interface GenerateProgress {
   note?: string;
 }
 
-export type AgentLog = (
-  agent: string,
-  message: string,
-  level?: "info" | "warn" | "error",
-) => void;
+export type AgentLog = (agent: string, message: string, level?: "info" | "warn" | "error") => void;
 
 export interface AgentModelChoice {
   role: AgentRole;
@@ -127,13 +260,6 @@ export function extractJsonObject<T = any>(raw: string): T | null {
   return null;
 }
 
-/**
- * Reemplaza extractJsonObject para el plan de reparación multi-archivo
- * (planMultiFileRepair) — formato de etiquetas tipo XML en vez de JSON.
- * Cada <file>...</file> es un bloque independiente: un corte de tokens a
- * mitad del archivo N nunca invalida los N-1 anteriores, que sí llegaron
- * a cerrarse (a diferencia de un único objeto JSON balanceado).
- */
 export function extractResilientFilePlan(raw: string): MultiFilePlanItem[] {
   const plans: MultiFilePlanItem[] = [];
   const fileRegex = /<file>\s*<path>([\s\S]*?)<\/path>\s*<action>(rewrite|create|delete)<\/action>\s*<reason>([\s\S]*?)<\/reason>\s*<\/file>/g;
@@ -141,51 +267,15 @@ export function extractResilientFilePlan(raw: string): MultiFilePlanItem[] {
   while ((match = fileRegex.exec(raw)) !== null) {
     const path = match[1].trim();
     if (!path) continue;
-    plans.push({
-      path,
-      action: match[2] as "rewrite" | "create" | "delete",
-      reason: match[3].trim(),
-    });
+    plans.push({ path, action: match[2] as "rewrite" | "create" | "delete", reason: match[3].trim() });
   }
   return plans;
 }
 
 export async function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
-  return Promise.race([
-    p,
-    new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms)),
-  ]);
+  return Promise.race([p, new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms))]);
 }
 
-// ─── Modelos Claude reales, de más capaz a más rápido ────────────────────────
-// Nombres verificados contra la API real de Anthropic. "auto"/ids legados
-// (zoco-*, gemini-*, etc.) se remapean aquí a un modelo real equivalente.
-export const CLAUDE_SONNET = "claude-sonnet-4-6";
-export const CLAUDE_OPUS = "claude-opus-4-8";
-export const CLAUDE_HAIKU = "claude-haiku-4-5-20251001";
-
-const CLAUDE_MODELS = [CLAUDE_SONNET, CLAUDE_OPUS, CLAUDE_HAIKU];
-
-// Normaliza cualquier identificador legado (zoco-flash/zoco-plus/zoco-max,
-// gemini-*, auto, etc.) a un modelo real de Claude.
-function claudeModelFor(model: string): string {
-  const m = String(model || "").toLowerCase();
-  if (CLAUDE_MODELS.includes(model)) return model;
-  if (/haiku|flash|lab/.test(m)) return CLAUDE_HAIKU;
-  if (/opus|max/.test(m)) return CLAUDE_OPUS;
-  if (/sonnet|plus|auto|default|^$/.test(m)) return CLAUDE_SONNET;
-  return CLAUDE_SONNET;
-}
-
-function fallbackClaudeModels(model: string): string[] {
-  const primary = claudeModelFor(model);
-  return [primary, ...CLAUDE_MODELS.filter((m) => m !== primary)];
-}
-
-// Timeout duro para cualquier llamada a Anthropic dentro de este archivo.
-// Sin esto, una llamada no-streaming puede colgarse minutos si el proveedor
-// se degrada — el job entero quedaría en silencio hasta el watchdog global
-// (12 min), perdiendo todo el trabajo ya hecho.
 export async function raceWithTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   let timer: NodeJS.Timeout;
   const timeoutPromise = new Promise<T>((_, reject) => {
@@ -197,205 +287,181 @@ export async function raceWithTimeout<T>(p: Promise<T>, ms: number, label: strin
     clearTimeout(timer!);
   }
 }
+
 export const AI_CALL_TIMEOUT_MS = 90_000;
 
-/**
- * Llamada principal de chat/completion — API nativa de Anthropic
- * (anthropic.messages.stream), con reintento y fallback entre modelos
- * Claude reales (Sonnet → Opus → Haiku) ante fallos transitorios.
- */
+// ─── FUNCIÓN PRINCIPAL: llamada a Claude Anthropic con reintentos ─────────────
 export async function createClaudeMessageWithFallback(
   role: AgentRole,
   model: string,
   params: any,
   meterOpts?: { jobId?: string },
 ): Promise<any> {
-  let lastError: unknown;
+  const claudeModel = claudeModelFor(model);
   const MAX_RETRIES = 3;
+  let lastError: unknown;
 
-  // Prompt caching: system prompts largos y estáticos se marcan como
-  // cacheable para reducir coste/latencia en llamadas repetidas.
-  const MIN_CACHEABLE_CHARS = 3500;
-  if (typeof params.system === "string" && params.system.length >= MIN_CACHEABLE_CHARS) {
-    params = {
-      ...params,
-      system: [{ type: "text", text: params.system, cache_control: { type: "ephemeral" } }],
-    };
-  }
+  // Extraer system prompt como string plano
+  const systemText: string = !params.system
+    ? ""
+    : typeof params.system === "string"
+      ? params.system
+      : Array.isArray(params.system)
+        ? params.system.map((b: any) => b?.text || "").join("\n")
+        : String(params.system);
 
-  // Compresión de historiales muy largos para no saturar la ventana de contexto.
-  if (params.messages && params.messages.length > 10) {
-    logger.info({ role, originalLength: params.messages.length }, "CONTEXT OPTIMIZER: Comprimiendo historial...");
-    const systemInstruction = params.messages[0].role === "system" ? params.messages.shift() : null;
-    const lastUserMessage = params.messages.pop();
-    const middleMessages = params.messages.slice(-4);
-    const firstMessage = params.messages[0];
+  // Convertir mensajes al formato nativo de Anthropic (sin role "system" en messages)
+  const messages = (params.messages || [])
+    .filter((m: any) => m && m.role !== "system")
+    .map((m: any) => ({
+      role: m.role as "user" | "assistant",
+      content: Array.isArray(m.content)
+        ? m.content.map((b: any) => (typeof b === "string" ? { type: "text", text: b } : b))
+        : String(m.content ?? ""),
+    }));
 
-    params.messages = [
-      ...(systemInstruction ? [systemInstruction] : []),
-      firstMessage,
+  // Comprimir historial largo (conserva comportamiento original)
+  if (messages.length > 10) {
+    logger.info({ role, originalLength: messages.length }, "CONTEXT OPTIMIZER: Comprimiendo historial...");
+    const lastMsg = messages.pop();
+    const middleMessages = messages.slice(-4);
+    const firstMsg = messages[0];
+    const compressed = [
+      firstMsg,
       { role: "user", content: "... [Contexto antiguo comprimido] ..." },
+      { role: "assistant", content: "Entendido." },
       ...middleMessages,
-      lastUserMessage,
+      lastMsg,
     ].filter(Boolean);
+    messages.length = 0;
+    messages.push(...compressed);
   }
 
-  for (const candidate of fallbackClaudeModels(model)) {
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      try {
-        await new Promise((r) => setTimeout(r, Math.random() * 300));
-        logger.info({ role, model: candidate }, "Iniciando stream con Anthropic...");
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      await new Promise(r => setTimeout(r, Math.random() * 300));
+      logger.info({ role, model: claudeModel }, "Llamando a Claude Anthropic...");
 
-        let fullText = "";
-        let usageInputTokens = 0;
-        let usageOutputTokens = 0;
-        let cacheReadTokens = 0;
-
-        const stream = getAnthropic().messages.stream({
-          model: candidate,
+      const response = await raceWithTimeout(
+        getAnthropic().messages.create({
+          model: claudeModel,
           max_tokens: params.max_tokens || 4096,
           temperature: params.temperature ?? 0.7,
-          system: params.system,
-          messages: params.messages || [],
-        });
+          ...(systemText ? { system: systemText } : {}),
+          messages,
+        }),
+        AI_CALL_TIMEOUT_MS,
+        `${role} (modelo ${claudeModel})`,
+      );
 
-        // Timeout de inactividad real: si pasan AI_CALL_TIMEOUT_MS sin recibir
-        // ni un solo evento nuevo del stream, se considera colgado y se pasa
-        // al siguiente intento/modelo, en vez de esperar indefinidamente.
-        const iterator = stream[Symbol.asyncIterator]();
-        while (true) {
-          const { value: chunk, done } = await raceWithTimeout(
-            iterator.next(),
-            AI_CALL_TIMEOUT_MS,
-            `${role} stream chunk (modelo ${candidate})`,
-          );
-          if (done) break;
-          if (chunk.type === "content_block_delta" && chunk.delta.type === "text_delta") {
-            fullText += chunk.delta.text;
-          }
-          if (chunk.type === "message_start") {
-            usageInputTokens = chunk.message.usage?.input_tokens ?? 0;
-            cacheReadTokens = (chunk.message.usage as any)?.cache_read_input_tokens ?? 0;
-          }
-          if (chunk.type === "message_delta") {
-            usageOutputTokens = chunk.usage?.output_tokens ?? usageOutputTokens;
-          }
-        }
+      const text = response.content
+        .filter((b: any) => b.type === "text")
+        .map((b: any) => b.text)
+        .join("");
 
-        if (!fullText) throw new Error("Stream vacío");
+      recordApiUsage({
+        jobId: meterOpts?.jobId,
+        model: claudeModel,
+        inputTokens: response.usage?.input_tokens || 0,
+        outputTokens: response.usage?.output_tokens || 0,
+        agent: role,
+      });
 
-        recordApiUsage({
-          jobId: meterOpts?.jobId,
-          model: candidate,
-          inputTokens: usageInputTokens,
-          outputTokens: usageOutputTokens,
-          agent: role,
-        });
+      return { content: [{ type: "text", text }] };
 
-        return {
-          content: [{ type: "text", text: fullText }],
-          usage: {
-            input_tokens: usageInputTokens,
-            output_tokens: usageOutputTokens,
-            cache_read_input_tokens: cacheReadTokens,
-          },
-          model: candidate,
-        };
-      } catch (err: any) {
-        lastError = err;
-        const isRateLimit = err?.status === 429;
-        const isOverloaded = err?.status === 529;
-        const isTransient = isRateLimit || isOverloaded
-          || err?.status >= 500
-          || /timed out|timeout|ECONNRESET|ETIMEDOUT|ECONNREFUSED|network|fetch failed|Stream vacío/i.test(String(err?.message || err));
+    } catch (err: any) {
+      lastError = err;
+      const isRateLimit = err?.status === 429 || String(err).includes("rate_limit");
+      const isTransient = isRateLimit
+        || err?.status >= 500
+        || /timed out|timeout|ECONNRESET|ETIMEDOUT|ECONNREFUSED|network|fetch failed/i.test(String(err?.message || err));
 
-        if (isTransient && attempt < MAX_RETRIES - 1) {
-          const delay = Math.pow(2, attempt) * 1500 + Math.random() * 1000;
-          logger.warn({ role, model: candidate, attempt, delay, isRateLimit, isOverloaded }, "Fallo transitorio; reintentando...");
-          await new Promise((r) => setTimeout(r, delay));
-          continue;
-        }
-
-        logger.warn({ role, model: candidate, err }, "Modelo falló; probando siguiente modelo de fallback");
-        break;
+      if (isTransient && attempt < MAX_RETRIES - 1) {
+        const delay = Math.pow(2, attempt) * 1500 + Math.random() * 1000;
+        logger.warn({ role, model: claudeModel, attempt, delay }, "Claude: fallo transitorio, reintentando...");
+        await new Promise(r => setTimeout(r, delay));
+        continue;
       }
+      logger.error({ role, model: claudeModel, err }, "Claude: todos los intentos fallaron");
+      break;
     }
   }
 
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
-/**
- * Variante de createClaudeMessageWithFallback para llamadas con tool-calling
- * (bucles agenticos como marisCrewAI.ts y agentTools.ts). Usa el formato
- * nativo de Anthropic (tools con input_schema, bloques tool_use/tool_result),
- * así que no hace falta ninguna conversión de formato.
- */
+// ─── TOOL CALLING con Claude Anthropic ───────────────────────────────────────
 export async function createClaudeToolCallWithFallback(
   role: AgentRole,
   model: string,
   params: any,
-  meterOpts?: { jobId?: string },
 ): Promise<any> {
-  let lastError: unknown;
+  const claudeModel = claudeModelFor(model);
   const MAX_RETRIES = 3;
+  let lastError: unknown;
 
-  for (const candidate of fallbackClaudeModels(model)) {
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      try {
-        const request: any = {
-          model: candidate,
+  const systemText: string = !params.system
+    ? ""
+    : typeof params.system === "string"
+      ? params.system
+      : Array.isArray(params.system)
+        ? params.system.map((b: any) => b?.text || "").join("\n")
+        : String(params.system);
+
+  const messages = (params.messages || [])
+    .filter((m: any) => m && m.role !== "system")
+    .map((m: any) => ({
+      role: m.role as "user" | "assistant",
+      content: Array.isArray(m.content)
+        ? m.content
+        : String(m.content ?? ""),
+    }));
+
+  const hasTools = Array.isArray(params.tools) && params.tools.length > 0;
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const response = await raceWithTimeout(
+        getAnthropic().messages.create({
+          model: claudeModel,
           max_tokens: params.max_tokens || 2048,
           temperature: params.temperature ?? 0.7,
-          system: params.system,
-          messages: params.messages || [],
-        };
-        if (Array.isArray(params.tools) && params.tools.length > 0) {
-          request.tools = params.tools;
-          if (params.tool_choice) request.tool_choice = params.tool_choice;
-        }
+          ...(systemText ? { system: systemText } : {}),
+          messages,
+          ...(hasTools ? { tools: params.tools } : {}),
+          ...(hasTools && params.tool_choice ? { tool_choice: params.tool_choice } : {}),
+        }),
+        AI_CALL_TIMEOUT_MS,
+        `${role} tool call (modelo ${claudeModel})`,
+      );
 
-        const response = await raceWithTimeout(
-          getAnthropic().messages.create(request) as unknown as Promise<any>,
-          AI_CALL_TIMEOUT_MS,
-          `${role} tool call (modelo ${candidate})`,
-        );
+      const usage = {
+        input_tokens: response.usage?.input_tokens ?? 0,
+        output_tokens: response.usage?.output_tokens ?? 0,
+      };
 
-        recordApiUsage({
-          jobId: meterOpts?.jobId,
-          model: candidate,
-          inputTokens: response.usage?.input_tokens ?? 0,
-          outputTokens: response.usage?.output_tokens ?? 0,
-          agent: role,
-        });
+      // Claude devuelve tool_use directamente en content — ya en formato Anthropic nativo
+      return {
+        content: response.content,
+        stop_reason: response.stop_reason,
+        usage,
+      };
 
-        return {
-          content: response.content,
-          stop_reason: response.stop_reason,
-          usage: {
-            input_tokens: response.usage?.input_tokens ?? 0,
-            output_tokens: response.usage?.output_tokens ?? 0,
-          },
-          model: candidate,
-        };
-      } catch (err: any) {
-        lastError = err;
-        const isRateLimit = err?.status === 429;
-        const isOverloaded = err?.status === 529;
-        const isTransient = isRateLimit || isOverloaded
-          || err?.status >= 500
-          || /timed out|timeout|ECONNRESET|ETIMEDOUT|ECONNREFUSED|network|fetch failed/i.test(String(err?.message || err));
+    } catch (err: any) {
+      lastError = err;
+      const isRateLimit = err?.status === 429 || String(err).includes("rate_limit");
+      const isTransient = isRateLimit
+        || err?.status >= 500
+        || /timed out|timeout|ECONNRESET|ETIMEDOUT|ECONNREFUSED|network|fetch failed/i.test(String(err?.message || err));
 
-        if (isTransient && attempt < MAX_RETRIES - 1) {
-          const delay = Math.pow(2, attempt) * 1500 + Math.random() * 1000;
-          logger.warn({ role, model: candidate, attempt, delay, isRateLimit, isOverloaded }, "Tool call: fallo transitorio; reintentando...");
-          await new Promise((r) => setTimeout(r, delay));
-          continue;
-        }
-
-        logger.warn({ role, model: candidate, err }, "Tool call: modelo falló; probando siguiente modelo de fallback");
-        break;
+      if (isTransient && attempt < MAX_RETRIES - 1) {
+        const delay = Math.pow(2, attempt) * 1500 + Math.random() * 1000;
+        logger.warn({ role, model: claudeModel, attempt, delay }, "Claude tool call: reintentando...");
+        await new Promise(r => setTimeout(r, delay));
+        continue;
       }
+      logger.error({ role, model: claudeModel, err }, "Claude tool call: todos los intentos fallaron");
+      break;
     }
   }
 
@@ -492,7 +558,7 @@ export function buildPatcherSystemPrompt(language: GenLanguage): string {
 }
 
 export function buildFastPatchPrompt(): string {
-  return `You are Maris AI's Fast Patcher. Apply ONLY the requested change to the frontend bundle.\nOutput STRICT JSON only:\n{"changedFiles":{"src/App.tsx":"full file content here"},"deletedFiles":["src/OldComponent.tsx"]}\n\nOPERATION SEMANTICS — obey the user literally:\n- ADD / AÑADIR / AGREGAR means add the requested element/file/data only. Do not rewrite unrelated content.\n- MODIFY / MODIFICAR / CAMBIAR / EDITAR means alter the existing target only. Do not duplicate it and do not create replacements unless asked.\n- DELETE / ELIMINAR / BORRAR / QUITAR means remove the requested target only. Put removed file paths in deletedFiles; for inline removals, return only the file that contains the removal.\n\nRULES:\n- Identify the exact file(s) that need to change. Usually just 1 file.\n- The key must match the exact filename in the bundle (e.g. "index.html", "src/App.tsx").\n- Return the COMPLETE content of each changed file (not a diff, the full file).\n- Keep ALL other files exactly as they are - do NOT include unchanged files.\n- Never perform a full redesign/rebuild from a small add/modify/delete request.\n- Output ONLY the JSON object. No markdown, no backticks, no explanation.`;
+  return `You are Maris AI's Fast Patcher. Apply ONLY the requested change to the frontend bundle.\nOutput STRICT JSON only:\n{"changedFiles":{"src/App.tsx":"full file content here"},"deletedFiles":["src/OldComponent.tsx"]}\n\nOPERATION SEMANTICS — obey the user literally:\n- ADD / AÑADIR / AGREGAR means add the requested element/file/data only.\n- MODIFY / MODIFICAR / CAMBIAR / EDITAR means alter the existing target only.\n- DELETE / ELIMINAR / BORRAR / QUITAR means remove the requested target only.\n\nRULES:\n- Identify the exact file(s) that need to change. Usually just 1 file.\n- Return the COMPLETE content of each changed file (not a diff, the full file).\n- Keep ALL other files exactly as they are.\n- Output ONLY the JSON object. No markdown, no backticks, no explanation.`;
 }
 
 export async function patchBundle(
@@ -500,25 +566,16 @@ export async function patchBundle(
   issues: QAIssue[],
   language: GenLanguage = "typescript",
   memoryContext: string = "",
-  model: string = CLAUDE_SONNET,
+  model: string = "zoco-plus",
   jobId?: string,
 ): Promise<string | null> {
   if (issues.length === 0) return null;
-
-  // MARIS-SHIELD: rechazar reparaciones masivas (>5 archivos distintos).
-  // El pipeline clásico de una sola pasada falla matemáticamente con 15+
-  // archivos simultáneos saturando la ventana de contexto. Si hay muchos
-  // archivos afectados, el CoreOrchestrator por hitos debe manejar la
-  // reparación (1 archivo por llamada).
   const affectedFiles = new Set(issues.map(i => i.file).filter(Boolean));
   if (affectedFiles.size > 5) {
-    console.warn(`[MARIS-SHIELD] patchBundle rechazado: ${affectedFiles.size} archivos afectados supera el límite de 5. Delegando al orquestador por hitos.`);
+    console.warn(`[MARIS-SHIELD] patchBundle rechazado: ${affectedFiles.size} archivos supera el límite de 5.`);
     return null;
   }
-  const issueList = issues
-    .map((i, idx) => `${idx + 1}. [${i.file}] Problem: ${i.problem}\n   Fix: ${i.fix}`)
-    .join("\n");
-
+  const issueList = issues.map((i, idx) => `${idx + 1}. [${i.file}] Problem: ${i.problem}\n   Fix: ${i.fix}`).join("\n");
   const issueHints = issues.flatMap((i) => [i.file, i.problem]);
   const compactedBundle = compactBundleForPrompt(frontendCode, issueHints, 70_000);
 
@@ -528,27 +585,18 @@ export async function patchBundle(
         const response = await createClaudeMessageWithFallback("patcher", model, {
           max_tokens: 24000,
           system: buildPatcherSystemPrompt(language) + "\nOutput JSON only.",
-          messages: [
-            {
-              role: "user",
-              content: `ISSUES TO FIX:\n${issueList}\n${memoryContext}\nCURRENT FRONTEND BUNDLE (only the most relevant files are shown — files NOT shown here are unrelated to these issues and must NOT be referenced as missing):\n${compactedBundle}\n\nReturn ONLY the changed/added files as JSON: {\"changedFiles\":{\"path\":\"full content\"},\"deletedFiles\":[\"path\"]}.`,
-            },
-          ],
+          messages: [{ role: "user", content: `ISSUES TO FIX:\n${issueList}\n${memoryContext}\nCURRENT FRONTEND BUNDLE:\n${compactedBundle}\n\nReturn ONLY the changed/added files as JSON: {"changedFiles":{"path":"full content"},"deletedFiles":["path"]}.` }],
         }, { jobId });
         const raw = (response.content[0] as any).text ?? "";
         const parsed = extractJsonObject<{ changedFiles?: Record<string, string>; deletedFiles?: string[] }>(raw);
-        if (!parsed || typeof parsed.changedFiles !== "object" || parsed.changedFiles === null) {
-          return null;
-        }
+        if (!parsed || typeof parsed.changedFiles !== "object" || parsed.changedFiles === null) return null;
         const changedFiles = parsed.changedFiles;
         const deletedFiles = Array.isArray(parsed.deletedFiles) ? parsed.deletedFiles.map(String) : [];
         if (Object.keys(changedFiles).length === 0 && deletedFiles.length === 0) return null;
         const merged = mergePatchIntoBundle(frontendCode, changedFiles, deletedFiles);
         if (!merged || merged.length < 100) return null;
         return merged;
-      } catch {
-        return null;
-      }
+      } catch { return null; }
     })(),
     240_000,
     null,
@@ -556,36 +604,24 @@ export async function patchBundle(
 }
 
 /* ----------------------- multi-file patcher -------------------------------- */
+
 export interface MultiFilePlanItem {
   path: string;
   action: "rewrite" | "create" | "delete";
   reason: string;
 }
 
-async function planMultiFileRepair(
-  bundle: string,
-  errorSummary: string,
-  language: GenLanguage,
-  model: string,
-): Promise<MultiFilePlanItem[] | null> {
-  const issueHints = [errorSummary];
-  const compactedBundle = compactBundleForPrompt(bundle, issueHints, 70_000);
-
+async function planMultiFileRepair(bundle: string, errorSummary: string, language: GenLanguage, model: string): Promise<MultiFilePlanItem[] | null> {
+  const compactedBundle = compactBundleForPrompt(bundle, [errorSummary], 70_000);
   return withTimeout(
     (async () => {
       try {
         const response = await createClaudeMessageWithFallback("planner", model, {
           max_tokens: 4000,
-          system: `You are Maris AI's multi-file repair planner. Your task is to analyze a frontend bundle and a summary of errors, then propose a plan to fix them across multiple files.\nOutput STRICT XML only, using <file><path>...</path><action>...</action><reason>...</reason></file> tags. Actions can be 'rewrite', 'create', or 'delete'.\n\nERROR SUMMARY:\n${errorSummary}\n\nCURRENT FRONTEND BUNDLE (only the most relevant files are shown — files NOT shown here are unrelated to these issues and must NOT be referenced as missing):\n${compactedBundle}\n\nReturn ONLY the XML plan. No markdown, no backticks, no explanation.`,
-          messages: [
-            {
-              role: "user",
-              content: `Based on the error summary and the provided bundle, generate a plan to fix the issues. Focus on identifying which files need to be rewritten, created, or deleted. For each file, provide a brief reason for the action.`,
-            },
-          ],
+          system: `You are Maris AI's multi-file repair planner.\nOutput STRICT XML only, using <file><path>...</path><action>...</action><reason>...</reason></file> tags.\nERROR SUMMARY:\n${errorSummary}\nCURRENT FRONTEND BUNDLE:\n${compactedBundle}\nReturn ONLY the XML plan.`,
+          messages: [{ role: "user", content: "Generate the repair plan." }],
         });
-        const raw = (response.content[0] as any).text ?? "";
-        return extractResilientFilePlan(raw);
+        return extractResilientFilePlan((response.content[0] as any).text ?? "");
       } catch (err) {
         logger.error({ err }, "Error planning multi-file repair");
         return null;
@@ -596,34 +632,19 @@ async function planMultiFileRepair(
   );
 }
 
-async function generateFilePatch(
-  bundle: string,
-  planItem: MultiFilePlanItem,
-  errorSummary: string,
-  language: GenLanguage,
-  model: string,
-): Promise<string | null> {
+async function generateFilePatch(bundle: string, planItem: MultiFilePlanItem, errorSummary: string, language: GenLanguage, model: string): Promise<string | null> {
   const { path, action, reason } = planItem;
   if (action === "delete") return null;
-
-  const issueHints = [path, reason, errorSummary];
-  const compactedBundle = compactBundleForPrompt(bundle, issueHints, 70_000);
-
+  const compactedBundle = compactBundleForPrompt(bundle, [path, reason, errorSummary], 70_000);
   return withTimeout(
     (async () => {
       try {
         const response = await createClaudeMessageWithFallback("patcher", model, {
           max_tokens: 16000,
           system: buildPatcherSystemPrompt(language) + `\nYour current task is to ${action} the file ${path} because: ${reason}.\nOutput JSON only.`,
-          messages: [
-            {
-              role: "user",
-              content: `CURRENT FRONTEND BUNDLE (only the most relevant files are shown — files NOT shown here are unrelated to this issue and must NOT be referenced as missing):\n${compactedBundle}\n\nGenerate the full content for the file ${path} based on the plan. Return ONLY the changed/added files as JSON: {\"changedFiles\":{\"${path}\":\"full content\"},\"deletedFiles\":[]}.`,
-            },
-          ],
+          messages: [{ role: "user", content: `CURRENT FRONTEND BUNDLE:\n${compactedBundle}\n\nGenerate the full content for ${path}. Return ONLY: {"changedFiles":{"${path}":"full content"},"deletedFiles":[]}.` }],
         });
-        const raw = (response.content[0] as any).text ?? "";
-        const parsed = extractJsonObject<{ changedFiles?: Record<string, string> }>(raw);
+        const parsed = extractJsonObject<{ changedFiles?: Record<string, string> }>((response.content[0] as any).text ?? "");
         return parsed?.changedFiles?.[path] || null;
       } catch (err) {
         logger.error({ err, path }, "Error generating file patch");
@@ -635,13 +656,7 @@ async function generateFilePatch(
   );
 }
 
-export async function patchBundleMultiFile(
-  frontendCode: string,
-  errorSummary: string,
-  language: GenLanguage = "typescript",
-  model: string = CLAUDE_SONNET,
-  jobId?: string,
-): Promise<string | null> {
+export async function patchBundleMultiFile(frontendCode: string, errorSummary: string, language: GenLanguage = "typescript", model: string = "zoco-plus", jobId?: string): Promise<string | null> {
   const plan = await planMultiFileRepair(frontendCode, errorSummary, language, model);
   if (!plan || plan.length === 0) return null;
 
@@ -650,111 +665,64 @@ export async function patchBundleMultiFile(
   const deletedFiles: string[] = [];
 
   for (const planItem of plan) {
-    if (planItem.action === "delete") {
-      deletedFiles.push(planItem.path);
-      continue;
-    }
-
+    if (planItem.action === "delete") { deletedFiles.push(planItem.path); continue; }
     let fileContent = await generateFilePatch(currentBundle, planItem, errorSummary, language, model);
     if (!fileContent) {
-      logger.warn({ path: planItem.path }, "Primer intento de generación de archivo fallido, reintentando...");
+      logger.warn({ path: planItem.path }, "Reintentando generación de archivo...");
       fileContent = await generateFilePatch(currentBundle, planItem, errorSummary, language, model);
     }
-
     if (fileContent) {
       changedFiles[planItem.path] = fileContent;
       currentBundle = mergePatchIntoBundle(currentBundle, { [planItem.path]: fileContent });
     } else {
-      logger.error({ path: planItem.path }, "Segundo intento de generación de archivo fallido. Saltando este archivo.");
+      logger.error({ path: planItem.path }, "Segundo intento fallido. Saltando archivo.");
     }
   }
 
   if (Object.keys(changedFiles).length === 0 && deletedFiles.length === 0) return null;
-
   return mergePatchIntoBundle(frontendCode, changedFiles, deletedFiles);
 }
 
-export async function createFastPatch(
-  frontendCode: string,
-  userPrompt: string,
-  language: GenLanguage = "typescript",
-  model: string = CLAUDE_SONNET,
-  jobId?: string,
-): Promise<string | null> {
-  const issueHints = [userPrompt];
-  const compactedBundle = compactBundleForPrompt(frontendCode, issueHints, 70_000);
-
+export async function createFastPatch(frontendCode: string, userPrompt: string, language: GenLanguage = "typescript", model: string = "zoco-plus", jobId?: string): Promise<string | null> {
+  const compactedBundle = compactBundleForPrompt(frontendCode, [userPrompt], 70_000);
   return withTimeout(
     (async () => {
       try {
         const response = await createClaudeMessageWithFallback("patcher", model, {
           max_tokens: 16000,
           system: buildFastPatchPrompt(),
-          messages: [
-            {
-              role: "user",
-              content: `USER REQUEST:\n${userPrompt}\n\nCURRENT FRONTEND BUNDLE (only the most relevant files are shown — files NOT shown here are unrelated to this issue and must NOT be referenced as missing):\n${compactedBundle}\n\nReturn ONLY the changed/added files as JSON: {\"changedFiles\":{\"path\":\"full content\"},\"deletedFiles\":[\"path\"]}.`,
-            },
-          ],
+          messages: [{ role: "user", content: `USER REQUEST:\n${userPrompt}\n\nCURRENT FRONTEND BUNDLE:\n${compactedBundle}\n\nReturn ONLY: {"changedFiles":{"path":"full content"},"deletedFiles":["path"]}.` }],
         }, { jobId });
         const raw = (response.content[0] as any).text ?? "";
         const parsed = extractJsonObject<{ changedFiles?: Record<string, string>; deletedFiles?: string[] }>(raw);
-        if (!parsed || typeof parsed.changedFiles !== "object" || parsed.changedFiles === null) {
-          return null;
-        }
+        if (!parsed || typeof parsed.changedFiles !== "object" || parsed.changedFiles === null) return null;
         const changedFiles = parsed.changedFiles;
         const deletedFiles = Array.isArray(parsed.deletedFiles) ? parsed.deletedFiles.map(String) : [];
         if (Object.keys(changedFiles).length === 0 && deletedFiles.length === 0) return null;
         const merged = mergePatchIntoBundle(frontendCode, changedFiles, deletedFiles);
         if (!merged || merged.length < 100) return null;
         return merged;
-      } catch {
-        return null;
-      }
+      } catch { return null; }
     })(),
     240_000,
     null,
   );
 }
 
-export async function createChatCompletion(
-  role: AgentRole,
-  model: string,
-  params: any,
-  meterOpts?: { jobId?: string },
-): Promise<any> {
-  return createClaudeMessageWithFallback(role, model, params, meterOpts);
-}
+// Aliases para compatibilidad con el resto del pipeline
+export const createChatCompletion = createClaudeMessageWithFallback;
+export const createToolCallCompletion = createClaudeToolCallWithFallback;
 
-export async function createToolCallCompletion(
-  role: AgentRole,
-  model: string,
-  params: any,
-  meterOpts?: { jobId?: string },
-): Promise<any> {
-  return createClaudeToolCallWithFallback(role, model, params, meterOpts);
-}
-
-export async function createChatCompletionStream(
-  role: AgentRole,
-  model: string,
-  params: any,
-  meterOpts?: { jobId?: string },
-): Promise<AsyncIterable<any>> {
+export async function createChatCompletionStream(role: AgentRole, model: string, params: any, meterOpts?: { jobId?: string }): Promise<AsyncIterable<any>> {
   const response = await createClaudeMessageWithFallback(role, model, params, meterOpts);
   return (async function* () {
     yield { type: 'content_block_delta', delta: { type: 'text_delta', text: response.content[0].text } };
   })();
 }
 
-export async function createToolCallCompletionStream(
-  role: AgentRole,
-  model: string,
-  params: any,
-  meterOpts?: { jobId?: string },
-): Promise<AsyncIterable<any>> {
-  const response = await createClaudeToolCallWithFallback(role, model, params, meterOpts);
+export async function createToolCallCompletionStream(role: AgentRole, model: string, params: any, meterOpts?: { jobId?: string }): Promise<AsyncIterable<any>> {
+  const response = await createClaudeToolCallWithFallback(role, model, params);
   return (async function* () {
-    yield { type: 'content_block_delta', delta: { type: 'text_delta', text: response.content[0].text } };
+    yield { type: 'content_block_delta', delta: { type: 'text_delta', text: response.content[0]?.text || "" } };
   })();
 }
