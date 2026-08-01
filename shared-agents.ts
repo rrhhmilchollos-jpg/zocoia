@@ -346,7 +346,9 @@ export async function createClaudeMessageWithFallback(
         getAnthropic().messages.create({
           model: claudeModel,
           max_tokens: params.max_tokens || 4096,
-          temperature: params.temperature ?? 0.7,
+          // NO se envía "temperature": Anthropic la deprecó en los modelos
+          // de nueva generación (Sonnet 4.6+/Opus 4.7+) — 400 garantizado
+          // si el campo está presente, con cualquier valor.
           ...(systemText ? { system: systemText } : {}),
           messages,
         }),
@@ -425,7 +427,7 @@ export async function createClaudeToolCallWithFallback(
         getAnthropic().messages.create({
           model: claudeModel,
           max_tokens: params.max_tokens || 2048,
-          temperature: params.temperature ?? 0.7,
+          // NO se envía "temperature" — ver nota en createClaudeMessageWithFallback.
           ...(systemText ? { system: systemText } : {}),
           messages,
           ...(hasTools ? { tools: params.tools } : {}),
