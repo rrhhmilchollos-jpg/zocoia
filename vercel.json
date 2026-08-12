@@ -1,6 +1,10 @@
 {
   "rewrites": [
     { "source": "/api/:path*", "destination": "https://api.zocoia.es/api/:path*" },
+    { "source": "/auth/:path*", "destination": "https://api.zocoia.es/auth/:path*" },
+    { "source": "/v1/:path*", "destination": "https://api.zocoia.es/v1/:path*" },
+    { "source": "/health", "destination": "https://api.zocoia.es/health" },
+    { "source": "/salud", "destination": "https://api.zocoia.es/salud" },
     { "source": "/(.*)", "destination": "/index.html" }
   ]
 }

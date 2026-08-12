@@ -1,7 +1,8 @@
 import React, { createContext, useContext, useEffect, useState, ReactNode } from 'react';
 
 // En producción, VITE_API_URL debe ser la URL de tu servicio en Railway
-export const API_BASE = import.meta.env.VITE_API_URL || window.location.origin;
+// En producción, usamos rutas relativas para que el proxy de Vercel (vercel.json) las gestione
+export const API_BASE = import.meta.env.VITE_API_URL || '';
 
 export interface AuthUser {
   id: string;
