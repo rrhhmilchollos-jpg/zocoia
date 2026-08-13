@@ -23,9 +23,8 @@ export function useApi() {
     options: RequestInit = {},
     retries = MAX_RETRIES,
   ): Promise<T> => {
-    const base = (window as any).__API_BASE__ || '';
     try {
-      const res = await fetch(`${base}${url}`, {
+      const res = await fetch(`${url}`, {
         ...options,
         headers: { ...authHeaders(), ...(options.headers || {}) },
       });
