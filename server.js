@@ -909,7 +909,11 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
 app.get(['/health', '/salud'], (req, res) => res.json({ status: 'ok', message: 'Zoco IA conectado con éxito' }));
 
 if (registerEventStreamRoute) {
-  try { registerEventStreamRoute(app, authMiddleware); } catch (e) { console.warn('[eventos-agente] No se pudo registrar:', e.message); }
+  try {
+    registerEventStreamRoute({ app, jwt, JWT_SECRET, db });
+  } catch (e) {
+    console.warn('[eventos-agente] No se pudo registrar:', e.message);
+  }
 }
 
 if (registerNewApiEndpoints) {
