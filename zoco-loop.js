@@ -27,6 +27,62 @@ const MAX_REPEATED_TOOL_CALLS = Math.min(
   Math.max(2, parseInt(process.env.COMPUTER_MAX_REPEATED_TOOL_CALLS || '3', 10))
 );
 
+// Algunos modelos locales pequeños pueden devolver una llamada de herramienta
+// como texto (`{"name": gestionar_plan}`) aunque reciban el esquema OpenAI.
+// Recuperamos únicamente nombres conocidos y nunca ejecutamos texto arbitrario.
+function recoverTextToolCall(text, tools, uuidv4) {
+  const cleaned = String(text || '')
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+  if (!cleaned || cleaned.length > 8000) return null;
+
+  const aliases = {
+    gestionarPlan: 'gestionar_plan',
+    gestionar_plan_de_tareas: 'gestionar_plan',
+    createFile: 'escribir_archivo',
+    crear_archivo: 'escribir_archivo',
+    escribirArchivo: 'escribir_archivo',
+    createFolder: 'crear_carpeta',
+    crear_carpeta: 'crear_carpeta',
+    readFile: 'leer_archivo',
+    leer_archivo: 'leer_archivo',
+    listFiles: 'listar_archivos',
+    listar_archivos: 'listar_archivos',
+    deleteFile: 'eliminar_archivo',
+    eliminar_archivo: 'eliminar_archivo',
+    executeCode: 'ejecutar_codigo',
+    abrirTerminalLinux: 'terminal',
+    abrir_terminal_linux: 'terminal',
+    busquedaWeb: 'busqueda_web',
+    leerPagina: 'leer_pagina',
+    browser: 'navegador',
+  };
+  const known = new Set((tools || []).map((tool) => tool?.function?.name).filter(Boolean));
+  let parsed = null;
+  try { parsed = JSON.parse(cleaned); } catch {}
+
+  let rawName = parsed?.name || parsed?.tool || parsed?.function?.name;
+  if (!rawName) {
+    const nameMatch = cleaned.match(/["']?name["']?\s*:\s*["']?([A-Za-z0-9_-]+)["']?/i);
+    rawName = nameMatch?.[1];
+  }
+  const candidates = [rawName, aliases[rawName]].filter(Boolean);
+  const name = candidates.find((candidate) => known.has(candidate));
+  if (!name) return null;
+
+  let args = parsed?.arguments ?? parsed?.args ?? parsed?.parameters ?? parsed?.input ?? {};
+  if (typeof args === 'string') {
+    try { args = JSON.parse(args); } catch { args = {}; }
+  }
+  if (!args || typeof args !== 'object' || Array.isArray(args)) args = {};
+  return {
+    id: `text-tool-${uuidv4()}`,
+    type: 'function',
+    function: { name, arguments: JSON.stringify(args) },
+  };
+}
+
 function stableToolSignature(name, args) {
   const normalise = (value) => {
     if (Array.isArray(value)) return value.map(normalise);
@@ -168,8 +224,12 @@ export async function runAgentLoop({
     }
 
     const msg = data.choices?.[0]?.message || {};
-    const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+    let toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
     const texto = String(msg.content || '').trim();
+    if (toolCalls.length === 0) {
+      const recovered = recoverTextToolCall(texto, tools, uuidv4);
+      if (recovered) toolCalls = [recovered];
+    }
 
     // ── 4. Emitir el razonamiento real del modelo ──
     // El texto que acompaña a una tool call es el "pensamiento" que el usuario ve.

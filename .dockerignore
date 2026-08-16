@@ -8,4 +8,16 @@ npm-debug.log
 *.md
 data/
 dist/
+# Modelos locales y copias de recuperación: no pertenecen a la imagen de la API
+ollama/
+backups/
+*.bak
+*.db
+*.sqlite
+*.sqlite3
+.maris-ollama-key
+# Temporales de ejecución del ordenador
+tmp/
+.tmp/
+workspaces/
 .DS_Store
