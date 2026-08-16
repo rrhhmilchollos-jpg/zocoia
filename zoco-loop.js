@@ -22,6 +22,24 @@ const MAX_ITERATIONS = parseInt(process.env.COMPUTER_MAX_ITERATIONS || '60', 10)
 const MAX_CONTEXT_MESSAGES = parseInt(process.env.COMPUTER_MAX_CONTEXT_MESSAGES || '80', 10);
 // Recordatorios consecutivos sin tool call antes de rendirse.
 const MAX_NUDGES = 3;
+const MAX_REPEATED_TOOL_CALLS = Math.min(
+  5,
+  Math.max(2, parseInt(process.env.COMPUTER_MAX_REPEATED_TOOL_CALLS || '3', 10))
+);
+
+function stableToolSignature(name, args) {
+  const normalise = (value) => {
+    if (Array.isArray(value)) return value.map(normalise);
+    if (value && typeof value === 'object') {
+      return Object.keys(value).sort().reduce((out, key) => {
+        out[key] = normalise(value[key]);
+        return out;
+      }, {});
+    }
+    return value;
+  };
+  return `${String(name || '')}:${JSON.stringify(normalise(args || {}))}`;
+}
 
 // ─── Construcción del historial ──────────────────────────────────────────────
 
@@ -109,6 +127,8 @@ export async function runAgentLoop({
 
   let finished = false;
   let nudges = 0;
+  let lastToolSignature = '';
+  let repeatedToolCalls = 0;
 
   for (let i = 0; i < MAX_ITERATIONS && !finished; i++) {
     // ── 1. Comprobar si el usuario ha detenido o pausado la tarea ──
@@ -219,10 +239,27 @@ export async function runAgentLoop({
         argsError = `Los argumentos JSON de la llamada no son válidos (${err.message}). Vuelve a llamar a la herramienta con JSON correcto.`;
       }
 
+      const toolSignature = stableToolSignature(name, args);
+      repeatedToolCalls = toolSignature === lastToolSignature ? repeatedToolCalls + 1 : 1;
+      lastToolSignature = toolSignature;
+
       recordEvent(db, task.id, 'tool_call', {
         herramienta: name,
         argumentos: JSON.stringify(args).slice(0, 1500),
       });
+
+      if (repeatedToolCalls >= MAX_REPEATED_TOOL_CALLS) {
+        const aviso =
+          `He detenido la tarea porque se intentó repetir ${repeatedToolCalls} veces la misma herramienta ` +
+          `sin un cambio verificable. Revisa el último resultado, cambia de estrategia o envía una instrucción nueva.`;
+        recordEvent(db, task.id, 'tool_error', { herramienta: name, mensaje: aviso });
+        db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)')
+          .run(uuidv4(), task.id, 'assistant', aviso);
+        db.prepare("UPDATE computer_tasks SET status = 'pausada', result = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+          .run(aviso, task.id);
+        recordEvent(db, task.id, 'paused', { mensaje: aviso });
+        return;
+      }
 
       let result;
       if (argsError) {

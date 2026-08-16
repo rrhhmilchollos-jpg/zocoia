@@ -111,5 +111,29 @@ const recuperadas = recoverOrphanTasks(db, recordEvent);
 const tras = db.prepare('SELECT status FROM computer_tasks WHERE id = ?').get(TASK_ID);
 check(recuperadas === 1 && tras.status === 'pausada', 'Las tareas huérfanas tras reinicio pasan a "pausada"');
 
+// ─── Regresión: la misma herramienta no puede consumir todas las iteraciones ───
+const REPEAT_TASK_ID = 'task-repeat-guard';
+db.prepare('INSERT INTO computer_tasks (id, user_id, title, status, model) VALUES (?,?,?,?,?)')
+  .run(REPEAT_TASK_ID, 'u1', 'Prueba de cortacircuitos', 'en_curso', 'zoco-plus');
+db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?,?,?,?)')
+  .run(uuidv4(), REPEAT_TASK_ID, 'user', 'No repitas acciones sin progreso');
+const repeatTask = db.prepare('SELECT * FROM computer_tasks WHERE id = ?').get(REPEAT_TASK_ID);
+let repeatExecutions = 0;
+await runAgentLoop({
+  db, uuidv4, task: repeatTask, workspaceDir, tools: [], context: {},
+  buildSystemPrompt: () => 'SYSTEM PROMPT DE PRUEBA',
+  recordEvent,
+  executeTool: async () => { repeatExecutions++; return 'Plan sin cambios.'; },
+  callModel: async () => ({ choices: [{ message: {
+    content: 'Repito la misma acción.',
+    tool_calls: [{ id: `repeat-${repeatExecutions}`, function: {
+      name: 'gestionar_plan',
+      arguments: JSON.stringify({ fases: [{ titulo: 'Sin cambios', estado: 'en_curso' }] }),
+    } }],
+  } }] }),
+});
+const repeatState = db.prepare('SELECT status FROM computer_tasks WHERE id = ?').get(REPEAT_TASK_ID);
+check(repeatState.status === 'pausada' && repeatExecutions === 2, 'El cortacircuitos pausa tras repetir la misma herramienta sin progreso');
+
 console.log(`\n${fallos === 0 ? '🎉 TODOS LOS TESTS PASAN' : `⚠️  ${fallos} test(s) fallidos`}`);
 process.exit(fallos === 0 ? 0 : 1);

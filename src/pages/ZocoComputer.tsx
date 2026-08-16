@@ -36,7 +36,9 @@ const EVENT_META: Record<string, { icon: string; label: string; panel: string }>
   task_started: { icon: 'fa-rocket', label: 'Tarea iniciada', panel: 'log' },
   thinking: { icon: 'fa-brain', label: 'Pensando…', panel: 'log' },
   plan: { icon: 'fa-list-check', label: 'Plan actualizado', panel: 'log' },
+  plan_updated: { icon: 'fa-list-check', label: 'Plan actualizado', panel: 'log' },
   tool_call: { icon: 'fa-wrench', label: 'Herramienta', panel: 'log' },
+  tool_result: { icon: 'fa-terminal', label: 'Resultado de herramienta', panel: 'terminal' },
   terminal_start: { icon: 'fa-terminal', label: 'Terminal', panel: 'terminal' },
   terminal_output: { icon: 'fa-terminal', label: 'Terminal', panel: 'terminal' },
   file_write: { icon: 'fa-file-pen', label: 'Editor', panel: 'editor' },
@@ -45,6 +47,7 @@ const EVENT_META: Record<string, { icon: string; label: string; panel: string }>
   file_list: { icon: 'fa-folder-open', label: 'Archivos', panel: 'editor' },
   web_search: { icon: 'fa-magnifying-glass', label: 'Búsqueda web', panel: 'browser' },
   web_search_result: { icon: 'fa-magnifying-glass', label: 'Resultados', panel: 'browser' },
+  web_read: { icon: 'fa-book-open', label: 'Página leída', panel: 'browser' },
   browse: { icon: 'fa-globe', label: 'Navegador', panel: 'browser' },
   browse_result: { icon: 'fa-globe', label: 'Página leída', panel: 'browser' },
   browser_action: { icon: 'fa-arrow-pointer', label: 'Navegador', panel: 'browser' },
@@ -411,20 +414,28 @@ export default function ZocoComputer() {
                       <span className={ev.exitCode === 0 ? 'text-gray-300' : 'text-red-400'}>{ev.salida}</span>
                     </>
                   )}
+                  {ev.type === 'tool_result' && (
+                    <>
+                      <span className="text-green-400">$ {ev.comando || ev.herramienta || 'herramienta'}</span>
+                      {'\n'}
+                      <span className={ev.codigo === 0 ? 'text-gray-300' : 'text-red-400'}>{ev.salida || '(sin salida)'}</span>
+                    </>
+                  )}
                   {ev.type === 'file_write' && (
                     <>
                       <span className="text-blue-400">✏ {ev.ruta}</span>
                       {'\n'}
-                      <span className="text-gray-400">{ev.contenido}</span>
+                      <span className="text-gray-400">{ev.vista || ev.contenido || '(contenido guardado)'}</span>
                     </>
                   )}
                   {ev.type === 'file_read' && <span className="text-blue-300">📄 Leyendo {ev.ruta}</span>}
                   {ev.type === 'file_list' && <span className="text-blue-300">📁 Listando workspace ({ev.total} elementos)</span>}
                   {ev.type === 'web_search' && <span className="text-purple-300">🔍 {ev.consulta}</span>}
                   {ev.type === 'web_search_result' && <span className="text-gray-400">{ev.resultado}</span>}
+                  {ev.type === 'web_read' && <span className="text-gray-400">{ev.vista || ev.resultado || '(página leída)'}</span>}
                   {ev.type === 'browse' && <span className="text-cyan-300">🌐 {ev.url}</span>}
                   {ev.type === 'browse_result' && <span className="text-gray-400">{ev.error ? `✕ ${ev.error}` : ev.extracto}</span>}
-                  {ev.type === 'plan' && Array.isArray(ev.fases) && (
+                  {(ev.type === 'plan' || ev.type === 'plan_updated') && Array.isArray(ev.fases) && (
                     <span className="text-amber-300">
                       {ev.fases.map((f: Fase, j: number) => `${f.estado === 'completada' ? '✓' : f.estado === 'en_curso' ? '▶' : '○'} ${f.titulo}`).join('\n')}
                     </span>
@@ -443,18 +454,18 @@ export default function ZocoComputer() {
                     <>
                       <span className="text-blue-400">✒ {ev.ruta} · {ev.ediciones} edición(es)</span>
                       {'\n'}
-                      <span className="text-gray-400">{ev.contenido}</span>
+                      <span className="text-gray-400">{ev.vista || ev.contenido || '(contenido guardado)'}</span>
                     </>
                   )}
                   {ev.type === 'browser_action' && (
-                    <span className="text-cyan-300">→ {ev.accion}{ev.url ? `: ${ev.url}` : ''}</span>
+                    <span className="text-cyan-300">→ {ev.accion}{ev.url ? `: ${ev.url}` : ''}{ev.texto ? `\n${ev.texto}` : ''}</span>
                   )}
                   {ev.type === 'browser_screenshot' && (
                     <div className="space-y-2">
                       <span className="text-cyan-300 block">{ev.descripcion}</span>
-                      {ev.captura && (
+                      {(ev.captura || ev.imagen) && (
                         <img
-                          src={ev.captura}
+                          src={ev.captura || ev.imagen}
                           alt="Captura del navegador del agente"
                           className="w-full rounded-md border border-gray-700"
                           loading="lazy"
