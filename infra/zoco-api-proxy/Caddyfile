@@ -1,0 +1,32 @@
+{
+    email soporte@zocoia.es
+}
+
+api.zocoia.es {
+    encode zstd gzip
+
+    log {
+        output stdout
+        format console
+    }
+
+    @preflight method OPTIONS
+    handle @preflight {
+        header Access-Control-Allow-Origin "https://www.zocoia.es"
+        header Access-Control-Allow-Methods "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        header Access-Control-Allow-Headers "Authorization,Content-Type,X-Request-ID"
+        header Access-Control-Max-Age "600"
+        respond "" 204
+    }
+
+    reverse_proxy zocoia-zocoia-api-1:3001 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+        transport http {
+            versions h1
+            read_buffer 0
+        }
+    }
+}

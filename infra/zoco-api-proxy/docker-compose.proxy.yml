@@ -1,0 +1,37 @@
+services:
+  zocoia-api-proxy:
+    image: caddy:2.8-alpine
+    container_name: zocoia-api-proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - zocoia_caddy_data:/data
+      - zocoia_caddy_config:/config
+    networks:
+      - zocoia_edge
+      - zocoia_internal
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+
+volumes:
+  zocoia_caddy_data:
+  zocoia_caddy_config:
+
+networks:
+  zocoia_edge:
+    name: zocoia_edge
+    driver: bridge
+  zocoia_internal:
+    name: zocoia_internal
+    driver: bridge
+    internal: true
