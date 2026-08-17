@@ -18,6 +18,7 @@ ensureComputerTables(db);
 const workspaceDir = '/tmp/zoco-test-ws';
 fs.rmSync(workspaceDir, { recursive: true, force: true });
 fs.mkdirSync(workspaceDir, { recursive: true });
+fs.writeFileSync(`${workspaceDir}/todo.md`, '# Contexto persistente\n\n- [>] Investigar\n- [ ] Redactar\n');
 
 const TASK_ID = 'task-test-1';
 db.prepare('INSERT INTO computer_tasks (id, user_id, title, status, model) VALUES (?,?,?,?,?)')
@@ -76,7 +77,8 @@ const callModel = async (messages) => {
 
 await runAgentLoop({
   db, uuidv4, task, workspaceDir, callModel, recordEvent, executeTool,
-  tools: [], context: {},
+  tools: [],
+  context: { reciteTaskContext: () => fs.readFileSync(`${workspaceDir}/todo.md`, 'utf8') },
   buildSystemPrompt: () => 'SYSTEM PROMPT DE PRUEBA',
 });
 
@@ -104,6 +106,8 @@ check(Boolean(tieneToolResult), 'Los resultados de herramientas se devuelven al 
 const razonamientos = eventos.filter(e => e.type === 'thinking' && e.texto);
 check(razonamientos.length >= 3, `Se emitió el razonamiento real del modelo (${razonamientos.length} eventos con texto)`);
 check(eventos.some(e => e.type === 'finished'), 'Se emitió el evento finished');
+const contextoRecitado = historialVisto.every(historial => historial[0]?.content?.includes('CONTEXTO RECITABLE DE LA TAREA') && historial[0]?.content?.includes('Investigar'));
+check(contextoRecitado, 'El plan persistente todo.md se recita en cada iteración');
 
 // ─── Test de recuperación de huérfanas ───
 db.prepare("UPDATE computer_tasks SET status = 'en_curso' WHERE id = ?").run(TASK_ID);

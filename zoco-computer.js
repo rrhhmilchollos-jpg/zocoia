@@ -179,6 +179,47 @@ function workspaceFor(taskId) {
   return dir;
 }
 
+function todoPath(workspaceDir) {
+  return path.join(workspaceDir, 'todo.md');
+}
+
+function normalizarPlanPersistente(plan) {
+  if (Array.isArray(plan)) return plan;
+  try {
+    const parsed = JSON.parse(plan || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function sincronizarContextoTarea(db, task, workspaceDir, planForzado = null) {
+  const row = db.prepare('SELECT plan, status, updated_at FROM computer_tasks WHERE id = ?').get(task.id) || {};
+  const fases = planForzado || normalizarPlanPersistente(row.plan);
+  const now = new Date().toISOString();
+  const lineas = [
+    '# Contexto persistente de tarea Zoco',
+    '',
+    `- Tarea: ${task.title}`,
+    `- Estado: ${row.status || task.status || 'en_curso'}`,
+    `- Actualizado: ${now}`,
+    '',
+    '## Plan global',
+  ];
+  if (fases.length) {
+    for (const fase of fases) {
+      const marca = fase.estado === 'completada' ? 'x' : fase.estado === 'en_curso' ? '>' : ' ';
+      lineas.push(`- [${marca}] ${fase.titulo}`);
+    }
+  } else {
+    lineas.push('- [>] Analizar el objetivo y crear un plan con la herramienta gestionar_plan.');
+  }
+  lineas.push('', '## Reglas de continuidad', '- Antes de repetir una herramienta, revisa el último resultado.', '- Mantén los entregables dentro del workspace.', '- Actualiza el plan al completar una fase.');
+  const contenido = `${lineas.join('\n')}\n`;
+  await fsp.writeFile(todoPath(workspaceDir), contenido, 'utf8');
+  return { ruta: 'todo.md', contenido, fases };
+}
+
 // Impide que el agente escriba fuera de su workspace (defensa en profundidad:
 // el prompt ya lo indica, pero una ruta con `../` no debe escapar).
 function resolveInside(workspaceDir, rutaRelativa) {
@@ -596,7 +637,8 @@ async function executeTool(db, task, workspaceDir, name, args, context) {
       }));
       db.prepare('UPDATE computer_tasks SET plan = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
         .run(JSON.stringify(normalizadas), task.id);
-      recordEvent(db, task.id, 'plan_updated', { fases: normalizadas });
+      const contextoPersistente = await sincronizarContextoTarea(db, task, workspaceDir, normalizadas);
+      recordEvent(db, task.id, 'plan_updated', { fases: normalizadas, contexto: contextoPersistente.ruta });
       const actual = normalizadas.find(f => f.estado === 'en_curso');
       return `Plan actualizado con ${normalizadas.length} fases.` +
              (actual ? ` Fase en curso: "${actual.titulo}".` : '');
@@ -778,7 +820,9 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
 
   const workspaceDir = workspaceFor(task.id);
 
-  recordEvent(db, task.id, 'task_started', { titulo: task.title, modelo: task.model });
+  const iniciar = async () => {
+    const contextoPersistente = await sincronizarContextoTarea(db, task, workspaceDir);
+    recordEvent(db, task.id, 'task_started', { titulo: task.title, modelo: task.model, contexto: contextoPersistente.ruta });
 
   // `makeCallModel` construye el invocador ya ligado al usuario: comprueba
   // créditos y cuenta activa, descuenta el consumo y devuelve la forma
@@ -800,7 +844,13 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
       tieneNavegador: Boolean(E2B_API_KEY),
     }),
     tools: TOOLS,
-    context: { uuidv4, publicBase: PUBLIC_BASE },
+    context: {
+      uuidv4,
+      publicBase: PUBLIC_BASE,
+      reciteTaskContext: () => {
+        try { return fs.readFileSync(todoPath(workspaceDir), 'utf8'); } catch { return ''; }
+      },
+    },
   })
     .catch((err) => {
       console.error(`[ZocoComputer] fallo no capturado en la tarea ${task.id}:`, err);
@@ -813,6 +863,14 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
     .finally(() => {
       enEjecucion.delete(task.id);
     });
+  };
+
+  iniciar().catch((err) => {
+    console.error(`[ZocoComputer] no se pudo iniciar la tarea ${task.id}:`, err);
+    recordEvent(db, task.id, 'error', { mensaje: `No se pudo preparar el contexto de tarea: ${err.message}` });
+    db.prepare("UPDATE computer_tasks SET status = 'error', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(task.id);
+    enEjecucion.delete(task.id);
+  });
 }
 
 // ─── Rutas Express ───────────────────────────────────────────────────────────

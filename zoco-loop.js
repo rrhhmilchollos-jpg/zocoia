@@ -149,9 +149,26 @@ export async function runAgentLoop({
   // ── Estado del historial ──
   // Se persiste el índice del último mensaje de usuario ya incorporado, para
   // poder inyectar en caliente los mensajes que llegan durante la ejecución.
+  const systemPromptBase = buildSystemPrompt();
   const messages = [
-    { role: 'system', content: buildSystemPrompt() },
+    { role: 'system', content: systemPromptBase },
   ];
+
+  const recitarContexto = () => {
+    let contextoPersistente = '';
+    try {
+      contextoPersistente = typeof context?.reciteTaskContext === 'function'
+        ? String(context.reciteTaskContext() || '')
+        : '';
+    } catch { /* La tarea sigue funcionando aunque el archivo no esté disponible. */ }
+    messages[0] = {
+      role: 'system',
+      content: contextoPersistente
+        ? `${systemPromptBase}\n\n--- CONTEXTO RECITABLE DE LA TAREA (todo.md) ---\n${contextoPersistente}\n--- FIN DEL CONTEXTO RECITABLE ---`
+        : systemPromptBase,
+    };
+  };
+  recitarContexto();
 
   const prevMsgs = db
     .prepare('SELECT id, role, content FROM computer_messages WHERE task_id = ? ORDER BY created_at ASC, rowid ASC')
@@ -201,10 +218,11 @@ export async function runAgentLoop({
       return;
     }
 
-    // ── 2. Absorber mensajes enviados en caliente ──
+    // ── 2. Absorber mensajes enviados en caliente y recitar el plan persistente ──
     absorberMensajesNuevos();
+    recitarContexto();
 
-    recordEvent(db, task.id, 'thinking', { iteracion: i + 1 });
+    recordEvent(db, task.id, 'thinking', { iteracion: i + 1, contexto: 'todo.md' });
 
     // ── 3. Llamar al modelo ──
     let data;
