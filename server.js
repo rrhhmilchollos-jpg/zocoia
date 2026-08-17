@@ -1493,5 +1493,5 @@ if (fs.existsSync(publicDir)) {
 }
 
 app.listen(port, () => {
-  console.log(`🚀 Zoco IA Console corriendo en puerto ${port} — Motor: Claude Anthropic`);
+  console.log(`🚀 Zoco IA Console corriendo en puerto ${port} — Motor: ${getAIProviderConfig().label}`);
 });
