@@ -71,7 +71,15 @@ async function getDesktop(taskId, apiKey) {
 
 // Ejecuta una acción del navegador visual. Devuelve texto para el modelo y,
 // opcionalmente, una captura en base64 y la URL del stream en vivo.
-export async function browserAction({ taskId, apiKey, accion, url, x, y, texto, tecla, direccion, cantidad }) {
+export async function browserAction({ taskId, apiKey, accion, url, x, y, texto, tecla, direccion, cantidad, onEvent = null }) {
+  const emitir = (type, payload = {}) => {
+    if (typeof onEvent === 'function') onEvent(type, payload);
+  };
+  emitir('browser_action_start', {
+    accion,
+    url: url || null,
+    coordenadas: Number.isFinite(x) && Number.isFinite(y) ? { x: Math.round(x), y: Math.round(y) } : null,
+  });
   const desktop = await getDesktop(taskId, apiKey);
   if (!desktop) {
     return {

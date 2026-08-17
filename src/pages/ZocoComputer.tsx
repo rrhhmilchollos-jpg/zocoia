@@ -33,6 +33,8 @@ const EVENT_META: Record<string, { icon: string; label: string; panel: RuntimeTa
   web_read: { icon: 'fa-book-open', label: 'Página revisada', panel: 'web', tone: 'text-fuchsia-300' },
   browse: { icon: 'fa-globe', label: 'Navegador', panel: 'web', tone: 'text-fuchsia-300' },
   browse_result: { icon: 'fa-globe', label: 'Página revisada', panel: 'web', tone: 'text-fuchsia-300' },
+  browser_action_start: { icon: 'fa-hourglass-start', label: 'Acción web iniciada', panel: 'web', tone: 'text-fuchsia-300' },
+  browser_action_done: { icon: 'fa-circle-check', label: 'Acción web completada', panel: 'web', tone: 'text-fuchsia-300' },
   browser_action: { icon: 'fa-arrow-pointer', label: 'Acción web', panel: 'web', tone: 'text-fuchsia-300' },
   browser_screenshot: { icon: 'fa-camera', label: 'Captura web', panel: 'web', tone: 'text-fuchsia-300' },
   port_exposed: { icon: 'fa-link', label: 'Servicio publicado', panel: 'activity', tone: 'text-emerald-300' },
@@ -68,7 +70,9 @@ function eventSummary(event: Evento): string {
   if (event.type === 'finished') return event.resumen || 'Resultado listo.';
   if (event.type === 'file_write' || event.type === 'file_edit' || event.type === 'file_read') return event.ruta || 'Archivo procesado.';
   if (event.type === 'web_search') return event.consulta || 'Búsqueda ejecutada.';
-  if (event.type === 'browse' || event.type === 'browser_action') return event.url || event.accion || 'Acción de navegador ejecutada.';
+  if (event.type === 'browse' || event.type === 'browser_action' || event.type === 'browser_action_start' || event.type === 'browser_action_done') {
+    return event.texto || event.url || event.accion || 'Acción de navegador ejecutada.';
+  }
   return event.texto || event.resultado || event.mensaje || 'Evento registrado.';
 }
 

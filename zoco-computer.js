@@ -707,8 +707,9 @@ async function executeTool(db, task, workspaceDir, name, args, context) {
           x: args.x, y: args.y,
           texto: args.texto, tecla: args.tecla,
           direccion: args.direccion, cantidad: args.cantidad,
+          onEvent: (type, payload) => recordEvent(db, task.id, type, payload),
         });
-        recordEvent(db, task.id, 'browser_action', {
+        recordEvent(db, task.id, 'browser_action_done', {
           accion: args.accion, url: args.url || null, texto: r.texto, streamUrl: r.streamUrl || null,
         });
         if (r.captura) {
