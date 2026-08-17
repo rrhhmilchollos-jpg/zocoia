@@ -111,7 +111,7 @@ const recuperadas = recoverOrphanTasks(db, recordEvent);
 const tras = db.prepare('SELECT status FROM computer_tasks WHERE id = ?').get(TASK_ID);
 check(recuperadas === 1 && tras.status === 'pausada', 'Las tareas huérfanas tras reinicio pasan a "pausada"');
 
-// ─── Regresión: la misma herramienta no puede consumir todas las iteraciones ───
+// ─── Regresión: la misma herramienta activa recuperación antes de pausarse ───
 const REPEAT_TASK_ID = 'task-repeat-guard';
 db.prepare('INSERT INTO computer_tasks (id, user_id, title, status, model) VALUES (?,?,?,?,?)')
   .run(REPEAT_TASK_ID, 'u1', 'Prueba de cortacircuitos', 'en_curso', 'zoco-plus');
@@ -133,7 +133,9 @@ await runAgentLoop({
   } }] }),
 });
 const repeatState = db.prepare('SELECT status FROM computer_tasks WHERE id = ?').get(REPEAT_TASK_ID);
-check(repeatState.status === 'pausada' && repeatExecutions === 2, 'El cortacircuitos pausa tras repetir la misma herramienta sin progreso');
+check(repeatState.status === 'pausada' && repeatExecutions === 3, 'El cortacircuitos permite una recuperación guiada antes de pausar repeticiones sin progreso');
+check(eventos.some(e => e.type === 'strategy_recovery'), 'La repetición activa una recuperación guiada para cambiar de estrategia');
+check(eventos.filter(e => e.type === 'tool_rejected').length === 3, 'Las llamadas idénticas posteriores se rechazan sin volver a ejecutar la herramienta');
 
 console.log(`\n${fallos === 0 ? '🎉 TODOS LOS TESTS PASAN' : `⚠️  ${fallos} test(s) fallidos`}`);
 process.exit(fallos === 0 ? 0 : 1);

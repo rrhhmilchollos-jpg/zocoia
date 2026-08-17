@@ -26,6 +26,11 @@ const MAX_REPEATED_TOOL_CALLS = Math.min(
   5,
   Math.max(2, parseInt(process.env.COMPUTER_MAX_REPEATED_TOOL_CALLS || '3', 10))
 );
+// Una repetición no debe detener una tarea útil de inmediato: primero se obliga
+// al modelo a replantear la estrategia y se rechazan los duplicados posteriores
+// sin volver a ejecutar la herramienta. Solo se pausa si ignora repetidamente
+// esa recuperación explícita.
+const MAX_REPEATED_TOOL_REJECTIONS = 3;
 
 // Algunos modelos locales pequeños pueden devolver una llamada de herramienta
 // como texto (`{"name": gestionar_plan}`) aunque reciban el esquema OpenAI.
@@ -185,6 +190,7 @@ export async function runAgentLoop({
   let nudges = 0;
   let lastToolSignature = '';
   let repeatedToolCalls = 0;
+  let repeatRecoveryIssued = false;
 
   for (let i = 0; i < MAX_ITERATIONS && !finished; i++) {
     // ── 1. Comprobar si el usuario ha detenido o pausado la tarea ──
@@ -300,7 +306,9 @@ export async function runAgentLoop({
       }
 
       const toolSignature = stableToolSignature(name, args);
-      repeatedToolCalls = toolSignature === lastToolSignature ? repeatedToolCalls + 1 : 1;
+      const isRepeatedSignature = toolSignature === lastToolSignature;
+      if (!isRepeatedSignature) repeatRecoveryIssued = false;
+      repeatedToolCalls = isRepeatedSignature ? repeatedToolCalls + 1 : 1;
       lastToolSignature = toolSignature;
 
       recordEvent(db, task.id, 'tool_call', {
@@ -308,22 +316,32 @@ export async function runAgentLoop({
         argumentos: JSON.stringify(args).slice(0, 1500),
       });
 
-      if (repeatedToolCalls >= MAX_REPEATED_TOOL_CALLS) {
-        const aviso =
-          `He detenido la tarea porque se intentó repetir ${repeatedToolCalls} veces la misma herramienta ` +
-          `sin un cambio verificable. Revisa el último resultado, cambia de estrategia o envía una instrucción nueva.`;
-        recordEvent(db, task.id, 'tool_error', { herramienta: name, mensaje: aviso });
-        db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)')
-          .run(uuidv4(), task.id, 'assistant', aviso);
-        db.prepare("UPDATE computer_tasks SET status = 'pausada', result = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-          .run(aviso, task.id);
-        recordEvent(db, task.id, 'paused', { mensaje: aviso });
-        return;
-      }
-
+      let recoveryDirective = '';
       let result;
       if (argsError) {
         result = argsError;
+      } else if (repeatedToolCalls > MAX_REPEATED_TOOL_CALLS) {
+        // Evitamos consumir más recursos repitiendo una llamada idéntica. El
+        // modelo recibe una observación concreta y puede elegir otra herramienta
+        // o cambiar argumentos en la siguiente iteración.
+        const rejected = repeatedToolCalls - MAX_REPEATED_TOOL_CALLS;
+        result =
+          `Llamada repetida rechazada (${rejected}/${MAX_REPEATED_TOOL_REJECTIONS} tras el aviso de recuperación): ` +
+          `no ejecutes de nuevo ${name} con los mismos argumentos. Analiza el último resultado, ` +
+          `usa una herramienta distinta o modifica los argumentos de forma verificable.`;
+        recordEvent(db, task.id, 'tool_rejected', { herramienta: name, mensaje: result });
+
+        if (rejected >= MAX_REPEATED_TOOL_REJECTIONS) {
+          const aviso =
+            `La tarea se ha pausado después de ${repeatedToolCalls} intentos idénticos de ${name}, ` +
+            `incluyendo una recuperación guiada y ${rejected} rechazos. Revisa el último resultado o añade una instrucción nueva.`;
+          db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)')
+            .run(uuidv4(), task.id, 'assistant', aviso);
+          db.prepare("UPDATE computer_tasks SET status = 'pausada', result = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+            .run(aviso, task.id);
+          recordEvent(db, task.id, 'paused', { mensaje: aviso });
+          return;
+        }
       } else {
         try {
           result = await executeTool(db, task, workspaceDir, name, args, context);
@@ -334,6 +352,16 @@ export async function runAgentLoop({
           recordEvent(db, task.id, 'tool_error', { herramienta: name, mensaje: err.message });
         }
       }
+
+      if (repeatedToolCalls === MAX_REPEATED_TOOL_CALLS && !repeatRecoveryIssued) {
+        repeatRecoveryIssued = true;
+        recoveryDirective =
+          '[Sistema] Se ha detectado una repetición exacta de herramienta. No finalices ni pauses todavía: ' +
+          'revisa el resultado recibido, actualiza el plan y cambia de estrategia. La próxima llamada ' +
+          'idéntica será rechazada sin ejecutarse.';
+        recordEvent(db, task.id, 'strategy_recovery', { herramienta: name, repeticion: repeatedToolCalls });
+      }
+
 
       // Señal de finalización explícita
       if (result && typeof result === 'object' && result.__finish) {
@@ -349,6 +377,9 @@ export async function runAgentLoop({
       }
 
       messages.push({ role: 'tool', tool_call_id: tc.id, content: String(result) });
+      if (recoveryDirective) {
+        messages.push({ role: 'user', content: recoveryDirective });
+      }
     }
   }
 
