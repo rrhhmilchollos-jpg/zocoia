@@ -40,28 +40,27 @@ const MAX_OUTPUT_CHARS = parseInt(process.env.COMPUTER_MAX_OUTPUT_CHARS || '1200
 const PUBLIC_BASE = process.env.COMPUTER_PUBLIC_BASE || '';
 const E2B_API_KEY = process.env.E2B_API_KEY || '';
 
-// Modelos ofrecidos al usuario, con la nomenclatura comercial de Zoco.
-// Los identificadores de la derecha se han verificado uno a uno contra
-// GET https://api.anthropic.com/v1/models con la clave de producción: usar un
-// identificador inexistente provoca un 404 en cada iteración del bucle.
+// Modelos ofrecidos al usuario con identificadores internos estables. El backend
+// los resuelve al modelo físico del proveedor activo para evitar enviar IDs de
+// Claude a Ollama (o viceversa) al cambiar de motor.
 const MODELOS = [
   {
     id: 'zoco-plus',
-    modelo: process.env.ANTHROPIC_MODEL_PLUS || 'claude-sonnet-4-6',
+    modelo: 'zoco-plus',
     name: 'Zoco Plus',
     description: 'Equilibrio entre velocidad y capacidad. Recomendado para la mayoría de tareas.',
     tier: 'standard',
   },
   {
     id: 'zoco-max',
-    modelo: process.env.ANTHROPIC_MODEL_MAX || 'claude-opus-4-8',
+    modelo: 'zoco-max',
     name: 'Zoco Max',
     description: 'Máxima capacidad de razonamiento para tareas complejas y código avanzado.',
     tier: 'max',
   },
   {
     id: 'zoco-flash',
-    modelo: process.env.ANTHROPIC_MODEL_FLASH || 'claude-haiku-4-5-20251001',
+    modelo: 'zoco-flash',
     name: 'Zoco Flash',
     description: 'El más rápido y económico. Ideal para tareas cortas.',
     tier: 'flash',
