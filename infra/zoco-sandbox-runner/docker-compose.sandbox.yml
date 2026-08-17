@@ -9,6 +9,7 @@ services:
       - SANDBOX_RUNNER_TOKEN=${SANDBOX_RUNNER_TOKEN}
       - SANDBOX_IMAGE=python:3.11-slim
       - SANDBOX_NETWORK=zocoia_sandbox_isolated
+      - SANDBOX_HOST_WORKSPACE_ROOT=/root/zocoia/data/workspaces/computer
       - SANDBOX_MAX_SESSIONS=4
       - SANDBOX_MAX_COMMANDS=40
       - SANDBOX_TTL_SECONDS=900

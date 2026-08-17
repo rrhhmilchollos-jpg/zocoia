@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 SERVICE_TOKEN = os.environ.get("SANDBOX_RUNNER_TOKEN", "")
 SANDBOX_IMAGE = os.environ.get("SANDBOX_IMAGE", "python:3.11-slim")
 SANDBOX_NETWORK = os.environ.get("SANDBOX_NETWORK", "zocoia_sandbox_isolated")
+HOST_WORKSPACE_ROOT = os.environ.get("SANDBOX_HOST_WORKSPACE_ROOT", "")
 MAX_SESSIONS = int(os.environ.get("SANDBOX_MAX_SESSIONS", "4"))
 MAX_COMMANDS_PER_SESSION = int(os.environ.get("SANDBOX_MAX_COMMANDS", "40"))
 SESSION_TTL_SECONDS = int(os.environ.get("SANDBOX_TTL_SECONDS", "900"))
@@ -81,8 +82,19 @@ def create_network() -> None:
         client.networks.create(SANDBOX_NETWORK, driver="bridge", internal=True, attachable=False)
 
 
+def workspace_for(task_id: str) -> str:
+    if not HOST_WORKSPACE_ROOT:
+        raise RuntimeError("SANDBOX_HOST_WORKSPACE_ROOT es obligatorio")
+    root = os.path.realpath(HOST_WORKSPACE_ROOT)
+    candidate = os.path.realpath(os.path.join(root, task_id))
+    if not candidate.startswith(root + os.sep) or not os.path.isdir(candidate):
+        raise RuntimeError("Workspace de tarea no disponible")
+    return candidate
+
+
 def start_container(task_id: str):
     create_network()
+    workspace = workspace_for(task_id)
     return client.containers.run(
         SANDBOX_IMAGE,
         name=session_name(task_id),
@@ -97,7 +109,9 @@ def start_container(task_id: str):
         nano_cpus=1_000_000_000,
         pids_limit=128,
         read_only=True,
-        tmpfs={"/tmp": "rw,noexec,nosuid,size=64m", "/work": "rw,noexec,nosuid,size=128m"},
+        tmpfs={"/tmp": "rw,noexec,nosuid,size=64m"},
+        volumes={workspace: {"bind": "/work", "mode": "rw"}},
+        working_dir="/work",
         user="65534:65534",
         cap_drop=["ALL"],
         security_opt=["no-new-privileges:true"],
