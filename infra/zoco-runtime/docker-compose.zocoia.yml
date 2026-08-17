@@ -48,6 +48,7 @@ services:
     networks:
       - default
       - zocoia_control
+      - zocoia_internal
 
 networks:
   default:
@@ -56,3 +57,6 @@ networks:
   zocoia_control:
     external: true
     name: zocoia_control
+  zocoia_internal:
+    external: true
+    name: zocoia_internal
