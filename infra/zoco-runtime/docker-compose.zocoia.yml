@@ -18,8 +18,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.backend
-    ports:
-      - "3001:3001"
+    expose:
+      - "3001"
     environment:
       - MONGODB_URI=${MONGODB_URI}
       - PORT=3001
