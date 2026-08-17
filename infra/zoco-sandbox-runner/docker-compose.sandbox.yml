@@ -1,0 +1,32 @@
+services:
+  zocoia-sandbox-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zocoia-sandbox-runner
+    restart: unless-stopped
+    environment:
+      - SANDBOX_RUNNER_TOKEN=${SANDBOX_RUNNER_TOKEN}
+      - SANDBOX_IMAGE=python:3.11-slim
+      - SANDBOX_NETWORK=zocoia_sandbox_isolated
+      - SANDBOX_MAX_SESSIONS=4
+      - SANDBOX_MAX_COMMANDS=40
+      - SANDBOX_TTL_SECONDS=900
+      - SANDBOX_MAX_OUTPUT_BYTES=65536
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - zocoia_control
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+
+networks:
+  zocoia_control:
+    name: zocoia_control
+    driver: bridge
+    internal: true
