@@ -22,8 +22,8 @@ const EVENT_META: Record<string, { icon: string; label: string; panel: RuntimeTa
   plan_updated: { icon: 'fa-diagram-project', label: 'Plan actualizado', panel: 'activity', tone: 'text-sky-300' },
   tool_call: { icon: 'fa-wand-magic-sparkles', label: 'Herramienta', panel: 'activity', tone: 'text-amber-300' },
   tool_result: { icon: 'fa-terminal', label: 'Resultado', panel: 'terminal', tone: 'text-emerald-300' },
-  terminal_start: { icon: 'fa-terminal', label: 'Terminal', panel: 'terminal', tone: 'text-emerald-300' },
-  terminal_output: { icon: 'fa-terminal', label: 'Terminal', panel: 'terminal', tone: 'text-emerald-300' },
+  terminal_start: { icon: 'fa-terminal', label: 'Terminal iniciada', panel: 'terminal', tone: 'text-emerald-300' },
+  terminal_output: { icon: 'fa-terminal', label: 'Salida en vivo', panel: 'terminal', tone: 'text-emerald-300' },
   file_write: { icon: 'fa-file-circle-plus', label: 'Archivo creado', panel: 'files', tone: 'text-sky-300' },
   file_edit: { icon: 'fa-file-pen', label: 'Archivo actualizado', panel: 'files', tone: 'text-sky-300' },
   file_read: { icon: 'fa-file-lines', label: 'Archivo leído', panel: 'files', tone: 'text-sky-300' },
@@ -60,7 +60,8 @@ function eventSummary(event: Evento): string {
   if (event.type === 'thinking') return event.texto || `Iteración ${event.iteracion || 'actual'}: preparando la siguiente acción.`;
   if (event.type === 'tool_call') return `${event.herramienta || 'herramienta'} · ${event.argumentos || 'sin argumentos visibles'}`;
   if (event.type === 'tool_result') return event.salida || '(herramienta terminada sin salida)';
-  if (event.type === 'terminal_output') return `${event.comando ? `$ ${event.comando}\n` : ''}${event.salida || ''}`;
+  if (event.type === 'terminal_start') return `${event.comando ? `$ ${event.comando}` : 'Iniciando terminal…'}${event.directorio ? `\nDirectorio: ${event.directorio}` : ''}`;
+  if (event.type === 'terminal_output') return event.salida || '(sin salida nueva)';
   if (event.type === 'plan' || event.type === 'plan_updated') return Array.isArray(event.fases) ? `${event.fases.length} fases sincronizadas.` : 'Plan sincronizado.';
   if (event.type === 'strategy_recovery') return `El agente revisa el último resultado de ${event.herramienta || 'la herramienta'} antes de continuar.`;
   if (event.type === 'tool_rejected' || event.type === 'tool_error' || event.type === 'paused' || event.type === 'error') return event.mensaje || 'Se requiere una estrategia distinta.';
@@ -72,9 +73,10 @@ function eventSummary(event: Evento): string {
 }
 
 function eventTime(event: Evento): string {
-  if (!event.ts) return 'Ahora';
-  const date = new Date(event.ts);
-  return Number.isNaN(date.valueOf()) ? 'Ahora' : date.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' });
+  const timestamp = event.ts || event.created_at;
+  if (!timestamp) return 'Ahora';
+  const date = new Date(timestamp);
+  return Number.isNaN(date.valueOf()) ? 'Ahora' : date.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
 export default function ZocoComputer() {

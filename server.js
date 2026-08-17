@@ -676,6 +676,9 @@ async function callChatModel({ claudeModel, messages, maxTokens, temperature, to
         message: {
           role: 'assistant',
           content: textContent,
+          // Conserva los bloques nativos de Anthropic para que el siguiente turno
+          // mantenga los tool_use_id exactos y no degrade las acciones a texto.
+          _anthropicBlocks: response.content,
           ...(tool_calls ? { tool_calls } : {}),
         },
         finish_reason: response.stop_reason === 'tool_use' ? 'tool_calls' : 'stop',

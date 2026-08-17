@@ -160,11 +160,14 @@ function broadcast(taskId, seq, type, payload) {
 // Registra un evento: lo persiste y lo difunde. Es la única vía de emisión, de
 // modo que quien se conecte tarde puede reconstruir la historia completa.
 function recordEvent(db, taskId, type, payload = {}) {
-  const cuerpo = JSON.stringify(payload ?? {});
+  // La misma marca temporal viaja por SSE y queda persistida con el evento,
+  // de modo que el runtime puede reproducir una secuencia verificable.
+  const evento = { ...(payload ?? {}), ts: new Date().toISOString() };
+  const cuerpo = JSON.stringify(evento);
   const info = db
     .prepare('INSERT INTO computer_events (task_id, type, payload) VALUES (?, ?, ?)')
     .run(taskId, type, cuerpo);
-  broadcast(taskId, info.lastInsertRowid, type, payload);
+  broadcast(taskId, info.lastInsertRowid, type, evento);
   return info.lastInsertRowid;
 }
 
@@ -428,7 +431,7 @@ const TOOLS = [
 // Ejecuta un comando con spawn y timeout duro. Se usa spawn en lugar de exec
 // para poder matar todo el grupo de procesos si se agota el tiempo: con exec,
 // un hijo que ignora SIGTERM dejaba el agente colgado indefinidamente.
-function runShell(comando, cwd, timeoutMs) {
+function runShell(comando, cwd, timeoutMs, onOutput = null) {
   return new Promise((resolve) => {
     const limite = Math.min(Math.max(parseInt(timeoutMs, 10) || TOOL_TIMEOUT_MS, 1000), 600000);
     const hijo = spawn('bash', ['-lc', comando], {
@@ -440,7 +443,10 @@ function runShell(comando, cwd, timeoutMs) {
     let salida = '';
     let cerrado = false;
     const acumular = (buf) => {
-      if (salida.length < MAX_OUTPUT_CHARS * 2) salida += buf.toString();
+      const fragmento = buf.toString();
+      if (salida.length < MAX_OUTPUT_CHARS * 2) salida += fragmento;
+      // No se espera al final del comando: cada fragmento llega al runtime vivo.
+      if (typeof onOutput === 'function' && fragmento) onOutput(fragmento);
     };
     hijo.stdout.on('data', acumular);
     hijo.stderr.on('data', acumular);
@@ -601,7 +607,10 @@ async function executeTool(db, task, workspaceDir, name, args, context) {
       if (!comando) return 'Falta el comando a ejecutar.';
       const cwd = args.directorio ? resolveInside(workspaceDir, args.directorio) : workspaceDir;
       fs.mkdirSync(cwd, { recursive: true });
-      const { code, salida } = await runShell(comando, cwd, args.timeout_ms);
+      recordEvent(db, task.id, 'terminal_start', { comando, directorio: path.relative(workspaceDir, cwd) || '.' });
+      const { code, salida } = await runShell(comando, cwd, args.timeout_ms, (fragmento) => {
+        recordEvent(db, task.id, 'terminal_output', { comando, salida: truncar(fragmento, 2000) });
+      });
       recordEvent(db, task.id, 'tool_result', {
         herramienta: 'terminal', comando, codigo: code, salida: truncar(salida, 4000),
       });
