@@ -85,10 +85,12 @@ def create_network() -> None:
 def workspace_for(task_id: str) -> str:
     if not HOST_WORKSPACE_ROOT:
         raise RuntimeError("SANDBOX_HOST_WORKSPACE_ROOT es obligatorio")
-    root = os.path.realpath(HOST_WORKSPACE_ROOT)
-    candidate = os.path.realpath(os.path.join(root, task_id))
-    if not candidate.startswith(root + os.sep) or not os.path.isdir(candidate):
-        raise RuntimeError("Workspace de tarea no disponible")
+    # Esta ruta pertenece al host Docker y no se monta dentro del runner. Se
+    # comprueba de forma léxica; task_id ya está limitado por el modelo Pydantic.
+    root = os.path.normpath(HOST_WORKSPACE_ROOT)
+    candidate = os.path.normpath(os.path.join(root, task_id))
+    if os.path.commonpath([root, candidate]) != root:
+        raise RuntimeError("Workspace de tarea no permitido")
     return candidate
 
 
