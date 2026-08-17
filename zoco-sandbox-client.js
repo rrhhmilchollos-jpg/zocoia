@@ -32,7 +32,11 @@ async function request(method, route, body = undefined, timeoutMs = DEFAULT_TIME
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(payload.detail || payload.error || `Runner respondió HTTP ${response.status}`);
+      const detail = payload.detail || payload.error || `Runner respondió HTTP ${response.status}`;
+      const message = typeof detail === 'string' ? detail : JSON.stringify(detail);
+      const error = new Error(message);
+      error.status = response.status;
+      throw error;
     }
     return payload;
   } catch (error) {
@@ -50,7 +54,9 @@ export async function createSandboxSession(taskId) {
 export async function executeInSandbox(sessionId, command, timeoutMs) {
   return request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/exec`, {
     command,
-    timeout_seconds: Math.max(1, Math.min(600, Math.ceil((timeoutMs || 180000) / 1000))),
+    // El runner impone un máximo de 60 segundos por comando; el agente puede
+    // encadenar pasos, pero no debe enviar un valor que FastAPI rechace con 422.
+    timeout_seconds: Math.max(1, Math.min(60, Math.ceil((timeoutMs || 180000) / 1000))),
   }, Math.max(DEFAULT_TIMEOUT_MS, (timeoutMs || 180000) + 10_000));
 }
 
