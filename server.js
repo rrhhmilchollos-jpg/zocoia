@@ -263,7 +263,10 @@ if (!apiKeyColumns.includes('usage_month')) db.exec('ALTER TABLE api_keys ADD CO
 const FREE_KEY_MONTHLY_TOKEN_LIMIT = Number(process.env.FREE_KEY_MONTHLY_TOKEN_LIMIT || 1000);
 const currentUsageMonth = () => new Date().toISOString().slice(0, 7);
 
-const RESOURCE_TYPES = ['agente', 'archivo', 'habilidad', 'lote', 'sesion', 'implementacion', 'entorno', 'credencial', 'memoria'];
+const RESOURCE_TYPES = [
+  'agente', 'archivo', 'habilidad', 'lote', 'sesion', 'implementacion', 'entorno', 'credencial', 'memoria',
+  'proyecto', 'conocimiento', 'conector', 'automatizacion',
+];
 const BALANCE_BLOCK_THRESHOLD = Number(process.env.BALANCE_BLOCK_THRESHOLD_USD || -0.83);
 
 const MODELOS_VALIDOS = [

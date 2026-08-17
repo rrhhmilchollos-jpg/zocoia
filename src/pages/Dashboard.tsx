@@ -36,6 +36,10 @@ const RESOURCE_SECTIONS = [
   { key: 'entorno', label: 'Entornos', icon: '🌐' },
   { key: 'credencial', label: 'Almacén de credenciales', icon: '🔒' },
   { key: 'memoria', label: 'Almacenes de memoria', icon: '🧠' },
+  { key: 'proyecto', label: 'Proyectos', icon: '🗂️' },
+  { key: 'conocimiento', label: 'Conocimiento', icon: '📚' },
+  { key: 'conector', label: 'Conectores', icon: '🔌' },
+  { key: 'automatizacion', label: 'Automatizaciones', icon: '⏱️' },
 ];
 
 export default function Dashboard() {
@@ -275,6 +279,8 @@ export default function Dashboard() {
                 {buildExpanded && (
                   <div className="mt-0.5 space-y-0.5">
                     <NavItem tab="archivo" label="Archivos" icon="📁" />
+                    <NavItem tab="proyecto" label="Proyectos" icon="🗂️" />
+                    <NavItem tab="conocimiento" label="Conocimiento" icon="📚" />
                     <button onClick={() => setSkillsPanelOpen(true)} className="w-full flex items-center space-x-2.5 px-3 py-2 rounded-lg text-left text-[13px] transition-colors text-gray-400 hover:text-gray-200 hover:bg-[#1e1e1e]">
                       <span className="text-base">⚡</span><span>Habilidades</span>
                     </button>
@@ -295,6 +301,8 @@ export default function Dashboard() {
                     <NavItem tab="implementacion" label="Implementaciones" icon="⚙️" />
                     <NavItem tab="entorno" label="Entornos" icon="🌐" />
                     <NavItem tab="credencial" label="Almacén de cred." icon="🔒" />
+                    <NavItem tab="conector" label="Conectores" icon="🔌" />
+                    <NavItem tab="automatizacion" label="Automatizaciones" icon="⏱️" />
                     <NavItem tab="memoria" label="Almacenes memoria" icon="🧠" />
                   </div>
                 )}
@@ -700,7 +708,7 @@ export default function Dashboard() {
             )}
 
             {/* ── RECURSOS GENÉRICOS ── */}
-            {RESOURCE_SECTIONS.filter(s => ['sesion', 'memoria', 'credencial', 'entorno', 'implementacion'].includes(s.key) && s.key === activeTab).map(s => (
+            {RESOURCE_SECTIONS.filter(s => ['sesion', 'memoria', 'credencial', 'entorno', 'implementacion', 'proyecto', 'conocimiento', 'conector', 'automatizacion'].includes(s.key) && s.key === activeTab).map(s => (
               <div key={s.key} className="max-w-4xl">
                 <div className="flex justify-between items-center mb-6">
                   <h1 className="text-2xl font-bold text-white">{s.label}</h1>
