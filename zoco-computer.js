@@ -175,7 +175,16 @@ function recordEvent(db, taskId, type, payload = {}) {
 
 function workspaceFor(taskId) {
   const dir = path.join(WORKSPACE_ROOT, taskId);
-  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // El runner efímero ejecuta como UID/GID 10001. Cada workspace nuevo se
+  // asigna exclusivamente a ese usuario; el proceso principal sigue pudiendo
+  // leerlo como root, pero una sandbox nunca puede salir de su propia tarea.
+  try {
+    fs.chmodSync(dir, 0o700);
+    fs.chownSync(dir, 10001, 10001);
+  } catch (err) {
+    console.warn(`[ZocoComputer] no se pudo preparar permisos de sandbox para ${taskId}: ${err.message}`);
+  }
   return dir;
 }
 
