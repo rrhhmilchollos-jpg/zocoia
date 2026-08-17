@@ -114,7 +114,7 @@ def start_container(task_id: str):
         tmpfs={"/tmp": "rw,noexec,nosuid,size=64m"},
         volumes={workspace: {"bind": "/work", "mode": "rw"}},
         working_dir="/work",
-        user="65534:65534",
+        user="10001:10001",
         cap_drop=["ALL"],
         security_opt=["no-new-privileges:true"],
         labels={"zocoia.sandbox": "true", "zocoia.task": task_id},
