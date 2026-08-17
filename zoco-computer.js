@@ -911,7 +911,7 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
 // ─── Rutas Express ───────────────────────────────────────────────────────────
 
 export function registerComputerRoutes({
-  app, db, authMiddleware, uuidv4, workspacesRoot, makeCallModel, jwt, JWT_SECRET,
+  app, db, authMiddleware, uuidv4, workspacesRoot, makeCallModel, isAIConfigured = () => true, aiConfigurationError = () => null, jwt, JWT_SECRET,
 }) {
   ensureSchema(db);
 
@@ -967,9 +967,9 @@ export function registerComputerRoutes({
       const titulo = String(req.body?.prompt ?? req.body?.task ?? req.body?.title ?? '').trim();
       if (!titulo) return res.status(400).json({ error: 'El prompt de la tarea es obligatorio.' });
 
-      if (!process.env.ANTHROPIC_API_KEY) {
+      if (!isAIConfigured()) {
         return res.status(503).json({
-          error: 'El motor de IA no está configurado en el servidor (falta ANTHROPIC_API_KEY).',
+          error: aiConfigurationError() || 'El motor de IA no está configurado en el servidor.',
         });
       }
 

@@ -17,6 +17,8 @@ import { seedOwnerAgentsIfEmpty, seedBasicAgentsForUser, isOwnerUser, ENTERPRISE
 import { registerSessionRoutes, validateZocoApiKey } from './zoco-sessions.js';
 import { registerConsoleRoutes, resumeInterruptedBatches, buildEnvironmentContext } from './zoco-console.js';
 
+dotenv.config();
+
 // DEEPSEEK_SAFE_FORMAT_RULE ya no se importa — Claude no la necesita.
 // Se mantiene como string vacío para no romper módulos que la referencien.
 const DEEPSEEK_SAFE_FORMAT_RULE = '';
@@ -56,29 +58,55 @@ function resolveClaudeModel(modeloZocoia) {
   return CLAUDE_MODEL_MAP[modeloZocoia] || 'claude-sonnet-4-6';
 }
 
-// ─── CÓDIGO OLLAMA COMENTADO (por si se necesita volver atrás) ───────────────
-/*
+// ─── PROVEEDORES DE IA ────────────────────────────────────────────────────────
+// El despliegue de Zoco usa Ollama por defecto. Anthropic sigue disponible solo
+// cuando se selecciona explícitamente y existe su clave de servidor.
 const OLLAMA_MODEL_MAP = {
-  'zoco-flash': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash',
-  'zoco-plus':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',
-  'zoco-max':   process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
-  'zoco-lab':   process.env.OLLAMA_MODEL_LAB   || 'Zoco-Lab',
-  'maris-velox': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash',
-  'maris-velox-1b': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash',
-  'maris-core':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',
-  'maris-core-7b':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',
-  'maris-pro':   process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
-  'maris-pro-32b':  process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
-  'maris-beta':  process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
-  'maris-beta-70b': process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
+  'zoco-flash': process.env.OLLAMA_MODEL_FLASH || 'qwen2.5-coder:3b',
+  'zoco-plus':  process.env.OLLAMA_MODEL_PLUS  || 'qwen2.5-coder:3b',
+  'zoco-max':   process.env.OLLAMA_MODEL_MAX   || 'qwen2.5-coder:3b',
+  'zoco-lab':   process.env.OLLAMA_MODEL_LAB   || 'qwen2.5-coder:3b',
+  'maris-velox': process.env.OLLAMA_MODEL_FLASH || 'qwen2.5-coder:3b',
+  'maris-velox-1b': process.env.OLLAMA_MODEL_FLASH || 'qwen2.5-coder:3b',
+  'maris-core': process.env.OLLAMA_MODEL_PLUS || 'qwen2.5-coder:3b',
+  'maris-core-7b': process.env.OLLAMA_MODEL_PLUS || 'qwen2.5-coder:3b',
+  'maris-pro': process.env.OLLAMA_MODEL_MAX || 'qwen2.5-coder:3b',
+  'maris-pro-32b': process.env.OLLAMA_MODEL_MAX || 'qwen2.5-coder:3b',
+  'maris-beta': process.env.OLLAMA_MODEL_MAX || 'qwen2.5-coder:3b',
+  'maris-beta-70b': process.env.OLLAMA_MODEL_MAX || 'qwen2.5-coder:3b',
 };
 const OLLAMA_URL = process.env.OLLAMA_BASE_URL || process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
-const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || 'ollama';
+const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || 'local-ollama';
 const OLLAMA_TIMEOUT_MS = parseInt(process.env.OLLAMA_TIMEOUT_MS || '300000', 10);
-*/
-// ─── FIN CÓDIGO OLLAMA ────────────────────────────────────────────────────────
-
 const ANTHROPIC_TIMEOUT_MS = parseInt(process.env.ANTHROPIC_TIMEOUT_MS || '120000', 10);
+
+function resolveOllamaModel(modeloZocoia) {
+  if (!modeloZocoia) return OLLAMA_MODEL_MAP['zoco-plus'];
+  return OLLAMA_MODEL_MAP[modeloZocoia] || String(modeloZocoia);
+}
+
+function getAIProviderConfig() {
+  const requested = String(process.env.AI_PROVIDER || 'ollama').trim().toLowerCase();
+  if (requested === 'ollama' || requested === 'local') {
+    return { provider: 'ollama', configured: !!OLLAMA_URL, modelResolver: resolveOllamaModel, label: 'Ollama local' };
+  }
+  if (requested === 'anthropic' || requested === 'claude') {
+    return { provider: 'anthropic', configured: !!process.env.ANTHROPIC_API_KEY, modelResolver: resolveClaudeModel, label: 'Claude Anthropic' };
+  }
+  if (requested === 'auto') {
+    return process.env.ANTHROPIC_API_KEY
+      ? { provider: 'anthropic', configured: true, modelResolver: resolveClaudeModel, label: 'Claude Anthropic' }
+      : { provider: 'ollama', configured: !!OLLAMA_URL, modelResolver: resolveOllamaModel, label: 'Ollama local' };
+  }
+  return { provider: requested, configured: false, modelResolver: resolveOllamaModel, label: requested };
+}
+
+function getAIConfigurationError() {
+  const config = getAIProviderConfig();
+  if (config.configured) return null;
+  if (config.provider === 'anthropic') return 'El proveedor Anthropic está seleccionado, pero falta su configuración de servidor.';
+  return `El proveedor de IA seleccionado (${config.label}) no está configurado.`;
+}
 const PROMPT_CACHE_TTL_MS = 5 * 60 * 1000;
 
 // Módulos opcionales — si no existen en el repo, el servidor sigue arrancando
@@ -115,8 +143,6 @@ try {
 } catch (err) {
   console.warn('⚠️  zoco-computer.js no disponible:', err?.message);
 }
-
-dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -631,7 +657,7 @@ function convertMessagesToAnthropic(messages) {
   return out;
 }
 
-async function callChatModel({ claudeModel, messages, maxTokens, temperature, tools, toolChoice }) {
+async function callAnthropicChatModel({ claudeModel, messages, maxTokens, temperature, tools, toolChoice }) {
   const anthropic = getAnthropicClient();
 
   // Separar el mensaje de sistema del resto
@@ -697,62 +723,70 @@ async function callChatModel({ claudeModel, messages, maxTokens, temperature, to
   }
 }
 
-// ─── CÓDIGO ANTIGUO callChatModel (Ollama) COMENTADO ─────────────────────────
-/*
-async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temperature, tools, toolChoice, ollamaOptions }) {
-  async function doFetch(url, auth, model, extraOllamaOptions) {
+async function callOllamaChatModel({ ollamaModel, messages, maxTokens, temperature, tools, toolChoice }) {
+  const endpoint = `${OLLAMA_URL.replace(/\/+$/, '')}/v1/chat/completions`;
+  let lastErr;
+  for (let attempt = 0; attempt < 2; attempt++) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), OLLAMA_TIMEOUT_MS);
     try {
-      const resp = await fetch(url, {
+      const response = await fetch(endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: auth },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OLLAMA_API_KEY}` },
         body: JSON.stringify({
-          model, messages, max_tokens: maxTokens, temperature,
-          ...(tools && tools.length ? { tools } : {}),
-          ...(tools && tools.length && toolChoice ? { tool_choice: toolChoice } : {}),
-          ...(extraOllamaOptions ? { options: extraOllamaOptions } : {}),
+          model: ollamaModel,
+          messages,
+          max_tokens: maxTokens || 4096,
+          temperature: typeof temperature === 'number' ? temperature : 0.7,
+          ...(tools?.length ? { tools } : {}),
+          ...(tools?.length && toolChoice ? { tool_choice: toolChoice } : {}),
         }),
         signal: controller.signal,
       });
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({}));
-        const e = new Error(err.error?.message || 'Error al llamar al modelo de IA');
-        e.status = resp.status;
-        throw e;
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const error = new Error(body?.error?.message || body?.error || `Ollama respondió HTTP ${response.status}`);
+        error.status = response.status;
+        throw error;
       }
-      return await resp.json();
+      return body;
+    } catch (error) {
+      lastErr = error;
+      if (error.name === 'AbortError') {
+        const timeoutError = new Error(`El modelo local ${ollamaModel} agotó el tiempo de espera.`);
+        timeoutError.status = 504;
+        throw timeoutError;
+      }
+      const transient = !error.status || error.status >= 500;
+      if (transient && attempt === 0) {
+        console.warn(`[Ollama] fallo transitorio (${error.message}); reintentando una vez.`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        continue;
+      }
+      if (!error.status) {
+        const connectionError = new Error(`No se pudo conectar con el motor local de Zoco: ${error.message}`);
+        connectionError.status = 502;
+        throw connectionError;
+      }
+      throw error;
     } finally {
       clearTimeout(timeoutId);
     }
   }
-  const endpoint = `${ollamaUrl.replace(/\/+$/, '')}/v1/chat/completions`;
-  const MAX_ATTEMPTS = 2;
-  let lastErr;
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    try {
-      return await doFetch(endpoint, `Bearer ${OLLAMA_API_KEY}`, ollamaModel, ollamaOptions);
-    } catch (err) {
-      lastErr = err;
-      if (err.name === 'AbortError') {
-        const e = new Error(`Timeout: el modelo ${ollamaModel} tardó más de ${Math.round(OLLAMA_TIMEOUT_MS / 1000)}s`);
-        e.status = 504; throw e;
-      }
-      const transient = !err.status || err.status >= 500;
-      if (transient && attempt < MAX_ATTEMPTS - 1) {
-        console.warn(`[Ollama] fallo transitorio (${err.message}) — reintentando...`);
-        await new Promise(r => setTimeout(r, 2000));
-        continue;
-      }
-      if (err.status) throw err;
-      const e = new Error(`Error de conexión con Ollama (${ollamaUrl}): ${err.message}`);
-      e.status = 502; throw e;
-    }
-  }
   throw lastErr;
 }
-*/
-// ─── FIN CÓDIGO ANTIGUO ───────────────────────────────────────────────────────
+
+async function callChatModel({ provider, model, messages, maxTokens, temperature, tools, toolChoice }) {
+  if (provider === 'ollama') {
+    return callOllamaChatModel({ ollamaModel: model, messages, maxTokens, temperature, tools, toolChoice });
+  }
+  if (provider === 'anthropic') {
+    return callAnthropicChatModel({ claudeModel: model, messages, maxTokens, temperature, tools, toolChoice });
+  }
+  const error = new Error(`Proveedor de IA no compatible: ${provider}`);
+  error.status = 503;
+  throw error;
+}
 
 async function processChatCompletion(authSub, { agentId, messages, model, temperature: temperatureInput, max_tokens: maxTokensInput, sessionSkills, tools: requestTools, tool_choice: requestToolChoice, apiKeyId, apiKeyType }) {
   const userCheck = db.prepare('SELECT creditos, activo FROM users WHERE id = ?').get(authSub);
@@ -828,8 +862,15 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
     }
   }
 
-  const claudeModel = resolveClaudeModel(modeloZocoia);
-  console.log(`[IA] ${modeloZocoia} → ${claudeModel} via Claude Anthropic`);
+  const aiConfig = getAIProviderConfig();
+  const aiConfigurationError = getAIConfigurationError();
+  if (aiConfigurationError) {
+    const error = new Error(aiConfigurationError);
+    error.status = 503;
+    throw error;
+  }
+  const resolvedModel = aiConfig.modelResolver(modeloZocoia);
+  console.log(`[IA] ${modeloZocoia} → ${resolvedModel} via ${aiConfig.label}`);
 
   const clamp = (v, min, max, fallback) => { const n = Number(v); if (!Number.isFinite(n)) return fallback; return Math.min(max, Math.max(min, n)); };
   const maxTokens = clamp(maxTokensInput || agenteData.num_predict, 256, 8192, 4096);
@@ -841,7 +882,8 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   if (allowedTools.length > 0 && !isOwnerUser(db, authSub)) allowedTools = [];
 
   const callModel = (msgs, tools, toolChoice) => callChatModel({
-    claudeModel,
+    provider: aiConfig.provider,
+    model: resolvedModel,
     messages: msgs,
     maxTokens,
     temperature,
@@ -899,14 +941,14 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   const tokensConDescuento = cacheResult.hit ? Math.max(0, totalTokens - Math.round(cacheResult.cachedTokens * 0.9)) : totalTokens;
   const costeEuros = tokensConDescuento * 0.000002;
   if (costeEuros > 0) {
-    db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)').run(uuidv4(), authSub, costeEuros, 'gasto', `Claude ${claudeModel}${cacheResult.hit ? ' (caché)' : ''}`);
+    db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)').run(uuidv4(), authSub, costeEuros, 'gasto', `${aiConfig.label} · ${resolvedModel}${cacheResult.hit ? ' (caché)' : ''}`);
     db.prepare('UPDATE users SET creditos = creditos - ? WHERE id = ?').run(costeEuros, authSub);
   }
 
   return {
     choices: [{ message: { role: 'assistant', content: respuesta, ...(clientToolCalls ? { tool_calls: clientToolCalls } : {}) }, finish_reason: clientToolCalls ? 'tool_calls' : 'stop' }],
     usage: { input_tokens: usage.prompt_tokens || 0, output_tokens: usage.completion_tokens || 0, total_tokens: totalTokens, cache_read_tokens: cacheResult.hit ? cacheResult.cachedTokens : 0, prompt_tokens: usage.prompt_tokens || 0, completion_tokens: usage.completion_tokens || 0 },
-    model: claudeModel,
+    model: resolvedModel,
   };
 }
 
@@ -1297,20 +1339,24 @@ app.get('/api/payments/success', authMiddleware, (req, res) => {
 });
 
 // ─── Sistema: estado del motor IA ─────────────────────────────────────────────
-// Antes chequeaba Ollama (/api/tags). Ahora reporta el estado de Claude Anthropic.
 app.get('/api/system/ollama', authMiddleware, async (req, res) => {
+  const config = getAIProviderConfig();
+  if (!config.configured) return res.json({ online: false, motor: config.label, error: getAIConfigurationError() });
   try {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) return res.json({ online: false, motor: 'Claude Anthropic', error: 'ANTHROPIC_API_KEY no configurada' });
-    // Verificación ligera: intentamos listar modelos
-    const resp = await fetch('https://api.anthropic.com/v1/models', {
-      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+    if (config.provider === 'ollama') {
+      const response = await fetch(`${OLLAMA_URL.replace(/\/+$/, '')}/api/tags`, { signal: AbortSignal.timeout(5000) });
+      if (!response.ok) return res.json({ online: false, motor: config.label });
+      const data = await response.json();
+      return res.json({ online: true, motor: config.label, models: (data.models || []).map(model => model.name).slice(0, 8) });
+    }
+    const response = await fetch('https://api.anthropic.com/v1/models', {
+      headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
       signal: AbortSignal.timeout(5000),
     });
-    if (!resp.ok) return res.json({ online: false, motor: 'Claude Anthropic' });
-    const data = await resp.json();
-    res.json({ online: true, motor: 'Claude Anthropic', models: (data.data || []).map(m => m.id).slice(0, 8) });
-  } catch { res.json({ online: false, motor: 'Claude Anthropic' }); }
+    if (!response.ok) return res.json({ online: false, motor: config.label });
+    const data = await response.json();
+    return res.json({ online: true, motor: config.label, models: (data.data || []).map(model => model.id).slice(0, 8) });
+  } catch { return res.json({ online: false, motor: config.label }); }
 });
 
 app.get('/admin/stats', authMiddleware, requireAdmin, (req, res) => {
@@ -1321,10 +1367,9 @@ app.get('/admin/stats', authMiddleware, requireAdmin, (req, res) => {
     llamadasHoy: db.prepare("SELECT COUNT(*) as n FROM usage_log WHERE kind='gasto' AND created_at >= date('now')").get().n,
     ultimosPagos: db.prepare('SELECT p.*, u.email as user_email FROM payments p LEFT JOIN users u ON u.id = p.user_id ORDER BY p.created_at DESC LIMIT 50').all(),
     vivaConfigurado: !!(VIVA_CLIENT_ID && VIVA_CLIENT_SECRET),
-    // ollamaOnline renombrado a motorOnline para el frontend — Claude siempre disponible si hay API key
-    ollamaOnline: !!process.env.ANTHROPIC_API_KEY,
-    motorOnline: !!process.env.ANTHROPIC_API_KEY,
-    motor: 'Claude Anthropic',
+    ollamaOnline: getAIProviderConfig().provider === 'ollama' && getAIProviderConfig().configured,
+    motorOnline: getAIProviderConfig().configured,
+    motor: getAIProviderConfig().label,
   });
 });
 
@@ -1362,17 +1407,22 @@ if (registerComputerRoutes) {
   registerComputerRoutes({
     app, db, authMiddleware, uuidv4, jwt, JWT_SECRET,
     workspacesRoot: WORKSPACES_ROOT,
+    isAIConfigured: () => !getAIConfigurationError(),
+    aiConfigurationError: getAIConfigurationError,
     makeCallModel: ({ userId, model }) => {
-      const claudeModel = resolveClaudeModel(model || 'zoco-plus');
+      const aiConfig = getAIProviderConfig();
+      const resolvedModel = aiConfig.modelResolver(model || 'zoco-plus');
       return async (msgs, tools, toolChoice) => {
+        const aiConfigurationError = getAIConfigurationError();
+        if (aiConfigurationError) { const error = new Error(aiConfigurationError); error.status = 503; throw error; }
         const userCheck = db.prepare('SELECT creditos, activo FROM users WHERE id = ?').get(userId);
         if (!userCheck || !userCheck.activo) { const e = new Error('Cuenta desactivada'); e.status = 403; throw e; }
         if (userCheck.creditos <= BALANCE_BLOCK_THRESHOLD) { const e = new Error('Créditos insuficientes'); e.status = 402; throw e; }
-        const data = await callChatModel({ claudeModel, messages: msgs, maxTokens: 4096, tools, toolChoice });
+        const data = await callChatModel({ provider: aiConfig.provider, model: resolvedModel, messages: msgs, maxTokens: 4096, tools, toolChoice });
         const totalTokens = data.usage?.total_tokens || 0;
         const coste = totalTokens * 0.000002;
         if (coste > 0) {
-          db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)').run(uuidv4(), userId, coste, 'gasto', `Ordenador de Zoco · ${claudeModel}`);
+          db.prepare('INSERT INTO usage_log (id, user_id, amount, kind, description) VALUES (?, ?, ?, ?, ?)').run(uuidv4(), userId, coste, 'gasto', `Ordenador de Zoco · ${aiConfig.label} · ${resolvedModel}`);
           db.prepare('UPDATE users SET creditos = creditos - ? WHERE id = ?').run(coste, userId);
         }
         return data;
