@@ -1,77 +1,81 @@
-import React, { useState, useRef, useCallback, useEffect } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useAuth, API_BASE } from '../context/AuthContext';
 
-/* ═══════════════════════════════════════════════════════════════════════════
-   El Ordenador de Zoco — interfaz tipo Manus:
-   · Columna izquierda: conversación con el agente + plan de fases en vivo
-   · Columna derecha: "el ordenador" — visor de acciones (terminal, editor,
-     navegador, búsquedas) retransmitidas por SSE
-   ═══════════════════════════════════════════════════════════════════════════ */
-
 interface Fase { titulo: string; estado: 'pendiente' | 'en_curso' | 'completada'; }
 interface Msg { role: string; content: string; created_at?: string; }
-interface Evento {
-  id?: number;
-  type: string;
-  ts?: string;
-  [k: string]: any;
-}
-interface Task {
-  id: string;
-  title: string;
-  status: string;
-  model?: string;
-  created_at?: string;
-  updated_at?: string;
-}
+interface Evento { id?: number; type: string; ts?: string; [key: string]: any; }
+interface Task { id: string; title: string; status: string; model?: string; created_at?: string; updated_at?: string; }
+
+type RuntimeTab = 'all' | 'terminal' | 'files' | 'web' | 'activity';
 
 const MODEL_OPTIONS = [
-  { value: 'zoco-max', label: 'Zoco Max · máxima capacidad' },
-  { value: 'zoco-plus', label: 'Zoco Plus · equilibrado' },
-  { value: 'zoco-flash', label: 'Zoco Flash · rápido' },
+  { value: 'zoco-max', label: 'Zoco Max', description: 'Razonamiento ampliado' },
+  { value: 'zoco-plus', label: 'Zoco Plus', description: 'Equilibrado' },
+  { value: 'zoco-flash', label: 'Zoco Flash', description: 'Respuesta rápida' },
 ];
 
-const EVENT_META: Record<string, { icon: string; label: string; panel: string }> = {
-  task_started: { icon: 'fa-rocket', label: 'Tarea iniciada', panel: 'log' },
-  thinking: { icon: 'fa-brain', label: 'Pensando…', panel: 'log' },
-  plan: { icon: 'fa-list-check', label: 'Plan actualizado', panel: 'log' },
-  plan_updated: { icon: 'fa-list-check', label: 'Plan actualizado', panel: 'log' },
-  tool_call: { icon: 'fa-wrench', label: 'Herramienta', panel: 'log' },
-  tool_result: { icon: 'fa-terminal', label: 'Resultado de herramienta', panel: 'terminal' },
-  terminal_start: { icon: 'fa-terminal', label: 'Terminal', panel: 'terminal' },
-  terminal_output: { icon: 'fa-terminal', label: 'Terminal', panel: 'terminal' },
-  file_write: { icon: 'fa-file-pen', label: 'Editor', panel: 'editor' },
-  file_edit: { icon: 'fa-pen-to-square', label: 'Edición', panel: 'editor' },
-  file_read: { icon: 'fa-file-lines', label: 'Lectura', panel: 'editor' },
-  file_list: { icon: 'fa-folder-open', label: 'Archivos', panel: 'editor' },
-  web_search: { icon: 'fa-magnifying-glass', label: 'Búsqueda web', panel: 'browser' },
-  web_search_result: { icon: 'fa-magnifying-glass', label: 'Resultados', panel: 'browser' },
-  web_read: { icon: 'fa-book-open', label: 'Página leída', panel: 'browser' },
-  browse: { icon: 'fa-globe', label: 'Navegador', panel: 'browser' },
-  browse_result: { icon: 'fa-globe', label: 'Página leída', panel: 'browser' },
-  browser_action: { icon: 'fa-arrow-pointer', label: 'Navegador', panel: 'browser' },
-  browser_screenshot: { icon: 'fa-camera', label: 'Captura', panel: 'browser' },
-  port_exposed: { icon: 'fa-link', label: 'Servicio publicado', panel: 'log' },
-  assistant_message: { icon: 'fa-comment', label: 'Mensaje', panel: 'log' },
-  user_message: { icon: 'fa-user', label: 'Usuario', panel: 'log' },
-  finished: { icon: 'fa-flag-checkered', label: 'Completada', panel: 'log' },
-  paused: { icon: 'fa-pause', label: 'Pausada', panel: 'log' },
-  stopped: { icon: 'fa-stop', label: 'Detenida', panel: 'log' },
-  tool_error: { icon: 'fa-circle-exclamation', label: 'Fallo de herramienta', panel: 'log' },
-  strategy_recovery: { icon: 'fa-route', label: 'Cambio de estrategia', panel: 'log' },
-  tool_rejected: { icon: 'fa-shield-halved', label: 'Llamada repetida bloqueada', panel: 'log' },
-  error: { icon: 'fa-triangle-exclamation', label: 'Error', panel: 'log' },
+const EVENT_META: Record<string, { icon: string; label: string; panel: RuntimeTab; tone: string }> = {
+  task_started: { icon: 'fa-play', label: 'Ejecución iniciada', panel: 'activity', tone: 'text-emerald-300' },
+  thinking: { icon: 'fa-sparkles', label: 'Razonando', panel: 'activity', tone: 'text-violet-300' },
+  plan: { icon: 'fa-diagram-project', label: 'Plan actualizado', panel: 'activity', tone: 'text-sky-300' },
+  plan_updated: { icon: 'fa-diagram-project', label: 'Plan actualizado', panel: 'activity', tone: 'text-sky-300' },
+  tool_call: { icon: 'fa-wand-magic-sparkles', label: 'Herramienta', panel: 'activity', tone: 'text-amber-300' },
+  tool_result: { icon: 'fa-terminal', label: 'Resultado', panel: 'terminal', tone: 'text-emerald-300' },
+  terminal_start: { icon: 'fa-terminal', label: 'Terminal', panel: 'terminal', tone: 'text-emerald-300' },
+  terminal_output: { icon: 'fa-terminal', label: 'Terminal', panel: 'terminal', tone: 'text-emerald-300' },
+  file_write: { icon: 'fa-file-circle-plus', label: 'Archivo creado', panel: 'files', tone: 'text-sky-300' },
+  file_edit: { icon: 'fa-file-pen', label: 'Archivo actualizado', panel: 'files', tone: 'text-sky-300' },
+  file_read: { icon: 'fa-file-lines', label: 'Archivo leído', panel: 'files', tone: 'text-sky-300' },
+  file_list: { icon: 'fa-folder-tree', label: 'Workspace', panel: 'files', tone: 'text-sky-300' },
+  web_search: { icon: 'fa-magnifying-glass', label: 'Búsqueda', panel: 'web', tone: 'text-fuchsia-300' },
+  web_search_result: { icon: 'fa-magnifying-glass', label: 'Resultados', panel: 'web', tone: 'text-fuchsia-300' },
+  web_read: { icon: 'fa-book-open', label: 'Página revisada', panel: 'web', tone: 'text-fuchsia-300' },
+  browse: { icon: 'fa-globe', label: 'Navegador', panel: 'web', tone: 'text-fuchsia-300' },
+  browse_result: { icon: 'fa-globe', label: 'Página revisada', panel: 'web', tone: 'text-fuchsia-300' },
+  browser_action: { icon: 'fa-arrow-pointer', label: 'Acción web', panel: 'web', tone: 'text-fuchsia-300' },
+  browser_screenshot: { icon: 'fa-camera', label: 'Captura web', panel: 'web', tone: 'text-fuchsia-300' },
+  port_exposed: { icon: 'fa-link', label: 'Servicio publicado', panel: 'activity', tone: 'text-emerald-300' },
+  assistant_message: { icon: 'fa-comment-dots', label: 'Respuesta', panel: 'activity', tone: 'text-slate-300' },
+  user_message: { icon: 'fa-user', label: 'Instrucción', panel: 'activity', tone: 'text-slate-300' },
+  strategy_recovery: { icon: 'fa-route', label: 'Cambio de estrategia', panel: 'activity', tone: 'text-cyan-300' },
+  tool_rejected: { icon: 'fa-shield-halved', label: 'Repetición bloqueada', panel: 'activity', tone: 'text-orange-300' },
+  tool_error: { icon: 'fa-triangle-exclamation', label: 'Herramienta con error', panel: 'activity', tone: 'text-red-300' },
+  finished: { icon: 'fa-circle-check', label: 'Resultado entregado', panel: 'activity', tone: 'text-emerald-300' },
+  paused: { icon: 'fa-circle-pause', label: 'Ejecución pausada', panel: 'activity', tone: 'text-amber-300' },
+  stopped: { icon: 'fa-circle-stop', label: 'Ejecución detenida', panel: 'activity', tone: 'text-slate-400' },
+  error: { icon: 'fa-circle-xmark', label: 'Error de ejecución', panel: 'activity', tone: 'text-red-300' },
 };
 
-const STATUS_BADGE: Record<string, { text: string; cls: string }> = {
-  en_curso: { text: 'En curso', cls: 'bg-blue-100 text-blue-700' },
-  completada: { text: 'Completada', cls: 'bg-green-100 text-green-700' },
-  pausada: { text: 'Pausada', cls: 'bg-amber-100 text-amber-700' },
-  detenida: { text: 'Detenida', cls: 'bg-gray-200 text-gray-600' },
-  error: { text: 'Error', cls: 'bg-red-100 text-red-700' },
-  pendiente: { text: 'Pendiente', cls: 'bg-gray-100 text-gray-500' },
+const STATUS_META: Record<string, { text: string; className: string; dot: string }> = {
+  en_curso: { text: 'En curso', className: 'border-violet-400/25 bg-violet-400/10 text-violet-200', dot: 'bg-violet-300 animate-pulse' },
+  completada: { text: 'Completada', className: 'border-emerald-400/25 bg-emerald-400/10 text-emerald-200', dot: 'bg-emerald-300' },
+  pausada: { text: 'Pausada', className: 'border-amber-400/25 bg-amber-400/10 text-amber-200', dot: 'bg-amber-300' },
+  detenida: { text: 'Detenida', className: 'border-slate-500/35 bg-slate-500/10 text-slate-300', dot: 'bg-slate-400' },
+  error: { text: 'Error', className: 'border-red-400/25 bg-red-400/10 text-red-200', dot: 'bg-red-300' },
+  pendiente: { text: 'Pendiente', className: 'border-slate-500/35 bg-slate-500/10 text-slate-300', dot: 'bg-slate-400' },
 };
+
+function eventSummary(event: Evento): string {
+  if (event.type === 'thinking') return event.texto || `Iteración ${event.iteracion || 'actual'}: preparando la siguiente acción.`;
+  if (event.type === 'tool_call') return `${event.herramienta || 'herramienta'} · ${event.argumentos || 'sin argumentos visibles'}`;
+  if (event.type === 'tool_result') return event.salida || '(herramienta terminada sin salida)';
+  if (event.type === 'terminal_output') return `${event.comando ? `$ ${event.comando}\n` : ''}${event.salida || ''}`;
+  if (event.type === 'plan' || event.type === 'plan_updated') return Array.isArray(event.fases) ? `${event.fases.length} fases sincronizadas.` : 'Plan sincronizado.';
+  if (event.type === 'strategy_recovery') return `El agente revisa el último resultado de ${event.herramienta || 'la herramienta'} antes de continuar.`;
+  if (event.type === 'tool_rejected' || event.type === 'tool_error' || event.type === 'paused' || event.type === 'error') return event.mensaje || 'Se requiere una estrategia distinta.';
+  if (event.type === 'finished') return event.resumen || 'Resultado listo.';
+  if (event.type === 'file_write' || event.type === 'file_edit' || event.type === 'file_read') return event.ruta || 'Archivo procesado.';
+  if (event.type === 'web_search') return event.consulta || 'Búsqueda ejecutada.';
+  if (event.type === 'browse' || event.type === 'browser_action') return event.url || event.accion || 'Acción de navegador ejecutada.';
+  return event.texto || event.resultado || event.mensaje || 'Evento registrado.';
+}
+
+function eventTime(event: Evento): string {
+  if (!event.ts) return 'Ahora';
+  const date = new Date(event.ts);
+  return Number.isNaN(date.valueOf()) ? 'Ahora' : date.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' });
+}
 
 export default function ZocoComputer() {
   const { token } = useAuth();
@@ -83,11 +87,12 @@ export default function ZocoComputer() {
   const [input, setInput] = useState('');
   const [model, setModel] = useState('zoco-max');
   const [creating, setCreating] = useState(false);
-  const [computerTab, setComputerTab] = useState<'auto' | 'terminal' | 'editor' | 'browser' | 'log'>('auto');
+  const [runtimeTab, setRuntimeTab] = useState<RuntimeTab>('all');
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const esRef = useRef<EventSource | null>(null);
+  const [showTaskRail, setShowTaskRail] = useState(true);
+  const eventSourceRef = useRef<EventSource | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
-  const computerEndRef = useRef<HTMLDivElement>(null);
+  const runtimeEndRef = useRef<HTMLDivElement>(null);
   const lastEventIdRef = useRef(0);
 
   const headers = useCallback((): HeadersInit => ({
@@ -95,114 +100,107 @@ export default function ZocoComputer() {
     Authorization: `Bearer ${token}`,
   }), [token]);
 
-  /* ── Carga de tareas ── */
   const loadTasks = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/computer/tasks`, { headers: headers() });
-      if (res.ok) setTasks(await res.json());
-    } catch { /* silencioso */ }
+      const response = await fetch(`${API_BASE}/api/computer/tasks`, { headers: headers() });
+      if (response.ok) setTasks(await response.json());
+    } catch { /* La pantalla conserva la última lista disponible. */ }
   }, [headers]);
 
-  useEffect(() => { loadTasks(); }, [loadTasks]);
+  useEffect(() => { void loadTasks(); }, [loadTasks]);
 
-  /* ── SSE: eventos en vivo de la tarea activa ── */
   const connectStream = useCallback((taskId: string) => {
-    esRef.current?.close();
-    const es = new EventSource(`${API_BASE}/api/computer/tasks/${taskId}/events?token=${encodeURIComponent(token || '')}&lastEventId=${lastEventIdRef.current}`);
-    es.onmessage = (e) => {
+    eventSourceRef.current?.close();
+    const stream = new EventSource(`${API_BASE}/api/computer/tasks/${taskId}/events?token=${encodeURIComponent(token || '')}&lastEventId=${lastEventIdRef.current}`);
+    stream.onmessage = (raw) => {
       try {
-        const ev: Evento = JSON.parse(e.data);
-        // El número de secuencia viaja en el campo `id:` del protocolo SSE, que
-        // el navegador expone como `lastEventId`; el cuerpo JSON no lo repite.
-        const seq = parseInt(e.lastEventId || '0', 10);
-        if (seq) lastEventIdRef.current = Math.max(lastEventIdRef.current, seq);
-        setEvents(prev => [...prev.slice(-499), { ...ev, id: seq || ev.id }]);
-        if ((ev.type === 'plan_updated' || ev.type === 'plan') && Array.isArray(ev.fases)) setPlan(ev.fases);
-        if (ev.type === 'assistant_message') setMessages(prev => [...prev, { role: 'assistant', content: ev.texto }]);
-        if (ev.type === 'finished') {
-          setMessages(prev => [...prev, { role: 'assistant', content: ev.resumen }]);
-          setActiveTask(prev => prev ? { ...prev, status: 'completada' } : prev);
-          loadTasks();
+        const event: Evento = JSON.parse(raw.data);
+        const sequence = Number.parseInt(raw.lastEventId || '0', 10);
+        if (sequence) lastEventIdRef.current = Math.max(lastEventIdRef.current, sequence);
+        setEvents(previous => [...previous.slice(-499), { ...event, id: sequence || event.id }]);
+        if ((event.type === 'plan_updated' || event.type === 'plan') && Array.isArray(event.fases)) setPlan(event.fases);
+        if (event.type === 'assistant_message') setMessages(previous => [...previous, { role: 'assistant', content: event.texto || event.mensaje || '' }]);
+        if (event.type === 'finished') {
+          setMessages(previous => [...previous, { role: 'assistant', content: event.resumen || 'Resultado listo.' }]);
+          setActiveTask(previous => previous ? { ...previous, status: 'completada' } : previous);
+          void loadTasks();
         }
-        if (ev.type === 'paused') setActiveTask(prev => prev ? { ...prev, status: 'pausada' } : prev);
-        if (ev.type === 'stopped') setActiveTask(prev => prev ? { ...prev, status: 'detenida' } : prev);
-        if (ev.type === 'error') setActiveTask(prev => prev ? { ...prev, status: 'error' } : prev);
-      } catch { /* evento malformado */ }
+        if (event.type === 'paused') setActiveTask(previous => previous ? { ...previous, status: 'pausada' } : previous);
+        if (event.type === 'stopped') setActiveTask(previous => previous ? { ...previous, status: 'detenida' } : previous);
+        if (event.type === 'error') setActiveTask(previous => previous ? { ...previous, status: 'error' } : previous);
+      } catch { /* Un evento malformado no interrumpe el stream. */ }
     };
-    es.onerror = () => { /* EventSource reintenta solo */ };
-    esRef.current = es;
-  }, [token, loadTasks]);
+    stream.onerror = () => { /* EventSource realiza la reconexión. */ };
+    eventSourceRef.current = stream;
+  }, [loadTasks, token]);
 
-  useEffect(() => () => esRef.current?.close(), []);
+  useEffect(() => () => eventSourceRef.current?.close(), []);
 
-  /* ── Abrir una tarea existente ── */
   const openTask = useCallback(async (taskId: string) => {
     try {
-      const res = await fetch(`${API_BASE}/api/computer/tasks/${taskId}`, { headers: headers() });
-      if (!res.ok) return;
-      const data = await res.json();
+      const response = await fetch(`${API_BASE}/api/computer/tasks/${taskId}`, { headers: headers() });
+      if (!response.ok) return;
+      const data = await response.json();
       setActiveTask({ id: data.id, title: data.title, status: data.status, model: data.model });
       setMessages(data.messages || data.mensajes || []);
       setPlan(data.plan || []);
-      const evs = data.events || data.eventos || [];
-      setEvents(evs);
-      // El detalle devuelve el número de secuencia como `seq`.
-      lastEventIdRef.current = evs.length
-        ? Math.max(...evs.map((e: Evento & { seq?: number }) => e.seq || e.id || 0))
-        : 0;
+      const loadedEvents = data.events || data.eventos || [];
+      setEvents(loadedEvents);
+      lastEventIdRef.current = loadedEvents.length ? Math.max(...loadedEvents.map((event: Evento & { seq?: number }) => event.seq || event.id || 0)) : 0;
       connectStream(taskId);
-    } catch { /* silencioso */ }
-  }, [headers, connectStream]);
+    } catch { /* Se mantiene el estado de la tarea anterior. */ }
+  }, [connectStream, headers]);
 
-  /* ── Crear tarea nueva ── */
   const createTask = useCallback(async () => {
     const prompt = input.trim();
     if (!prompt || creating) return;
     setCreating(true);
     setInput('');
     try {
-      const res = await fetch(`${API_BASE}/api/computer/tasks`, {
+      const response = await fetch(`${API_BASE}/api/computer/tasks`, {
         method: 'POST', headers: headers(), body: JSON.stringify({ prompt, model }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Error al crear la tarea');
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'No se pudo iniciar la tarea');
       setActiveTask({ id: data.id, title: data.title, status: 'en_curso', model });
       setMessages([{ role: 'user', content: prompt }]);
       setPlan([]);
       setEvents([]);
       lastEventIdRef.current = 0;
       connectStream(data.id);
-      loadTasks();
-    } catch (e: any) {
-      setMessages(prev => [...prev, { role: 'assistant', content: `⚠️ ${e.message}` }]);
+      void loadTasks();
+    } catch (error: any) {
+      setMessages(previous => [...previous, { role: 'assistant', content: `No se pudo iniciar la tarea: ${error.message}` }]);
     } finally {
       setCreating(false);
     }
-  }, [input, creating, model, headers, connectStream, loadTasks]);
+  }, [connectStream, creating, headers, input, loadTasks, model]);
 
-  /* ── Enviar mensaje a la tarea activa ── */
-  const sendMessage = useCallback(async () => {
-    const content = input.trim();
+  const sendMessage = useCallback(async (contentOverride?: string) => {
+    const content = (contentOverride ?? input).trim();
     if (!content || !activeTask) return;
     setInput('');
-    setMessages(prev => [...prev, { role: 'user', content }]);
+    setMessages(previous => [...previous, { role: 'user', content }]);
     try {
-      const res = await fetch(`${API_BASE}/api/computer/tasks/${activeTask.id}/messages`, {
+      const response = await fetch(`${API_BASE}/api/computer/tasks/${activeTask.id}/messages`, {
         method: 'POST', headers: headers(), body: JSON.stringify({ content }),
       });
-      if (res.ok) setActiveTask(prev => prev ? { ...prev, status: 'en_curso' } : prev);
-    } catch { /* silencioso */ }
-  }, [input, activeTask, headers]);
+      if (response.ok) {
+        setActiveTask(previous => previous ? { ...previous, status: 'en_curso' } : previous);
+        void loadTasks();
+      }
+    } catch { /* El mensaje permanece visible para conservar contexto. */ }
+  }, [activeTask, headers, input, loadTasks]);
 
   const stopTask = useCallback(async () => {
     if (!activeTask) return;
-    await fetch(`${API_BASE}/api/computer/tasks/${activeTask.id}/stop`, { method: 'POST', headers: headers() }).catch(() => {});
-    setActiveTask(prev => prev ? { ...prev, status: 'detenida' } : prev);
-    loadTasks();
+    await fetch(`${API_BASE}/api/computer/tasks/${activeTask.id}/stop`, { method: 'POST', headers: headers() }).catch(() => undefined);
+    setActiveTask(previous => previous ? { ...previous, status: 'detenida' } : previous);
+    void loadTasks();
   }, [activeTask, headers, loadTasks]);
 
-  const newTask = useCallback(() => {
-    esRef.current?.close();
+  const startNewTask = useCallback(() => {
+    eventSourceRef.current?.close();
     setActiveTask(null);
     setMessages([]);
     setPlan([]);
@@ -212,295 +210,56 @@ export default function ZocoComputer() {
   }, []);
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, plan]);
-  useEffect(() => { computerEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [events]);
-
-  /* ── Eventos filtrados según pestaña del ordenador ── */
-  const visibleEvents = events.filter(ev => {
-    const meta = EVENT_META[ev.type];
-    if (!meta) return false;
-    if (computerTab === 'auto' || computerTab === 'log') return true;
-    return meta.panel === computerTab;
-  });
+  useEffect(() => { runtimeEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [events]);
 
   const running = activeTask?.status === 'en_curso';
-  const badge = STATUS_BADGE[activeTask?.status || 'pendiente'] || STATUS_BADGE.pendiente;
+  const status = STATUS_META[activeTask?.status || 'pendiente'] || STATUS_META.pendiente;
+  const visibleEvents = events.filter(event => runtimeTab === 'all' || EVENT_META[event.type]?.panel === runtimeTab || (runtimeTab === 'activity' && EVENT_META[event.type]?.panel === 'activity'));
+  const activityEvents = events.filter(event => ['thinking', 'plan', 'plan_updated', 'tool_call', 'strategy_recovery', 'tool_rejected', 'tool_error', 'finished', 'paused', 'error'].includes(event.type)).slice(-8);
+  const currentModel = MODEL_OPTIONS.find(option => option.value === (activeTask?.model || model)) || MODEL_OPTIONS[0];
 
   return (
-    <div className="h-screen flex bg-[#f5f5f4] text-gray-800 overflow-hidden">
-      {/* ══ Barra lateral: historial de tareas ══ */}
-      <aside className={`${sidebarOpen ? 'w-64' : 'w-0'} transition-all duration-200 bg-white border-r border-gray-200 flex flex-col overflow-hidden shrink-0`}>
-        <div className="p-3 border-b border-gray-100 flex items-center justify-between">
-          <Link to="/" className="text-sm font-semibold text-gray-700 hover:text-blue-600 flex items-center gap-2">
-            <i className="fa-solid fa-arrow-left text-xs" /> Zoco IA
-          </Link>
-          <button onClick={newTask} className="text-xs bg-gray-900 text-white px-2.5 py-1.5 rounded-lg hover:bg-gray-700">
-            <i className="fa-solid fa-plus mr-1" /> Nueva
-          </button>
-        </div>
-        <div className="flex-1 overflow-y-auto p-2 space-y-1">
-          {tasks.length === 0 && <p className="text-xs text-gray-400 p-3">Sin tareas todavía. Crea la primera.</p>}
-          {tasks.map(t => (
-            <button
-              key={t.id}
-              onClick={() => openTask(t.id)}
-              className={`w-full text-left p-2.5 rounded-lg text-xs hover:bg-gray-100 ${activeTask?.id === t.id ? 'bg-blue-50 border border-blue-200' : 'border border-transparent'}`}
-            >
-              <p className="font-medium text-gray-700 truncate">{t.title}</p>
-              <span className={`inline-block mt-1 px-1.5 py-0.5 rounded text-[10px] ${(STATUS_BADGE[t.status] || STATUS_BADGE.pendiente).cls}`}>
-                {(STATUS_BADGE[t.status] || STATUS_BADGE.pendiente).text}
-              </span>
-            </button>
-          ))}
-        </div>
-      </aside>
-
-      {/* ══ Columna central: conversación + plan ══ */}
-      <main className="flex-1 flex flex-col min-w-0">
-        <header className="h-14 bg-white border-b border-gray-200 flex items-center px-4 gap-3 shrink-0">
-          <button onClick={() => setSidebarOpen(o => !o)} className="text-gray-500 hover:text-gray-800">
-            <i className="fa-solid fa-bars" />
-          </button>
-          <div className="flex items-center gap-2 min-w-0">
-            <div className="w-8 h-8 rounded-lg bg-gray-900 text-white flex items-center justify-center shrink-0">
-              <i className="fa-solid fa-desktop text-sm" />
-            </div>
-            <div className="min-w-0">
-              <h1 className="text-sm font-bold truncate">{activeTask ? activeTask.title : 'El Ordenador de Zoco'}</h1>
-              <p className="text-[11px] text-gray-400">Agente autónomo general</p>
-            </div>
+    <div className="h-[100dvh] overflow-hidden bg-[#0b0d12] text-[#edf0f7] selection:bg-violet-400/30">
+      <div className="flex h-full min-w-[980px]">
+        <aside className={`${sidebarOpen ? 'w-[270px]' : 'w-0'} relative flex shrink-0 flex-col overflow-hidden border-r border-white/[.08] bg-[#101218] transition-all duration-300`}>
+          <div className="flex h-16 items-center justify-between border-b border-white/[.08] px-4">
+            <Link to="/" className="flex items-center gap-2 text-sm font-bold tracking-[-.02em] text-white"><span className="grid h-7 w-7 place-items-center rounded-lg bg-gradient-to-br from-violet-400 to-sky-300 text-xs text-[#12131a]"><i className="fa-solid fa-bolt" /></span>Zoco IA</Link>
+            <button onClick={startNewTask} className="rounded-lg bg-white px-3 py-1.5 text-xs font-bold text-[#11131a] transition hover:bg-violet-100"><i className="fa-solid fa-plus mr-1.5" />Nueva</button>
           </div>
-          <div className="ml-auto flex items-center gap-2">
-            {activeTask && (
-              <span className={`text-[11px] px-2 py-1 rounded-full font-medium ${badge.cls}`}>
-                {running && <i className="fa-solid fa-circle-notch fa-spin mr-1" />}
-                {badge.text}
-              </span>
-            )}
-            {running && (
-              <button onClick={stopTask} className="text-xs bg-red-50 text-red-600 border border-red-200 px-2.5 py-1.5 rounded-lg hover:bg-red-100">
-                <i className="fa-solid fa-stop mr-1" /> Detener
-              </button>
-            )}
+          <div className="flex items-center gap-2 px-4 pt-4 text-[10px] font-bold tracking-[.16em] text-slate-500"><span>ESPACIO DE TRABAJO</span><span className="h-px flex-1 bg-white/[.07]" /></div>
+          <div className="px-3 pb-4 pt-3">
+            <button onClick={() => setShowTaskRail(value => !value)} className="flex w-full items-center justify-between rounded-xl border border-white/[.08] bg-white/[.035] px-3 py-2.5 text-left text-xs text-slate-300 hover:bg-white/[.07]"><span className="flex items-center gap-2"><i className="fa-solid fa-layer-group text-violet-300" />Tareas autónomas</span><span className="rounded-md bg-white/[.07] px-1.5 py-0.5 text-[10px]">{tasks.length}</span></button>
           </div>
-        </header>
+          {showTaskRail && <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-4"><p className="mb-2 px-2 text-[10px] font-bold tracking-[.14em] text-slate-500">EJECUCIONES RECIENTES</p><div className="space-y-1.5">{tasks.length ? tasks.map(task => { const taskStatus = STATUS_META[task.status] || STATUS_META.pendiente; return <button key={task.id} onClick={() => void openTask(task.id)} className={`w-full rounded-xl border p-3 text-left transition ${activeTask?.id === task.id ? 'border-violet-400/35 bg-violet-400/[.12] shadow-[0_8px_28px_rgba(89,76,255,.12)]' : 'border-transparent bg-white/[.018] hover:border-white/[.08] hover:bg-white/[.055]'}`}><div className="flex items-start gap-2"><span className={`mt-1 h-1.5 w-1.5 shrink-0 rounded-full ${taskStatus.dot}`} /><span className="line-clamp-2 flex-1 text-xs font-semibold leading-5 text-slate-100">{task.title}</span></div><span className={`mt-2 inline-flex items-center gap-1 rounded-full border px-2 py-1 text-[9px] font-bold ${taskStatus.className}`}>{taskStatus.text}</span></button>; }) : <p className="rounded-xl border border-dashed border-white/[.09] px-3 py-5 text-center text-xs leading-5 text-slate-500">Crea una tarea para iniciar tu primer flujo autónomo.</p>}</div></div>}
+          <div className="border-t border-white/[.08] p-4"><div className="rounded-xl bg-white/[.035] p-3"><p className="text-xs font-semibold text-slate-300">Ordenador disponible</p><p className="mt-1 text-[11px] leading-4 text-slate-500">Terminal, archivos y navegador se muestran durante la ejecución.</p></div></div>
+        </aside>
 
-        <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
-          {!activeTask && (
-            <div className="max-w-xl mx-auto mt-16 text-center">
-              <div className="w-16 h-16 rounded-2xl bg-gray-900 text-white flex items-center justify-center mx-auto mb-4">
-                <i className="fa-solid fa-desktop text-2xl" />
-              </div>
-              <h2 className="text-xl font-bold mb-2">¿Qué quieres que haga por ti?</h2>
-              <p className="text-sm text-gray-500 mb-6">
-                Describe cualquier tarea: investigar un tema, escribir un informe, analizar datos,
-                programar un script… El agente planifica, ejecuta herramientas reales y te entrega el resultado.
-              </p>
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
-                {['Investiga las últimas tendencias de IA y escribe un informe', 'Crea un script en Python que analice un CSV', 'Busca información sobre mi competencia y resúmela'].map(s => (
-                  <button key={s} onClick={() => setInput(s)} className="p-3 bg-white border border-gray-200 rounded-xl hover:border-blue-300 hover:bg-blue-50 text-gray-600 text-left">
-                    {s}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
+        <main className="flex min-w-0 flex-1 flex-col bg-[#f7f8fb] text-[#171923]">
+          <header className="flex h-16 shrink-0 items-center gap-3 border-b border-[#e4e6ec] bg-white px-4">
+            <button onClick={() => setSidebarOpen(value => !value)} className="grid h-9 w-9 place-items-center rounded-lg text-slate-500 hover:bg-slate-100"><i className="fa-solid fa-bars" /></button>
+            <div className="min-w-0"><div className="flex items-center gap-2"><span className="grid h-7 w-7 place-items-center rounded-md bg-[#171923] text-xs text-white"><i className="fa-solid fa-robot" /></span><h1 className="truncate text-sm font-bold">{activeTask?.title || 'Agente autónomo Zoco'}</h1></div><p className="ml-9 mt-0.5 text-[11px] text-slate-400">{currentModel.label} · {currentModel.description}</p></div>
+            <div className="ml-auto flex items-center gap-2">{activeTask && <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1.5 text-[10px] font-bold ${status.className}`}><span className={`h-1.5 w-1.5 rounded-full ${status.dot}`} />{status.text}</span>}{running && <button onClick={() => void stopTask()} className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-bold text-red-600 hover:bg-red-100"><i className="fa-solid fa-stop mr-1.5" />Detener</button>}</div>
+          </header>
 
-          {messages.map((m, i) => (
-            <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-sm whitespace-pre-wrap ${m.role === 'user' ? 'bg-gray-900 text-white' : 'bg-white border border-gray-200 text-gray-800'}`}>
-                {m.content}
-              </div>
-            </div>
-          ))}
+          <section className="min-h-0 flex-1 overflow-y-auto px-5 py-5 xl:px-8">
+            {!activeTask && <div className="mx-auto flex min-h-full max-w-2xl flex-col items-center justify-center pb-20 text-center"><div className="grid h-16 w-16 place-items-center rounded-2xl bg-gradient-to-br from-[#1c2151] to-[#725cff] text-2xl text-white shadow-[0_18px_45px_rgba(82,71,211,.3)]"><i className="fa-solid fa-wand-magic-sparkles" /></div><h2 className="mt-6 text-3xl font-bold tracking-[-.055em]">Delega un objetivo completo.</h2><p className="mt-3 max-w-xl text-sm leading-6 text-slate-500">Zoco convierte tu petición en un plan, usa herramientas reales y mantiene visible cada decisión en el espacio de trabajo.</p><div className="mt-8 grid w-full gap-3 text-left sm:grid-cols-3">{['Investiga el mercado y prepara un informe con fuentes.', 'Analiza los archivos del workspace y resume los hallazgos.', 'Crea una aplicación y valida los pasos principales.'].map(suggestion => <button key={suggestion} onClick={() => setInput(suggestion)} className="rounded-2xl border border-[#e5e7ef] bg-white p-4 text-xs leading-5 text-slate-600 shadow-sm transition hover:-translate-y-0.5 hover:border-violet-300 hover:shadow-md">{suggestion}<i className="fa-solid fa-arrow-up-right-from-square ml-2 text-violet-500" /></button>)}</div></div>}
+            {activeTask && <div className="mx-auto max-w-3xl space-y-5"><div className="rounded-2xl border border-[#e2e5ed] bg-white p-5 shadow-[0_8px_30px_rgba(16,24,40,.04)]"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-xs font-bold tracking-[.14em] text-violet-600">EJECUCIÓN ACTUAL</p><p className="mt-2 text-sm leading-6 text-slate-500">{running ? 'El agente está coordinando el plan y las herramientas.' : activeTask.status === 'pausada' ? 'La ejecución conserva el contexto y puede reanudarse con una estrategia distinta.' : 'Consulta la actividad, el plan y los resultados de esta tarea.'}</p></div>{activeTask.status === 'pausada' && <button onClick={() => void sendMessage('Reanuda la tarea revisando el último resultado. Cambia de estrategia o herramienta; no repitas la misma llamada con los mismos argumentos.')} className="rounded-xl bg-[#171923] px-4 py-2.5 text-xs font-bold text-white hover:bg-[#2b2e3c]"><i className="fa-solid fa-rotate-right mr-1.5" />Reanudar con otra estrategia</button>}</div></div>
+              {messages.map((message, index) => <div key={`${message.role}-${index}`} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}><div className={`max-w-[88%] rounded-2xl px-4 py-3 text-sm leading-6 shadow-sm ${message.role === 'user' ? 'bg-[#171923] text-white' : 'border border-[#e3e5eb] bg-white text-slate-700'}`}>{message.content}</div></div>)}
+              {plan.length > 0 && <section className="rounded-2xl border border-[#e3e5eb] bg-white p-5"><div className="flex items-center justify-between"><p className="text-xs font-bold tracking-[.14em] text-slate-500"><i className="fa-solid fa-diagram-project mr-2 text-violet-500" />PLAN VIVO</p><span className="text-[10px] font-semibold text-slate-400">{plan.filter(phase => phase.estado === 'completada').length}/{plan.length} completadas</span></div><ol className="mt-4 space-y-3">{plan.map((phase, index) => <li key={`${phase.titulo}-${index}`} className="flex items-center gap-3"><span className={`grid h-6 w-6 place-items-center rounded-full text-[10px] font-bold ${phase.estado === 'completada' ? 'bg-emerald-100 text-emerald-700' : phase.estado === 'en_curso' ? 'bg-violet-100 text-violet-700' : 'bg-slate-100 text-slate-500'}`}>{phase.estado === 'completada' ? <i className="fa-solid fa-check" /> : phase.estado === 'en_curso' ? <i className="fa-solid fa-spinner fa-spin" /> : index + 1}</span><span className={`text-sm ${phase.estado === 'completada' ? 'text-slate-400 line-through' : phase.estado === 'en_curso' ? 'font-semibold text-slate-800' : 'text-slate-500'}`}>{phase.titulo}</span></li>)}</ol></section>}
+              {activityEvents.length > 0 && <section className="rounded-2xl border border-[#e3e5eb] bg-white p-5"><p className="text-xs font-bold tracking-[.14em] text-slate-500"><i className="fa-solid fa-timeline mr-2 text-violet-500" />CRONOLOGÍA RECIENTE</p><div className="mt-4 space-y-3">{activityEvents.map((event, index) => { const meta = EVENT_META[event.type] || { icon: 'fa-circle-info', label: event.type, tone: 'text-slate-500' }; return <article key={event.id || `${event.type}-${index}`} className="flex gap-3"><span className={`mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-slate-50 text-xs ${meta.tone}`}><i className={`fa-solid ${meta.icon}`} /></span><div className="min-w-0 flex-1 border-b border-slate-100 pb-3"><div className="flex items-center justify-between gap-3"><b className="text-xs text-slate-700">{meta.label}</b><span className="text-[10px] text-slate-400">{eventTime(event)}</span></div><p className="mt-1 whitespace-pre-wrap break-words text-xs leading-5 text-slate-500">{eventSummary(event)}</p></div></article>; })}</div></section>}
+              {running && <div className="flex items-center gap-2 px-2 text-xs text-violet-600"><span className="h-2 w-2 animate-pulse rounded-full bg-violet-500" />Zoco está trabajando sobre la siguiente fase.</div>}
+              <div ref={chatEndRef} />
+            </div>}
+          </section>
+          <footer className="border-t border-[#e4e6ec] bg-white p-4"><div className="mx-auto flex max-w-3xl items-end gap-2 rounded-2xl border border-[#dfe2eb] bg-[#fbfcff] p-2 shadow-sm"><div className="hidden rounded-xl bg-[#f0f1f6] px-2 py-2 text-[10px] font-bold text-slate-500 sm:block">{activeTask ? 'CONTEXTO ACTIVO' : currentModel.label.toUpperCase()}</div><textarea value={input} onChange={event => setInput(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (activeTask) void sendMessage(); else void createTask(); } }} placeholder={activeTask ? 'Añade una instrucción, un criterio o una nueva prioridad…' : 'Describe lo que quieres delegar al agente…'} rows={1} className="min-h-[40px] flex-1 resize-none bg-transparent px-2 py-2 text-sm text-slate-700 outline-none placeholder:text-slate-400" /><button onClick={() => { if (activeTask) void sendMessage(); else void createTask(); }} disabled={creating || !input.trim()} className="grid h-10 w-10 place-items-center rounded-xl bg-[#171923] text-white transition hover:bg-violet-700 disabled:cursor-not-allowed disabled:opacity-35"><i className={`fa-solid ${creating ? 'fa-spinner fa-spin' : 'fa-arrow-up'} text-sm`} /></button></div></footer>
+        </main>
 
-          {/* Plan de fases en vivo */}
-          {plan.length > 0 && (
-            <div className="bg-white border border-gray-200 rounded-2xl p-4 max-w-[85%]">
-              <p className="text-xs font-semibold text-gray-500 mb-2 uppercase tracking-wide">
-                <i className="fa-solid fa-list-check mr-1.5" /> Plan de la tarea
-              </p>
-              <ul className="space-y-1.5">
-                {plan.map((f, i) => (
-                  <li key={i} className="flex items-center gap-2 text-sm">
-                    {f.estado === 'completada' && <i className="fa-solid fa-circle-check text-green-500" />}
-                    {f.estado === 'en_curso' && <i className="fa-solid fa-circle-notch fa-spin text-blue-500" />}
-                    {f.estado === 'pendiente' && <i className="fa-regular fa-circle text-gray-300" />}
-                    <span className={f.estado === 'completada' ? 'text-gray-400 line-through' : f.estado === 'en_curso' ? 'font-medium' : 'text-gray-500'}>
-                      {f.titulo}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-
-          {running && (
-            <div className="flex items-center gap-2 text-xs text-gray-400 pl-2">
-              <i className="fa-solid fa-circle-notch fa-spin" /> El agente está trabajando…
-            </div>
-          )}
-          <div ref={chatEndRef} />
-        </div>
-
-        {/* Entrada */}
-        <div className="p-3 bg-white border-t border-gray-200 shrink-0">
-          <div className="flex items-end gap-2 max-w-3xl mx-auto">
-            {!activeTask && (
-              <select value={model} onChange={e => setModel(e.target.value)} className="text-xs border border-gray-200 rounded-lg px-2 py-2.5 bg-gray-50 text-gray-600 shrink-0">
-                {MODEL_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-              </select>
-            )}
-            <textarea
-              value={input}
-              onChange={e => setInput(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); activeTask ? sendMessage() : createTask(); } }}
-              placeholder={activeTask ? 'Envía instrucciones adicionales al agente…' : 'Describe la tarea que quieres delegar…'}
-              rows={1}
-              className="flex-1 resize-none border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-gray-900/10 focus:border-gray-400"
-            />
-            <button
-              onClick={activeTask ? sendMessage : createTask}
-              disabled={creating || !input.trim()}
-              className="bg-gray-900 text-white w-10 h-10 rounded-xl flex items-center justify-center hover:bg-gray-700 disabled:opacity-40 shrink-0"
-            >
-              <i className={`fa-solid ${creating ? 'fa-circle-notch fa-spin' : 'fa-paper-plane'} text-sm`} />
-            </button>
-          </div>
-        </div>
-      </main>
-
-      {/* ══ Columna derecha: el ordenador (visor de acciones) ══ */}
-      <section className="w-[46%] max-w-3xl bg-[#1c1c1e] text-gray-200 flex flex-col border-l border-gray-800 shrink-0 hidden lg:flex">
-        <div className="h-14 flex items-center px-4 gap-3 border-b border-gray-800 shrink-0">
-          <div className="flex gap-1.5">
-            <span className="w-3 h-3 rounded-full bg-red-500/80" />
-            <span className="w-3 h-3 rounded-full bg-yellow-500/80" />
-            <span className="w-3 h-3 rounded-full bg-green-500/80" />
-          </div>
-          <p className="text-xs font-medium text-gray-400">Ordenador de Zoco</p>
-          <div className="ml-auto flex gap-1 text-[11px]">
-            {([['auto', 'Todo'], ['terminal', 'Terminal'], ['editor', 'Editor'], ['browser', 'Navegador']] as const).map(([tab, label]) => (
-              <button
-                key={tab}
-                onClick={() => setComputerTab(tab)}
-                className={`px-2.5 py-1 rounded-md ${computerTab === tab ? 'bg-gray-700 text-white' : 'text-gray-500 hover:text-gray-300'}`}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="flex-1 overflow-y-auto p-3 space-y-2 font-mono text-xs">
-          {visibleEvents.length === 0 && (
-            <div className="text-gray-600 text-center mt-20">
-              <i className="fa-solid fa-display text-3xl mb-3 block" />
-              Las acciones del agente aparecerán aquí en tiempo real.
-            </div>
-          )}
-          {visibleEvents.map((ev, i) => {
-            const meta = EVENT_META[ev.type] || { icon: 'fa-circle-info', label: ev.type, panel: 'log' };
-            return (
-              <div key={ev.id ?? `live-${i}`} className="bg-[#242426] border border-gray-800 rounded-lg overflow-hidden">
-                <div className="flex items-center gap-2 px-3 py-1.5 bg-[#2c2c2e] text-[11px] text-gray-400">
-                  <i className={`fa-solid ${meta.icon}`} />
-                  <span className="font-semibold">{meta.label}</span>
-                  {ev.ts && <span className="ml-auto text-gray-600">{new Date(ev.ts).toLocaleTimeString('es-ES')}</span>}
-                </div>
-                <div className="px-3 py-2 whitespace-pre-wrap break-words text-gray-300">
-                  {ev.type === 'terminal_start' && <span className="text-green-400">$ {ev.comando}</span>}
-                  {ev.type === 'terminal_output' && (
-                    <>
-                      <span className="text-green-400">$ {ev.comando}</span>
-                      {'\n'}
-                      <span className={ev.exitCode === 0 ? 'text-gray-300' : 'text-red-400'}>{ev.salida}</span>
-                    </>
-                  )}
-                  {ev.type === 'tool_result' && (
-                    <>
-                      <span className="text-green-400">$ {ev.comando || ev.herramienta || 'herramienta'}</span>
-                      {'\n'}
-                      <span className={ev.codigo === 0 ? 'text-gray-300' : 'text-red-400'}>{ev.salida || '(sin salida)'}</span>
-                    </>
-                  )}
-                  {ev.type === 'file_write' && (
-                    <>
-                      <span className="text-blue-400">✏ {ev.ruta}</span>
-                      {'\n'}
-                      <span className="text-gray-400">{ev.vista || ev.contenido || '(contenido guardado)'}</span>
-                    </>
-                  )}
-                  {ev.type === 'file_read' && <span className="text-blue-300">📄 Leyendo {ev.ruta}</span>}
-                  {ev.type === 'file_list' && <span className="text-blue-300">📁 Listando workspace ({ev.total} elementos)</span>}
-                  {ev.type === 'web_search' && <span className="text-purple-300">🔍 {ev.consulta}</span>}
-                  {ev.type === 'web_search_result' && <span className="text-gray-400">{ev.resultado}</span>}
-                  {ev.type === 'web_read' && <span className="text-gray-400">{ev.vista || ev.resultado || '(página leída)'}</span>}
-                  {ev.type === 'browse' && <span className="text-cyan-300">🌐 {ev.url}</span>}
-                  {ev.type === 'browse_result' && <span className="text-gray-400">{ev.error ? `✕ ${ev.error}` : ev.extracto}</span>}
-                  {(ev.type === 'plan' || ev.type === 'plan_updated') && Array.isArray(ev.fases) && (
-                    <span className="text-amber-300">
-                      {ev.fases.map((f: Fase, j: number) => `${f.estado === 'completada' ? '✓' : f.estado === 'en_curso' ? '▶' : '○'} ${f.titulo}`).join('\n')}
-                    </span>
-                  )}
-                  {ev.type === 'tool_call' && <span className="text-gray-400">{ev.herramienta}({ev.argumentos})</span>}
-                  {ev.type === 'tool_error' && <span className="text-orange-400">⚠ {ev.herramienta}: {ev.mensaje}</span>}
-                  {ev.type === 'strategy_recovery' && <span className="text-sky-300">↗ Se detectó una repetición de {ev.herramienta}. El agente debe revisar el resultado y elegir una estrategia distinta.</span>}
-                  {ev.type === 'tool_rejected' && <span className="text-amber-300">⛔ {ev.mensaje}</span>}
-                  {/* El razonamiento real del modelo llega en ev.texto; si aún no
-                      ha llegado (primer instante de la iteración) se muestra el
-                      indicador genérico con el número de iteración. */}
-                  {ev.type === 'thinking' && (
-                    ev.texto
-                      ? <span className="text-gray-300 italic whitespace-pre-wrap">{ev.texto}</span>
-                      : <span className="text-gray-500 italic">Iteración {ev.iteracion}: analizando el estado y decidiendo la siguiente acción…</span>
-                  )}
-                  {ev.type === 'file_edit' && (
-                    <>
-                      <span className="text-blue-400">✒ {ev.ruta} · {ev.ediciones} edición(es)</span>
-                      {'\n'}
-                      <span className="text-gray-400">{ev.vista || ev.contenido || '(contenido guardado)'}</span>
-                    </>
-                  )}
-                  {ev.type === 'browser_action' && (
-                    <span className="text-cyan-300">→ {ev.accion}{ev.url ? `: ${ev.url}` : ''}{ev.texto ? `\n${ev.texto}` : ''}</span>
-                  )}
-                  {ev.type === 'browser_screenshot' && (
-                    <div className="space-y-2">
-                      <span className="text-cyan-300 block">{ev.descripcion}</span>
-                      {(ev.captura || ev.imagen) && (
-                        <img
-                          src={ev.captura || ev.imagen}
-                          alt="Captura del navegador del agente"
-                          className="w-full rounded-md border border-gray-700"
-                          loading="lazy"
-                        />
-                      )}
-                      {ev.streamUrl && (
-                        <a href={ev.streamUrl} target="_blank" rel="noreferrer" className="text-blue-400 underline text-[11px] block">
-                          Ver el escritorio en vivo
-                        </a>
-                      )}
-                    </div>
-                  )}
-                  {ev.type === 'port_exposed' && (
-                    ev.url
-                      ? <a href={ev.url} target="_blank" rel="noreferrer" className="text-blue-400 underline">🔗 {ev.url}</a>
-                      : <span className="text-amber-400">{ev.mensaje}</span>
-                  )}
-                  {ev.type === 'assistant_message' && <span className="text-emerald-300">{ev.texto}</span>}
-                  {ev.type === 'user_message' && <span className="text-gray-300">{ev.texto}</span>}
-                  {ev.type === 'finished' && <span className="text-green-400">✓ Tarea completada{Array.isArray(ev.archivos) && ev.archivos.length ? `\nArchivos: ${ev.archivos.join(', ')}` : ''}</span>}
-                  {ev.type === 'error' && <span className="text-red-400">✕ {ev.mensaje}</span>}
-                  {ev.type === 'paused' && <span className="text-amber-400">⏸ {ev.mensaje}</span>}
-                  {ev.type === 'stopped' && <span className="text-gray-500">■ Tarea detenida por el usuario</span>}
-                  {ev.type === 'task_started' && <span className="text-gray-400">▶ {ev.titulo}</span>}
-                </div>
-              </div>
-            );
-          })}
-          <div ref={computerEndRef} />
-        </div>
-      </section>
+        <section className="flex w-[43%] max-w-[700px] shrink-0 flex-col border-l border-white/[.08] bg-[#111319] text-slate-200">
+          <header className="flex h-16 shrink-0 items-center gap-3 border-b border-white/[.08] px-4"><div className="flex gap-1.5"><span className="h-2.5 w-2.5 rounded-full bg-[#ff6f61]" /><span className="h-2.5 w-2.5 rounded-full bg-[#f4c95d]" /><span className="h-2.5 w-2.5 rounded-full bg-[#60d394]" /></div><div><p className="text-xs font-bold text-slate-200">Runtime de Zoco</p><p className="mt-0.5 text-[10px] text-slate-500">Actividad verificable del agente</p></div><div className="ml-auto flex rounded-lg border border-white/[.08] bg-white/[.03] p-0.5">{([['all', 'Todo'], ['terminal', 'Terminal'], ['files', 'Archivos'], ['web', 'Web']] as const).map(([tab, label]) => <button key={tab} onClick={() => setRuntimeTab(tab)} className={`rounded-md px-2.5 py-1.5 text-[10px] font-semibold transition ${runtimeTab === tab ? 'bg-white/[.12] text-white shadow-sm' : 'text-slate-500 hover:text-slate-300'}`}>{label}</button>)}</div></header>
+          <div className="min-h-0 flex-1 overflow-y-auto p-4 font-mono text-xs">{visibleEvents.length === 0 ? <div className="flex h-full flex-col items-center justify-center text-center text-slate-600"><span className="grid h-12 w-12 place-items-center rounded-2xl border border-white/[.08] bg-white/[.02] text-xl"><i className="fa-solid fa-display" /></span><p className="mt-4 text-xs text-slate-500">El ordenador mostrará las acciones verificables del agente.</p><p className="mt-1 max-w-[260px] text-[10px] leading-5 text-slate-600">Terminal, archivos, navegación, resultados y recuperación de estrategia se registrarán aquí.</p></div> : <div className="space-y-2.5">{visibleEvents.map((event, index) => { const meta = EVENT_META[event.type] || { icon: 'fa-circle-info', label: event.type, tone: 'text-slate-400' }; return <article key={event.id || `${event.type}-${index}`} className="overflow-hidden rounded-xl border border-white/[.08] bg-white/[.025]"><header className="flex items-center gap-2 border-b border-white/[.06] bg-white/[.025] px-3 py-2"><i className={`fa-solid ${meta.icon} text-[10px] ${meta.tone}`} /><span className="text-[10px] font-semibold text-slate-300">{meta.label}</span><span className="ml-auto text-[9px] text-slate-600">{eventTime(event)}</span></header><div className="max-h-64 overflow-auto whitespace-pre-wrap break-words px-3 py-3 leading-5 text-slate-400">{event.type === 'browser_screenshot' && (event.captura || event.imagen) ? <><p className="mb-2 text-slate-300">{event.descripcion || 'Captura del agente'}</p><img src={event.captura || event.imagen} alt="Captura del navegador del agente" className="w-full rounded-lg border border-white/[.08]" /></> : eventSummary(event)}</div></article>; })}<div ref={runtimeEndRef} /></div>}</div>
+          <footer className="border-t border-white/[.08] px-4 py-3"><div className="flex items-center justify-between text-[10px] text-slate-500"><span className="flex items-center gap-1.5"><span className={`h-1.5 w-1.5 rounded-full ${running ? 'bg-emerald-400 animate-pulse' : 'bg-slate-600'}`} />{running ? 'Sesión de agente activa' : 'Esperando una tarea'}</span><span>{events.length} eventos en contexto</span></div></footer>
+        </section>
+      </div>
     </div>
   );
 }
