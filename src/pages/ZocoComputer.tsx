@@ -59,6 +59,8 @@ const EVENT_META: Record<string, { icon: string; label: string; panel: string }>
   paused: { icon: 'fa-pause', label: 'Pausada', panel: 'log' },
   stopped: { icon: 'fa-stop', label: 'Detenida', panel: 'log' },
   tool_error: { icon: 'fa-circle-exclamation', label: 'Fallo de herramienta', panel: 'log' },
+  strategy_recovery: { icon: 'fa-route', label: 'Cambio de estrategia', panel: 'log' },
+  tool_rejected: { icon: 'fa-shield-halved', label: 'Llamada repetida bloqueada', panel: 'log' },
   error: { icon: 'fa-triangle-exclamation', label: 'Error', panel: 'log' },
 };
 
@@ -442,6 +444,8 @@ export default function ZocoComputer() {
                   )}
                   {ev.type === 'tool_call' && <span className="text-gray-400">{ev.herramienta}({ev.argumentos})</span>}
                   {ev.type === 'tool_error' && <span className="text-orange-400">⚠ {ev.herramienta}: {ev.mensaje}</span>}
+                  {ev.type === 'strategy_recovery' && <span className="text-sky-300">↗ Se detectó una repetición de {ev.herramienta}. El agente debe revisar el resultado y elegir una estrategia distinta.</span>}
+                  {ev.type === 'tool_rejected' && <span className="text-amber-300">⛔ {ev.mensaje}</span>}
                   {/* El razonamiento real del modelo llega en ev.texto; si aún no
                       ha llegado (primer instante de la iteración) se muestra el
                       indicador genérico con el número de iteración. */}
