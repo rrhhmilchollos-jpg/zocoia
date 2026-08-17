@@ -93,6 +93,7 @@ export default function ZocoComputer() {
   const [input, setInput] = useState('');
   const [model, setModel] = useState('zoco-max');
   const [creating, setCreating] = useState(false);
+  const [creationError, setCreationError] = useState<string | null>(null);
   const [runtimeTab, setRuntimeTab] = useState<RuntimeTab>('all');
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [showTaskRail, setShowTaskRail] = useState(true);
@@ -161,8 +162,10 @@ export default function ZocoComputer() {
     const prompt = input.trim();
     if (!prompt || creating) return;
     setCreating(true);
+    setCreationError(null);
     setInput('');
     try {
+      if (!token) throw new Error('Inicia sesión para crear una tarea autónoma.');
       const response = await fetch(`${API_BASE}/api/computer/tasks`, {
         method: 'POST', headers: headers(), body: JSON.stringify({ prompt, model }),
       });
@@ -176,11 +179,12 @@ export default function ZocoComputer() {
       connectStream(data.id);
       void loadTasks();
     } catch (error: any) {
+      setCreationError(error.message || 'No se pudo iniciar la tarea.');
       setMessages(previous => [...previous, { role: 'assistant', content: `No se pudo iniciar la tarea: ${error.message}` }]);
     } finally {
       setCreating(false);
     }
-  }, [connectStream, creating, headers, input, loadTasks, model]);
+  }, [connectStream, creating, headers, input, loadTasks, model, token]);
 
   const sendMessage = useCallback(async (contentOverride?: string) => {
     const content = (contentOverride ?? input).trim();
@@ -248,7 +252,7 @@ export default function ZocoComputer() {
           </header>
 
           <section className="min-h-0 flex-1 overflow-y-auto px-5 py-5 xl:px-8">
-            {!activeTask && <div className="mx-auto flex min-h-full max-w-2xl flex-col items-center justify-center pb-20 text-center"><div className="grid h-16 w-16 place-items-center rounded-2xl bg-gradient-to-br from-[#1c2151] to-[#725cff] text-2xl text-white shadow-[0_18px_45px_rgba(82,71,211,.3)]"><i className="fa-solid fa-wand-magic-sparkles" /></div><h2 className="mt-6 text-3xl font-bold tracking-[-.055em]">Delega un objetivo completo.</h2><p className="mt-3 max-w-xl text-sm leading-6 text-slate-500">Zoco convierte tu petición en un plan, usa herramientas reales y mantiene visible cada decisión en el espacio de trabajo.</p><div className="mt-8 grid w-full gap-3 text-left sm:grid-cols-3">{['Investiga el mercado y prepara un informe con fuentes.', 'Analiza los archivos del workspace y resume los hallazgos.', 'Crea una aplicación y valida los pasos principales.'].map(suggestion => <button key={suggestion} onClick={() => setInput(suggestion)} className="rounded-2xl border border-[#e5e7ef] bg-white p-4 text-xs leading-5 text-slate-600 shadow-sm transition hover:-translate-y-0.5 hover:border-violet-300 hover:shadow-md">{suggestion}<i className="fa-solid fa-arrow-up-right-from-square ml-2 text-violet-500" /></button>)}</div></div>}
+            {!activeTask && <div className="mx-auto flex min-h-full max-w-2xl flex-col items-center justify-center pb-20 text-center"><div className="grid h-16 w-16 place-items-center rounded-2xl bg-gradient-to-br from-[#1c2151] to-[#725cff] text-2xl text-white shadow-[0_18px_45px_rgba(82,71,211,.3)]"><i className="fa-solid fa-wand-magic-sparkles" /></div><h2 className="mt-6 text-3xl font-bold tracking-[-.055em]">Delega un objetivo completo.</h2><p className="mt-3 max-w-xl text-sm leading-6 text-slate-500">Zoco convierte tu petición en un plan, usa herramientas reales y mantiene visible cada decisión en el espacio de trabajo.</p>{creationError && <p role="alert" className="mt-4 max-w-xl rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{creationError}</p>}<div className="mt-8 grid w-full gap-3 text-left sm:grid-cols-3">{['Investiga el mercado y prepara un informe con fuentes.', 'Analiza los archivos del workspace y resume los hallazgos.', 'Crea una aplicación y valida los pasos principales.'].map(suggestion => <button key={suggestion} onClick={() => setInput(suggestion)} className="rounded-2xl border border-[#e5e7ef] bg-white p-4 text-xs leading-5 text-slate-600 shadow-sm transition hover:-translate-y-0.5 hover:border-violet-300 hover:shadow-md">{suggestion}<i className="fa-solid fa-arrow-up-right-from-square ml-2 text-violet-500" /></button>)}</div></div>}
             {activeTask && <div className="mx-auto max-w-3xl space-y-5"><div className="rounded-2xl border border-[#e2e5ed] bg-white p-5 shadow-[0_8px_30px_rgba(16,24,40,.04)]"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-xs font-bold tracking-[.14em] text-violet-600">EJECUCIÓN ACTUAL</p><p className="mt-2 text-sm leading-6 text-slate-500">{running ? 'El agente está coordinando el plan y las herramientas.' : activeTask.status === 'pausada' ? 'La ejecución conserva el contexto y puede reanudarse con una estrategia distinta.' : 'Consulta la actividad, el plan y los resultados de esta tarea.'}</p></div>{activeTask.status === 'pausada' && <button onClick={() => void sendMessage('Reanuda la tarea revisando el último resultado. Cambia de estrategia o herramienta; no repitas la misma llamada con los mismos argumentos.')} className="rounded-xl bg-[#171923] px-4 py-2.5 text-xs font-bold text-white hover:bg-[#2b2e3c]"><i className="fa-solid fa-rotate-right mr-1.5" />Reanudar con otra estrategia</button>}</div></div>
               {messages.map((message, index) => <div key={`${message.role}-${index}`} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}><div className={`max-w-[88%] rounded-2xl px-4 py-3 text-sm leading-6 shadow-sm ${message.role === 'user' ? 'bg-[#171923] text-white' : 'border border-[#e3e5eb] bg-white text-slate-700'}`}>{message.content}</div></div>)}
               {plan.length > 0 && <section className="rounded-2xl border border-[#e3e5eb] bg-white p-5"><div className="flex items-center justify-between"><p className="text-xs font-bold tracking-[.14em] text-slate-500"><i className="fa-solid fa-diagram-project mr-2 text-violet-500" />PLAN VIVO</p><span className="text-[10px] font-semibold text-slate-400">{plan.filter(phase => phase.estado === 'completada').length}/{plan.length} completadas</span></div><ol className="mt-4 space-y-3">{plan.map((phase, index) => <li key={`${phase.titulo}-${index}`} className="flex items-center gap-3"><span className={`grid h-6 w-6 place-items-center rounded-full text-[10px] font-bold ${phase.estado === 'completada' ? 'bg-emerald-100 text-emerald-700' : phase.estado === 'en_curso' ? 'bg-violet-100 text-violet-700' : 'bg-slate-100 text-slate-500'}`}>{phase.estado === 'completada' ? <i className="fa-solid fa-check" /> : phase.estado === 'en_curso' ? <i className="fa-solid fa-spinner fa-spin" /> : index + 1}</span><span className={`text-sm ${phase.estado === 'completada' ? 'text-slate-400 line-through' : phase.estado === 'en_curso' ? 'font-semibold text-slate-800' : 'text-slate-500'}`}>{phase.titulo}</span></li>)}</ol></section>}
