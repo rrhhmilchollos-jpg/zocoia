@@ -30,6 +30,7 @@ import path from 'path';
 import { buildComputerSystemPrompt } from './zoco-prompt.js';
 import { runAgentLoop, recoverOrphanTasks } from './zoco-loop.js';
 import { applyFileEdits, browserAction, exposePort } from './zoco-tools-extra.js';
+import { createSandboxSession, executeInSandbox, closeSandboxSession } from './zoco-sandbox-client.js';
 
 // ─── Configuración ────────────────────────────────────────────────────────────
 
@@ -246,6 +247,10 @@ function truncar(texto, limite = MAX_OUTPUT_CHARS) {
   const s = String(texto ?? '');
   if (s.length <= limite) return s;
   return s.slice(0, limite) + `\n…[salida truncada; ${s.length} caracteres en total]`;
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
 // ─── Catálogo de herramientas (formato OpenAI; server.js lo traduce) ─────────
@@ -659,13 +664,24 @@ async function executeTool(db, task, workspaceDir, name, args, context) {
       const cwd = args.directorio ? resolveInside(workspaceDir, args.directorio) : workspaceDir;
       fs.mkdirSync(cwd, { recursive: true });
       recordEvent(db, task.id, 'terminal_start', { comando, directorio: path.relative(workspaceDir, cwd) || '.' });
-      const { code, salida } = await runShell(comando, cwd, args.timeout_ms, (fragmento) => {
-        recordEvent(db, task.id, 'terminal_output', { comando, salida: truncar(fragmento, 2000) });
-      });
-      recordEvent(db, task.id, 'tool_result', {
-        herramienta: 'terminal', comando, codigo: code, salida: truncar(salida, 4000),
-      });
-      return `[código de salida ${code}]\n${salida}`;
+      if (!context.sandboxSessionId) {
+        return 'La sandbox efímera no está disponible para esta tarea. No se ejecutará el comando en el servidor principal.';
+      }
+      const relativo = path.relative(workspaceDir, cwd) || '.';
+      const comandoAislado = relativo === '.' ? comando : `cd -- ${shellQuote(relativo)} && ${comando}`;
+      try {
+        recordEvent(db, task.id, 'sandbox_command', { comando, directorio: relativo, sesion: 'efímera' });
+        const resultado = await executeInSandbox(context.sandboxSessionId, comandoAislado, args.timeout_ms);
+        const salida = truncar(`${resultado.stdout || ''}${resultado.stderr || ''}`);
+        if (salida) recordEvent(db, task.id, 'terminal_output', { comando, salida: truncar(salida, 4000) });
+        recordEvent(db, task.id, 'tool_result', {
+          herramienta: 'terminal', comando, codigo: resultado.exit_code, salida: truncar(salida, 4000), sandbox: true,
+        });
+        return `[sandbox aislada · código de salida ${resultado.exit_code}]\n${salida || '(sin salida)'}`;
+      } catch (err) {
+        recordEvent(db, task.id, 'sandbox_error', { comando, mensaje: err.message });
+        return `La sandbox aislada rechazó o no pudo ejecutar el comando: ${err.message}`;
+      }
     }
 
     case 'escribir_archivo': {
@@ -831,6 +847,14 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
 
   const iniciar = async () => {
     const contextoPersistente = await sincronizarContextoTarea(db, task, workspaceDir);
+    let sandboxSessionId = null;
+    try {
+      const sandbox = await createSandboxSession(task.id);
+      sandboxSessionId = sandbox.session_id;
+      recordEvent(db, task.id, 'sandbox_started', { perfil: 'efímera restringida', red: 'interna sin salida' });
+    } catch (err) {
+      recordEvent(db, task.id, 'sandbox_unavailable', { mensaje: err.message });
+    }
     recordEvent(db, task.id, 'task_started', { titulo: task.title, modelo: task.model, contexto: contextoPersistente.ruta });
 
   // `makeCallModel` construye el invocador ya ligado al usuario: comprueba
@@ -853,10 +877,11 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
       tieneNavegador: Boolean(E2B_API_KEY),
     }),
     tools: TOOLS,
-    context: {
-      uuidv4,
-      publicBase: PUBLIC_BASE,
-      reciteTaskContext: () => {
+      context: {
+        uuidv4,
+        publicBase: PUBLIC_BASE,
+        sandboxSessionId,
+        reciteTaskContext: () => {
         try { return fs.readFileSync(todoPath(workspaceDir), 'utf8'); } catch { return ''; }
       },
     },
@@ -870,6 +895,7 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
       } catch { /* la BD puede estar cerrándose */ }
     })
     .finally(() => {
+      closeSandboxSession(sandboxSessionId);
       enEjecucion.delete(task.id);
     });
   };
