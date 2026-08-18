@@ -1126,6 +1126,53 @@ export function registerComputerRoutes({
     }
   });
 
+  // ── Reintentar una tarea terminal ──
+  app.post('/api/computer/tasks/:id/retry', authMiddleware, (req, res) => {
+    try {
+      const task = propietario(req, req.params.id);
+      if (!task) return res.status(404).json({ error: 'Tarea no encontrada.' });
+      if (task.status === 'en_curso') return res.status(409).json({ error: 'La tarea ya está en curso.' });
+      if (!['error', 'pausada', 'detenida'].includes(task.status)) {
+        return res.status(409).json({ error: 'Solo pueden reintentarse tareas fallidas, pausadas o detenidas.' });
+      }
+      if (!isAIConfigured()) {
+        return res.status(503).json({ error: aiConfigurationError() || 'El motor de IA no está configurado en el servidor.' });
+      }
+
+      db.prepare("UPDATE computer_tasks SET status = 'en_curso', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(task.id);
+      const fresh = db.prepare('SELECT * FROM computer_tasks WHERE id = ?').get(task.id);
+      recordEvent(db, task.id, 'task_retried', { mensaje: 'Tarea reintentada manualmente por el usuario.' });
+      lanzarTarea({ db, uuidv4, task: fresh, makeCallModel });
+      res.json({ ok: true, id: task.id, status: 'en_curso' });
+    } catch (err) {
+      console.error('[ZocoComputer] error reintentando tarea:', err);
+      res.status(500).json({ error: 'No se pudo reintentar la tarea.' });
+    }
+  });
+
+  // ── Eliminar una tarea terminal y sus datos de trabajo ──
+  app.delete('/api/computer/tasks/:id', authMiddleware, async (req, res) => {
+    try {
+      const task = propietario(req, req.params.id);
+      if (!task) return res.status(404).json({ error: 'Tarea no encontrada.' });
+      if (task.status === 'en_curso') {
+        return res.status(409).json({ error: 'Detén la tarea antes de eliminarla.' });
+      }
+
+      const borrar = db.transaction(() => {
+        db.prepare('DELETE FROM computer_events WHERE task_id = ?').run(task.id);
+        db.prepare('DELETE FROM computer_messages WHERE task_id = ?').run(task.id);
+        db.prepare('DELETE FROM computer_tasks WHERE id = ? AND user_id = ?').run(task.id, req.auth.sub);
+      });
+      borrar();
+      await fsp.rm(workspaceFor(task.id), { recursive: true, force: true });
+      res.json({ ok: true, id: task.id });
+    } catch (err) {
+      console.error('[ZocoComputer] error eliminando tarea:', err);
+      res.status(500).json({ error: 'No se pudo eliminar la tarea.' });
+    }
+  });
+
   // ── Descargar un entregable ──
   app.get('/api/computer/tasks/:id/files/*', authMiddleware, (req, res) => {
     try {

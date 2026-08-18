@@ -113,6 +113,8 @@ export default function ZocoComputer() {
   const [runtimeTab, setRuntimeTab] = useState<RuntimeTab>('all');
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [showTaskRail, setShowTaskRail] = useState(true);
+  const [taskMenuId, setTaskMenuId] = useState<string | null>(null);
+  const [taskActionError, setTaskActionError] = useState<string | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const runtimeEndRef = useRef<HTMLDivElement>(null);
@@ -179,6 +181,43 @@ export default function ZocoComputer() {
       connectStream(taskId);
     } catch { /* Se mantiene el estado de la tarea anterior. */ }
   }, [connectStream, headers]);
+
+  const retryTask = useCallback(async (taskId: string) => {
+    setTaskActionError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/computer/tasks/${taskId}/retry`, { method: 'POST', headers: headers() });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'No se pudo reintentar la tarea.');
+      setTaskMenuId(null);
+      await loadTasks();
+      await openTask(taskId);
+    } catch (error: any) {
+      setTaskActionError(error.message || 'No se pudo reintentar la tarea.');
+    }
+  }, [headers, loadTasks, openTask]);
+
+  const deleteTask = useCallback(async (task: Task) => {
+    if (!window.confirm(`¿Eliminar definitivamente el trabajo «${task.title}» y su historial?`)) return;
+    setTaskActionError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/computer/tasks/${task.id}`, { method: 'DELETE', headers: headers() });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'No se pudo eliminar la tarea.');
+      setTaskMenuId(null);
+      if (activeTask?.id === task.id) {
+        eventSourceRef.current?.close();
+        setActiveTask(null);
+        setMessages([]);
+        setPlan([]);
+        setEvents([]);
+        setInput('');
+        lastEventIdRef.current = 0;
+      }
+      await loadTasks();
+    } catch (error: any) {
+      setTaskActionError(error.message || 'No se pudo eliminar la tarea.');
+    }
+  }, [activeTask?.id, headers, loadTasks]);
 
   const createTask = useCallback(async () => {
     const prompt = input.trim();
@@ -262,7 +301,7 @@ export default function ZocoComputer() {
           <div className="px-3 pb-4 pt-3">
             <button onClick={() => setShowTaskRail(value => !value)} className="flex w-full items-center justify-between rounded-xl border border-white/[.08] bg-white/[.035] px-3 py-2.5 text-left text-xs text-slate-300 hover:bg-white/[.07]"><span className="flex items-center gap-2"><i className="fa-solid fa-layer-group text-violet-300" />Tareas autónomas</span><span className="rounded-md bg-white/[.07] px-1.5 py-0.5 text-[10px]">{tasks.length}</span></button>
           </div>
-          {showTaskRail && <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-4"><p className="mb-2 px-2 text-[10px] font-bold tracking-[.14em] text-slate-500">EJECUCIONES RECIENTES</p><div className="space-y-1.5">{tasks.length ? tasks.map(task => { const taskStatus = STATUS_META[task.status] || STATUS_META.pendiente; return <button key={task.id} onClick={() => void openTask(task.id)} className={`w-full rounded-xl border p-3 text-left transition ${activeTask?.id === task.id ? 'border-violet-400/35 bg-violet-400/[.12] shadow-[0_8px_28px_rgba(89,76,255,.12)]' : 'border-transparent bg-white/[.018] hover:border-white/[.08] hover:bg-white/[.055]'}`}><div className="flex items-start gap-2"><span className={`mt-1 h-1.5 w-1.5 shrink-0 rounded-full ${taskStatus.dot}`} /><span className="line-clamp-2 flex-1 text-xs font-semibold leading-5 text-slate-100">{task.title}</span></div><span className={`mt-2 inline-flex items-center gap-1 rounded-full border px-2 py-1 text-[9px] font-bold ${taskStatus.className}`}>{taskStatus.text}</span></button>; }) : <p className="rounded-xl border border-dashed border-white/[.09] px-3 py-5 text-center text-xs leading-5 text-slate-500">Crea una tarea para iniciar tu primer flujo autónomo.</p>}</div></div>}
+          {showTaskRail && <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-4"><p className="mb-2 px-2 text-[10px] font-bold tracking-[.14em] text-slate-500">EJECUCIONES RECIENTES</p>{taskActionError && <p role="alert" className="mb-2 rounded-lg border border-red-400/25 bg-red-400/10 px-2 py-1.5 text-[10px] leading-4 text-red-200">{taskActionError}</p>}<div className="space-y-1.5">{tasks.length ? tasks.map(task => { const taskStatus = STATUS_META[task.status] || STATUS_META.pendiente; const terminal = task.status !== 'en_curso'; const retryable = ['error', 'pausada', 'detenida'].includes(task.status); return <div key={task.id} className={`relative rounded-xl border p-3 transition ${activeTask?.id === task.id ? 'border-violet-400/35 bg-violet-400/[.12] shadow-[0_8px_28px_rgba(89,76,255,.12)]' : 'border-transparent bg-white/[.018] hover:border-white/[.08] hover:bg-white/[.055]'}`}><button onClick={() => void openTask(task.id)} className="w-full pr-6 text-left"><div className="flex items-start gap-2"><span className={`mt-1 h-1.5 w-1.5 shrink-0 rounded-full ${taskStatus.dot}`} /><span className="line-clamp-2 flex-1 text-xs font-semibold leading-5 text-slate-100">{task.title}</span></div><span className={`mt-2 inline-flex items-center gap-1 rounded-full border px-2 py-1 text-[9px] font-bold ${taskStatus.className}`}>{taskStatus.text}</span></button>{terminal && <><button aria-label={`Opciones para ${task.title}`} onClick={(event) => { event.stopPropagation(); setTaskMenuId(current => current === task.id ? null : task.id); }} className="absolute right-2 top-2 grid h-6 w-6 place-items-center rounded-md text-slate-400 hover:bg-white/[.12] hover:text-white"><i className="fa-solid fa-ellipsis" /></button>{taskMenuId === task.id && <div className="absolute right-2 top-9 z-30 min-w-36 rounded-xl border border-white/[.12] bg-[#1b1e27] p-1.5 shadow-2xl"><button onClick={(event) => { event.stopPropagation(); void openTask(task.id); setTaskMenuId(null); }} className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[11px] text-slate-200 hover:bg-white/[.08]"><i className="fa-solid fa-eye w-3 text-slate-400" />Ver detalle</button>{retryable && <button onClick={(event) => { event.stopPropagation(); void retryTask(task.id); }} className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[11px] text-cyan-200 hover:bg-cyan-400/10"><i className="fa-solid fa-rotate-right w-3" />Reintentar</button>}<button onClick={(event) => { event.stopPropagation(); void deleteTask(task); }} className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[11px] text-red-200 hover:bg-red-400/10"><i className="fa-solid fa-trash w-3" />Eliminar</button></div>}</>}</div>; }) : <p className="rounded-xl border border-dashed border-white/[.09] px-3 py-5 text-center text-xs leading-5 text-slate-500">Crea una tarea para iniciar tu primer flujo autónomo.</p>}</div></div>}
           <div className="border-t border-white/[.08] p-4"><div className="rounded-xl bg-white/[.035] p-3"><p className="text-xs font-semibold text-slate-300">Ordenador disponible</p><p className="mt-1 text-[11px] leading-4 text-slate-500">Terminal, archivos y navegador se muestran durante la ejecución.</p></div></div>
         </aside>
 
