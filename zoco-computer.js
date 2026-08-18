@@ -87,6 +87,10 @@ function ensureSchema(db) {
       model       TEXT,
       plan        TEXT,
       result      TEXT,
+      runtime_state TEXT,
+      last_event_id INTEGER DEFAULT 0,
+      heartbeat_at TEXT,
+      cancel_requested_at TEXT,
       created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at  TEXT DEFAULT CURRENT_TIMESTAMP
     );
@@ -125,6 +129,10 @@ function ensureSchema(db) {
     if (!cols.includes('model')) db.exec('ALTER TABLE computer_tasks ADD COLUMN model TEXT');
     if (!cols.includes('plan')) db.exec('ALTER TABLE computer_tasks ADD COLUMN plan TEXT');
     if (!cols.includes('updated_at')) db.exec('ALTER TABLE computer_tasks ADD COLUMN updated_at TEXT');
+    if (!cols.includes('runtime_state')) db.exec('ALTER TABLE computer_tasks ADD COLUMN runtime_state TEXT');
+    if (!cols.includes('last_event_id')) db.exec('ALTER TABLE computer_tasks ADD COLUMN last_event_id INTEGER DEFAULT 0');
+    if (!cols.includes('heartbeat_at')) db.exec('ALTER TABLE computer_tasks ADD COLUMN heartbeat_at TEXT');
+    if (!cols.includes('cancel_requested_at')) db.exec('ALTER TABLE computer_tasks ADD COLUMN cancel_requested_at TEXT');
     db.exec(`
       UPDATE computer_tasks SET status = CASE status
         WHEN 'running'   THEN 'en_curso'
@@ -143,6 +151,36 @@ function ensureSchema(db) {
 
 // Suscriptores SSE activos, indexados por task_id.
 const suscriptores = new Map(); // task_id -> Set<res>
+// Contexto efímero de la herramienta que está ejecutándose. Permite correlacionar
+// los eventos internos ya existentes sin reescribir cada adaptador de una vez.
+const activeToolRuns = new Map(); // task_id -> { tool_run_id, herramienta }
+
+function eventChannel(type, payload = {}) {
+  if (payload.channel) return payload.channel;
+  if (/^(terminal|sandbox|port_)/.test(type)) return 'terminal';
+  if (/^(file_|workspace_)/.test(type)) return 'files';
+  if (/^(browser|web_)/.test(type)) return 'web';
+  if (/^(tool_|plan_|assistant_message|user_message|model_|thinking|strategy_|task_|paused|stopped|finished|error|runtime_)/.test(type)) return 'agent';
+  return 'system';
+}
+
+function parseRuntimeState(raw) {
+  try { return raw ? JSON.parse(raw) : {}; } catch { return {}; }
+}
+
+function setRuntimeState(db, taskId, patch = {}, reason = null) {
+  const row = db.prepare('SELECT runtime_state FROM computer_tasks WHERE id = ?').get(taskId) || {};
+  const now = new Date().toISOString();
+  const state = {
+    ...parseRuntimeState(row.runtime_state),
+    ...patch,
+    last_progress_at: now,
+  };
+  db.prepare('UPDATE computer_tasks SET runtime_state = ?, heartbeat_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+    .run(JSON.stringify(state), now, taskId);
+  if (reason) recordEvent(db, taskId, 'runtime_state', { channel: 'agent', reason, runtime: state });
+  return state;
+}
 
 function broadcast(taskId, seq, type, payload) {
   const set = suscriptores.get(taskId);
@@ -164,11 +202,20 @@ function broadcast(taskId, seq, type, payload) {
 function recordEvent(db, taskId, type, payload = {}) {
   // La misma marca temporal viaja por SSE y queda persistida con el evento,
   // de modo que el runtime puede reproducir una secuencia verificable.
-  const evento = { ...(payload ?? {}), ts: new Date().toISOString() };
+  const activeTool = activeToolRuns.get(taskId);
+  const evento = {
+    ...(payload ?? {}),
+    channel: eventChannel(type, payload),
+    ...(activeTool && !payload?.tool_run_id ? activeTool : {}),
+    ts: new Date().toISOString(),
+    schema_version: 2,
+  };
   const cuerpo = JSON.stringify(evento);
   const info = db
     .prepare('INSERT INTO computer_events (task_id, type, payload) VALUES (?, ?, ?)')
     .run(taskId, type, cuerpo);
+  db.prepare('UPDATE computer_tasks SET last_event_id = ?, heartbeat_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+    .run(info.lastInsertRowid, evento.ts, taskId);
   broadcast(taskId, info.lastInsertRowid, type, evento);
   return info.lastInsertRowid;
 }
@@ -640,7 +687,13 @@ async function busquedaWeb(consulta) {
 
 // Dispatcher. Devuelve SIEMPRE un string (observación para el modelo), salvo
 // `entregar_resultado`, que devuelve el objeto de finalización que espera el bucle.
-async function executeTool(db, task, workspaceDir, name, args, context) {
+async function executeTool(db, task, workspaceDir, name, args, context, runtime = {}) {
+  const toolRun = {
+    tool_run_id: runtime.toolRunId || context.uuidv4(),
+    herramienta: name || 'desconocida',
+  };
+  activeToolRuns.set(task.id, toolRun);
+  try {
   switch (name) {
     case 'gestionar_plan': {
       const fases = Array.isArray(args.fases) ? args.fases : [];
@@ -671,16 +724,33 @@ async function executeTool(db, task, workspaceDir, name, args, context) {
       const relativo = path.relative(workspaceDir, cwd) || '.';
       const comandoAislado = relativo === '.' ? comando : `cd -- ${shellQuote(relativo)} && ${comando}`;
       try {
-        recordEvent(db, task.id, 'sandbox_command', { comando, directorio: relativo, sesion: 'efímera' });
-        const resultado = await executeInSandbox(context.sandboxSessionId, comandoAislado, args.timeout_ms);
+        recordEvent(db, task.id, 'sandbox_command', { comando, directorio: relativo, sesion: 'efímera', channel: 'terminal' });
+        const commandStartedAt = Date.now();
+        const commandHeartbeat = setInterval(() => {
+          const segundos = Math.max(1, Math.round((Date.now() - commandStartedAt) / 1000));
+          setRuntimeState(db, task.id, {
+            phase: 'tool_running', active_tool: 'terminal',
+            elapsed_seconds: segundos, status_detail: 'Comando ejecutándose dentro de la sandbox aislada.',
+          });
+          recordEvent(db, task.id, 'tool_progress', {
+            herramienta: 'terminal', segundos, channel: 'terminal',
+            mensaje: `El comando continúa ejecutándose en la sandbox (${segundos}s).`,
+          });
+        }, 2500);
+        let resultado;
+        try {
+          resultado = await executeInSandbox(context.sandboxSessionId, comandoAislado, args.timeout_ms);
+        } finally {
+          clearInterval(commandHeartbeat);
+        }
         const salida = truncar(`${resultado.stdout || ''}${resultado.stderr || ''}`);
         if (salida) recordEvent(db, task.id, 'terminal_output', { comando, salida: truncar(salida, 4000) });
         recordEvent(db, task.id, 'tool_result', {
-          herramienta: 'terminal', comando, codigo: resultado.exit_code, salida: truncar(salida, 4000), sandbox: true,
+          herramienta: 'terminal', comando, codigo: resultado.exit_code, salida: truncar(salida, 4000), sandbox: true, channel: 'terminal',
         });
         return `[sandbox aislada · código de salida ${resultado.exit_code}]\n${salida || '(sin salida)'}`;
       } catch (err) {
-        recordEvent(db, task.id, 'sandbox_error', { comando, mensaje: err.message });
+        recordEvent(db, task.id, 'sandbox_error', { comando, mensaje: err.message, channel: 'terminal' });
         return `La sandbox aislada rechazó o no pudo ejecutar el comando: ${err.message}`;
       }
     }
@@ -833,12 +903,19 @@ async function executeTool(db, task, workspaceDir, name, args, context) {
     default:
       return `Herramienta desconocida: "${name}". Usa solo las herramientas declaradas.`;
   }
+  } finally {
+    const actual = activeToolRuns.get(task.id);
+    if (actual?.tool_run_id === toolRun.tool_run_id) activeToolRuns.delete(task.id);
+  }
 }
 
 // ─── Arranque de una tarea en segundo plano ──────────────────────────────────
 
 // Tareas vivas en este proceso, para poder consultarlas y evitar duplicados.
 const enEjecucion = new Set();
+// Recursos en curso por tarea: el botón Detener puede liberar sandbox y navegador
+// inmediatamente, mientras el bucle comprueba la cancelación antes de cada acción.
+const runtimeSessions = new Map(); // task_id -> { sandboxSessionId, cancelled }
 
 function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
   if (enEjecucion.has(task.id)) return;
@@ -847,16 +924,24 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
   const workspaceDir = workspaceFor(task.id);
 
   const iniciar = async () => {
+    setRuntimeState(db, task.id, {
+      phase: 'initializing', iteration: 0, active_tool: null,
+      provider: process.env.AI_PROVIDER || 'ollama', model: task.model,
+      started_at: new Date().toISOString(), status_detail: 'Preparando el workspace y el entorno aislado.',
+    }, 'task_initializing');
     const contextoPersistente = await sincronizarContextoTarea(db, task, workspaceDir);
     let sandboxSessionId = null;
     try {
       const sandbox = await createSandboxSession(task.id);
       sandboxSessionId = sandbox.session_id;
-      recordEvent(db, task.id, 'sandbox_started', { perfil: 'efímera restringida', red: 'interna sin salida' });
+      runtimeSessions.set(task.id, { sandboxSessionId, cancelled: false });
+      setRuntimeState(db, task.id, { sandbox_session_id: sandboxSessionId, phase: 'sandbox_ready', status_detail: 'Sandbox efímera preparada.' });
+      recordEvent(db, task.id, 'sandbox_started', { perfil: 'efímera restringida', red: 'interna sin salida', channel: 'terminal' });
     } catch (err) {
       recordEvent(db, task.id, 'sandbox_unavailable', { mensaje: err.message });
     }
-    recordEvent(db, task.id, 'task_started', { titulo: task.title, modelo: task.model, contexto: contextoPersistente.ruta });
+    setRuntimeState(db, task.id, { phase: 'agent_ready', status_detail: 'Agente listo para planificar.' }, 'task_started');
+    recordEvent(db, task.id, 'task_started', { titulo: task.title, modelo: task.model, contexto: contextoPersistente.ruta, channel: 'agent' });
 
     // Para solicitudes explícitas de inspección visual, abrimos primero la URL
     // en Chromium y entregamos al modelo la captura y el texto visibles reales.
@@ -893,6 +978,7 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
     callModel,
     recordEvent,
     executeTool,
+    setRuntimeState,
     buildSystemPrompt: () => buildComputerSystemPrompt({
       taskTitle: task.title,
       workspaceDir,
@@ -903,6 +989,7 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
         uuidv4,
         publicBase: PUBLIC_BASE,
         sandboxSessionId,
+        isCancelled: () => Boolean(runtimeSessions.get(task.id)?.cancelled),
         reciteTaskContext: () => {
         try { return fs.readFileSync(todoPath(workspaceDir), 'utf8'); } catch { return ''; }
       },
@@ -911,7 +998,8 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
     .catch((err) => {
       console.error(`[ZocoComputer] fallo no capturado en la tarea ${task.id}:`, err);
       try {
-        recordEvent(db, task.id, 'error', { mensaje: `Error interno del agente: ${err.message}` });
+        setRuntimeState(db, task.id, { phase: 'error', active_tool: null, status_detail: `Error interno: ${err.message}` });
+        recordEvent(db, task.id, 'error', { mensaje: `Error interno del agente: ${err.message}`, channel: 'agent' });
         db.prepare("UPDATE computer_tasks SET status = 'error', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
           .run(task.id);
       } catch { /* la BD puede estar cerrándose */ }
@@ -919,6 +1007,7 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
     .finally(() => {
       closeSandboxSession(sandboxSessionId);
       void closeLocalBrowser(task.id);
+      runtimeSessions.delete(task.id);
       enEjecucion.delete(task.id);
     });
   };
@@ -973,7 +1062,7 @@ export function registerComputerRoutes({
   app.get('/api/computer/tasks', authMiddleware, (req, res) => {
     try {
       const tareas = db.prepare(
-        `SELECT id, title, status, model, plan, result, created_at, updated_at
+        `SELECT id, title, status, model, plan, result, runtime_state, last_event_id, heartbeat_at, cancel_requested_at, created_at, updated_at
            FROM computer_tasks WHERE user_id = ?
           ORDER BY datetime(COALESCE(updated_at, created_at)) DESC LIMIT 100`
       ).all(req.auth.sub);
@@ -1000,14 +1089,18 @@ export function registerComputerRoutes({
       const modelo = resolverModelo(req.body?.model);
 
       db.prepare(
-        `INSERT INTO computer_tasks (id, user_id, title, status, model, created_at, updated_at)
-         VALUES (?, ?, ?, 'en_curso', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
-      ).run(id, req.auth.sub, titulo, modelo);
+        `INSERT INTO computer_tasks (id, user_id, title, status, model, runtime_state, created_at, updated_at)
+         VALUES (?, ?, ?, 'en_curso', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+      ).run(id, req.auth.sub, titulo, modelo, JSON.stringify({
+        phase: 'queued', iteration: 0, active_tool: null, provider: process.env.AI_PROVIDER || 'ollama',
+        model: modelo, started_at: null, last_progress_at: new Date().toISOString(), status_detail: 'Tarea en cola de preparación.',
+      }));
 
       db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)')
         .run(uuidv4(), id, 'user', titulo);
 
       const task = db.prepare('SELECT * FROM computer_tasks WHERE id = ?').get(id);
+      recordEvent(db, id, 'task_queued', { channel: 'agent', titulo, modelo });
 
       // Respondemos ya: el panel se suscribirá al stream por separado.
       res.status(201).json({ id, title: titulo, status: 'en_curso', model: modelo });
@@ -1016,6 +1109,31 @@ export function registerComputerRoutes({
     } catch (err) {
       console.error('[ZocoComputer] error creando tarea:', err);
       if (!res.headersSent) res.status(500).json({ error: 'No se pudo crear la tarea.' });
+    }
+  });
+
+  // ── Instantánea operacional: permite reanudar el panel sin inferir estados ──
+  app.get('/api/computer/tasks/:id/runtime', authMiddleware, (req, res) => {
+    try {
+      const task = propietario(req, req.params.id);
+      if (!task) return res.status(404).json({ error: 'Tarea no encontrada.' });
+      const runtime = parseRuntimeState(task.runtime_state);
+      const lastEvents = db.prepare(
+        'SELECT id, type, payload, created_at FROM computer_events WHERE task_id = ? ORDER BY id DESC LIMIT 80'
+      ).all(task.id).reverse().map(e => ({
+        event_id: e.id, type: e.type, created_at: e.created_at,
+        ...(() => { try { return JSON.parse(e.payload || '{}'); } catch { return {}; } })(),
+      }));
+      res.json({
+        task: { id: task.id, title: task.title, status: task.status, model: task.model, result: task.result },
+        runtime,
+        live: enEjecucion.has(task.id),
+        last_event_id: task.last_event_id || lastEvents.at(-1)?.event_id || 0,
+        events: lastEvents,
+      });
+    } catch (err) {
+      console.error('[ZocoComputer] error obteniendo runtime:', err);
+      res.status(500).json({ error: 'No se pudo obtener el estado operativo.' });
     }
   });
 
@@ -1045,6 +1163,7 @@ export function registerComputerRoutes({
       // castellanas y los tests/integraciones externas las inglesas.
       res.json({
         ...task, plan,
+        runtime: parseRuntimeState(task.runtime_state),
         mensajes, eventos,
         messages: mensajes, events: eventos,
         viva: enEjecucion.has(task.id),
@@ -1066,6 +1185,16 @@ export function registerComputerRoutes({
     // Imprescindible para que Traefik/Nginx no bufferice el stream.
     res.setHeader('X-Accel-Buffering', 'no');
     if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+    // Primero se transmite la instantánea: el cliente conoce el estado real
+    // incluso antes de recibir la reemisión o conectarse por primera vez.
+    const runtime = parseRuntimeState(task.runtime_state);
+    const snapshot = {
+      type: 'runtime_snapshot', channel: 'agent', schema_version: 2,
+      runtime, status: task.status, last_event_id: task.last_event_id || 0,
+      live: enEjecucion.has(task.id), ts: new Date().toISOString(),
+    };
+    res.write(`event: runtime_snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`);
 
     // Reemisión de lo ya ocurrido, para que quien llega tarde no pierda nada.
     const desde = parseInt(req.headers['last-event-id'] || req.query.lastEventId || '0', 10) || 0;
@@ -1140,11 +1269,18 @@ export function registerComputerRoutes({
     try {
       const task = propietario(req, req.params.id);
       if (!task) return res.status(404).json({ error: 'Tarea no encontrada.' });
-      db.prepare("UPDATE computer_tasks SET status = 'detenida', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .run(task.id);
-      recordEvent(db, task.id, 'stopped', { mensaje: 'Tarea detenida por el usuario.' });
+      const runtime = runtimeSessions.get(task.id);
+      if (runtime) {
+        runtime.cancelled = true;
+        if (runtime.sandboxSessionId) void closeSandboxSession(runtime.sandboxSessionId);
+      }
+      db.prepare("UPDATE computer_tasks SET status = 'detenida', cancel_requested_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+        .run(new Date().toISOString(), task.id);
+      setRuntimeState(db, task.id, { phase: 'cancelling', active_tool: null, status_detail: 'Cancelación solicitada; liberando recursos.' }, 'stop_requested');
+      recordEvent(db, task.id, 'tool_cancelled', { channel: 'agent', mensaje: 'Cancelación solicitada por el usuario.' });
+      recordEvent(db, task.id, 'stopped', { mensaje: 'Tarea detenida por el usuario.', channel: 'agent' });
       void closeLocalBrowser(task.id);
-      res.json({ ok: true });
+      res.json({ ok: true, cancelled: Boolean(runtime) });
     } catch (err) {
       console.error('[ZocoComputer] error deteniendo tarea:', err);
       res.status(500).json({ error: 'No se pudo detener la tarea.' });

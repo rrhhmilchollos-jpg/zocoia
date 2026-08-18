@@ -32,6 +32,11 @@ const MAX_REPEATED_TOOL_CALLS = Math.min(
 // esa recuperación explícita.
 const MAX_REPEATED_TOOL_REJECTIONS = 3;
 
+function truncar(texto, limite = 1200) {
+  const valor = String(texto || '');
+  return valor.length > limite ? `${valor.slice(0, limite)}\n… [salida truncada]` : valor;
+}
+
 // Algunos modelos locales pequeños pueden devolver una llamada de herramienta
 // como texto (`{"name": gestionar_plan}`) aunque reciban el esquema OpenAI.
 // Recuperamos únicamente nombres conocidos y nunca ejecutamos texto arbitrario.
@@ -153,6 +158,7 @@ export async function runAgentLoop({
   workspaceDir,
   callModel,
   recordEvent,
+  setRuntimeState = () => {},
   executeTool,
   buildSystemPrompt,
   tools,
@@ -225,8 +231,9 @@ export async function runAgentLoop({
     // ── 1. Comprobar si el usuario ha detenido o pausado la tarea ──
     const current = db.prepare('SELECT status FROM computer_tasks WHERE id = ?').get(task.id);
     if (!current) return;
-    if (current.status === 'detenida') {
-      recordEvent(db, task.id, 'stopped', {});
+    if (current.status === 'detenida' || context?.isCancelled?.()) {
+      setRuntimeState(db, task.id, { phase: 'stopped', active_tool: null, status_detail: 'Tarea detenida; no se iniciarán más acciones.' });
+      recordEvent(db, task.id, 'stopped', { channel: 'agent' });
       return;
     }
 
@@ -234,7 +241,11 @@ export async function runAgentLoop({
     absorberMensajesNuevos();
     recitarContexto();
 
-    recordEvent(db, task.id, 'thinking', { iteracion: i + 1, contexto: 'todo.md' });
+    setRuntimeState(db, task.id, {
+      phase: 'model_wait', iteration: i + 1, active_tool: null,
+      status_detail: 'El modelo está preparando la siguiente acción.',
+    });
+    recordEvent(db, task.id, 'thinking', { iteracion: i + 1, contexto: 'todo.md', channel: 'agent' });
 
     // ── 3. Llamar al modelo ──
     // Ollama en CPU puede tardar en preparar el contexto. El latido deja una
@@ -243,10 +254,16 @@ export async function runAgentLoop({
     const inferenceStartedAt = Date.now();
     const inferenceHeartbeat = setInterval(() => {
       const elapsedSeconds = Math.max(1, Math.round((Date.now() - inferenceStartedAt) / 1000));
+      setRuntimeState(db, task.id, {
+        phase: 'model_wait', iteration: i + 1, active_tool: null,
+        elapsed_seconds: elapsedSeconds,
+        status_detail: 'El modelo local continúa preparando la siguiente acción.',
+      });
       recordEvent(db, task.id, 'model_waiting', {
         iteracion: i + 1,
         segundos: elapsedSeconds,
         mensaje: `El modelo local continúa preparando la siguiente acción (${elapsedSeconds}s).`,
+        channel: 'agent',
       });
     }, 8000);
     let data;
@@ -266,11 +283,19 @@ export async function runAgentLoop({
         nudges++;
         continue;
       }
-      recordEvent(db, task.id, 'error', { mensaje: `Error del modelo: ${err.message}` });
+      setRuntimeState(db, task.id, { phase: 'error', active_tool: null, status_detail: `Error del modelo: ${err.message}` });
+      recordEvent(db, task.id, 'error', { mensaje: `Error del modelo: ${err.message}`, channel: 'agent' });
       db.prepare("UPDATE computer_tasks SET status = 'error', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(task.id);
       return;
     } finally {
       clearInterval(inferenceHeartbeat);
+    }
+
+    const afterInference = db.prepare('SELECT status FROM computer_tasks WHERE id = ?').get(task.id);
+    if (!afterInference || afterInference.status === 'detenida' || context?.isCancelled?.()) {
+      setRuntimeState(db, task.id, { phase: 'stopped', active_tool: null, status_detail: 'Tarea detenida durante la inferencia.' });
+      recordEvent(db, task.id, 'stopped', { channel: 'agent', mensaje: 'La inferencia terminó después de solicitar la cancelación; no se ejecutarán herramientas.' });
+      return;
     }
 
     const msg = data.choices?.[0]?.message || {};
@@ -355,9 +380,22 @@ export async function runAgentLoop({
       repeatedToolCalls = isRepeatedSignature ? repeatedToolCalls + 1 : 1;
       lastToolSignature = toolSignature;
 
+      const toolRunId = uuidv4();
+      const toolChannel = /^(terminal|sandbox|exponer_puerto)/.test(name || '') ? 'terminal'
+        : /^(escribir_archivo|leer_archivo|editar_archivo|listar_archivos)$/.test(name || '') ? 'files'
+        : /^(navegador|leer_pagina|busqueda_web)$/.test(name || '') ? 'web' : 'agent';
+      setRuntimeState(db, task.id, {
+        phase: 'tool_running', iteration: i + 1, active_tool: name || 'desconocida',
+        tool_run_id: toolRunId, channel: toolChannel, status_detail: `Ejecutando ${name || 'herramienta'}.`,
+      });
       recordEvent(db, task.id, 'tool_call', {
         herramienta: name,
         argumentos: JSON.stringify(args).slice(0, 1500),
+        tool_run_id: toolRunId,
+        channel: toolChannel,
+      });
+      recordEvent(db, task.id, 'tool_started', {
+        herramienta: name, tool_run_id: toolRunId, channel: toolChannel,
       });
 
       let recoveryDirective = '';
@@ -383,12 +421,13 @@ export async function runAgentLoop({
             .run(uuidv4(), task.id, 'assistant', aviso);
           db.prepare("UPDATE computer_tasks SET status = 'pausada', result = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
             .run(aviso, task.id);
-          recordEvent(db, task.id, 'paused', { mensaje: aviso });
+          setRuntimeState(db, task.id, { phase: 'paused', active_tool: null, status_detail: aviso });
+    recordEvent(db, task.id, 'paused', { mensaje: aviso, channel: 'agent' });
           return;
         }
       } else {
         try {
-          result = await executeTool(db, task, workspaceDir, name, args, context);
+          result = await executeTool(db, task, workspaceDir, name, args, context, { toolRunId, channel: toolChannel });
         } catch (err) {
           // El error se devuelve al modelo como observación para que se corrija,
           // en lugar de abortar la tarea entera.
@@ -396,6 +435,16 @@ export async function runAgentLoop({
           recordEvent(db, task.id, 'tool_error', { herramienta: name, mensaje: err.message });
         }
       }
+
+      recordEvent(db, task.id, 'tool_completed', {
+        herramienta: name, tool_run_id: toolRunId, channel: toolChannel,
+        resumen: truncar(String(result && result.__finish ? result.resumen : result || ''), 1000),
+      });
+      setRuntimeState(db, task.id, {
+        phase: 'agent_ready', iteration: i + 1, active_tool: null,
+        last_tool: name || null, last_tool_run_id: toolRunId,
+        status_detail: `Finalizó ${name || 'la herramienta'}.`,
+      });
 
       if (repeatedToolCalls === MAX_REPEATED_TOOL_CALLS && !repeatRecoveryIssued) {
         repeatRecoveryIssued = true;
@@ -414,7 +463,8 @@ export async function runAgentLoop({
           .run(uuidv4(), task.id, 'assistant', resumen);
         db.prepare("UPDATE computer_tasks SET status = 'completada', result = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
           .run(resumen, task.id);
-        recordEvent(db, task.id, 'finished', { resumen, archivos: result.archivos || [] });
+        setRuntimeState(db, task.id, { phase: 'completed', active_tool: null, status_detail: 'Tarea completada.', completed_at: new Date().toISOString() });
+        recordEvent(db, task.id, 'finished', { resumen, archivos: result.archivos || [], channel: 'agent' });
         messages.push({ role: 'tool', tool_call_id: tc.id, content: 'Resultado entregado al usuario.' });
         finished = true;
         break;
@@ -435,7 +485,8 @@ export async function runAgentLoop({
     db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)')
       .run(uuidv4(), task.id, 'assistant', aviso);
     db.prepare("UPDATE computer_tasks SET status = 'pausada', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(task.id);
-    recordEvent(db, task.id, 'paused', { mensaje: aviso });
+    setRuntimeState(db, task.id, { phase: 'paused', active_tool: null, status_detail: aviso });
+    recordEvent(db, task.id, 'paused', { mensaje: aviso, channel: 'agent' });
   }
 }
 

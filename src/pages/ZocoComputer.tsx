@@ -5,7 +5,8 @@ import { useAuth, API_BASE } from '../context/AuthContext';
 interface Fase { titulo: string; estado: 'pendiente' | 'en_curso' | 'completada'; }
 interface Msg { role: string; content: string; created_at?: string; }
 interface Evento { id?: number; type: string; ts?: string; [key: string]: any; }
-interface Task { id: string; title: string; status: string; model?: string; created_at?: string; updated_at?: string; }
+interface RuntimeState { phase?: string; iteration?: number; active_tool?: string | null; tool_run_id?: string; channel?: string; status_detail?: string; elapsed_seconds?: number; provider?: string; model?: string; last_progress_at?: string; [key: string]: any; }
+interface Task { id: string; title: string; status: string; model?: string; runtime_state?: string; runtime?: RuntimeState; created_at?: string; updated_at?: string; }
 
 type RuntimeTab = 'all' | 'terminal' | 'files' | 'web' | 'activity';
 
@@ -21,7 +22,14 @@ const MODEL_OPTIONS = [
 ];
 
 const EVENT_META: Record<string, { icon: string; label: string; panel: RuntimeTab; tone: string }> = {
+  task_queued: { icon: 'fa-clock', label: 'Tarea en cola', panel: 'activity', tone: 'text-slate-300' },
   task_started: { icon: 'fa-play', label: 'Ejecución iniciada', panel: 'activity', tone: 'text-emerald-300' },
+  runtime_snapshot: { icon: 'fa-gauge-high', label: 'Estado recuperado', panel: 'activity', tone: 'text-cyan-300' },
+  runtime_state: { icon: 'fa-satellite-dish', label: 'Estado operativo', panel: 'activity', tone: 'text-cyan-300' },
+  tool_started: { icon: 'fa-spinner', label: 'Herramienta iniciada', panel: 'activity', tone: 'text-amber-300' },
+  tool_progress: { icon: 'fa-spinner fa-spin', label: 'Herramienta en curso', panel: 'terminal', tone: 'text-amber-300' },
+  tool_completed: { icon: 'fa-circle-check', label: 'Herramienta finalizada', panel: 'activity', tone: 'text-emerald-300' },
+  tool_cancelled: { icon: 'fa-ban', label: 'Cancelación solicitada', panel: 'activity', tone: 'text-amber-300' },
   thinking: { icon: 'fa-sparkles', label: 'Razonando', panel: 'activity', tone: 'text-violet-300' },
   model_waiting: { icon: 'fa-microchip', label: 'Modelo local activo', panel: 'activity', tone: 'text-cyan-300' },
   plan: { icon: 'fa-diagram-project', label: 'Plan actualizado', panel: 'activity', tone: 'text-sky-300' },
@@ -61,7 +69,7 @@ const EVENT_META: Record<string, { icon: string; label: string; panel: RuntimeTa
 const SSE_EVENT_TYPES = [
   ...Object.keys(EVENT_META),
   'sandbox_started', 'sandbox_unavailable', 'sandbox_command', 'sandbox_error',
-  'todo_recited', 'task_resumed', 'task_stopped',
+  'todo_recited', 'task_resumed', 'task_stopped', 'browser_action_success', 'browser_action_error',
 ];
 
 const STATUS_META: Record<string, { text: string; className: string; dot: string }> = {
@@ -74,6 +82,11 @@ const STATUS_META: Record<string, { text: string; className: string; dot: string
 };
 
 function eventSummary(event: Evento): string {
+  if (event.type === 'runtime_snapshot' || event.type === 'runtime_state') return event.runtime?.status_detail || event.status_detail || 'Estado operativo sincronizado.';
+  if (event.type === 'tool_started') return `${event.herramienta || 'Herramienta'} iniciada${event.tool_run_id ? ` · ${event.tool_run_id.slice(0, 8)}` : ''}.`;
+  if (event.type === 'tool_progress') return event.mensaje || `${event.herramienta || 'Herramienta'} en curso (${event.segundos || 0}s).`;
+  if (event.type === 'tool_completed') return event.resumen || `${event.herramienta || 'Herramienta'} finalizada.`;
+  if (event.type === 'tool_cancelled') return event.mensaje || 'Cancelación solicitada.';
   if (event.type === 'thinking') return event.texto || `Iteración ${event.iteracion || 'actual'}: preparando la siguiente acción.`;
   if (event.type === 'model_waiting') return event.mensaje || `El modelo local continúa activo (${event.segundos || 0}s).`;
   if (event.type === 'tool_call') return `${event.herramienta || 'herramienta'} · ${event.argumentos || 'sin argumentos visibles'}`;
@@ -106,6 +119,7 @@ export default function ZocoComputer() {
   const [messages, setMessages] = useState<Msg[]>([]);
   const [plan, setPlan] = useState<Fase[]>([]);
   const [events, setEvents] = useState<Evento[]>([]);
+  const [runtime, setRuntime] = useState<RuntimeState | null>(null);
   const [input, setInput] = useState('');
   const [model, setModel] = useState('zoco-max');
   const [creating, setCreating] = useState(false);
@@ -142,6 +156,11 @@ export default function ZocoComputer() {
         const event: Evento = JSON.parse(raw.data);
         const sequence = Number.parseInt(raw.lastEventId || '0', 10);
         if (sequence) lastEventIdRef.current = Math.max(lastEventIdRef.current, sequence);
+        if (event.type === 'runtime_snapshot') {
+          setRuntime(event.runtime || null);
+          if (event.status) setActiveTask(previous => previous ? { ...previous, status: event.status } : previous);
+        }
+        if (event.type === 'runtime_state' && event.runtime) setRuntime(event.runtime);
         setEvents(previous => [...previous.slice(-499), { ...event, id: sequence || event.id }]);
         if ((event.type === 'plan_updated' || event.type === 'plan') && Array.isArray(event.fases)) setPlan(event.fases);
         if (event.type === 'assistant_message') setMessages(previous => [...previous, { role: 'assistant', content: event.texto || event.mensaje || '' }]);
@@ -169,15 +188,20 @@ export default function ZocoComputer() {
 
   const openTask = useCallback(async (taskId: string) => {
     try {
-      const response = await fetch(`${API_BASE}/api/computer/tasks/${taskId}`, { headers: headers() });
+      const [response, runtimeResponse] = await Promise.all([
+        fetch(`${API_BASE}/api/computer/tasks/${taskId}`, { headers: headers() }),
+        fetch(`${API_BASE}/api/computer/tasks/${taskId}/runtime`, { headers: headers() }),
+      ]);
       if (!response.ok) return;
       const data = await response.json();
-      setActiveTask({ id: data.id, title: data.title, status: data.status, model: data.model });
+      const snapshot = runtimeResponse.ok ? await runtimeResponse.json() : null;
+      setActiveTask({ id: data.id, title: data.title, status: data.status, model: data.model, runtime: snapshot?.runtime || data.runtime });
+      setRuntime(snapshot?.runtime || data.runtime || null);
       setMessages(data.messages || data.mensajes || []);
       setPlan(data.plan || []);
       const loadedEvents = data.events || data.eventos || [];
       setEvents(loadedEvents);
-      lastEventIdRef.current = loadedEvents.length ? Math.max(...loadedEvents.map((event: Evento & { seq?: number }) => event.seq || event.id || 0)) : 0;
+      lastEventIdRef.current = snapshot?.last_event_id || (loadedEvents.length ? Math.max(...loadedEvents.map((event: Evento & { seq?: number }) => event.seq || event.id || 0)) : 0);
       connectStream(taskId);
     } catch { /* Se mantiene el estado de la tarea anterior. */ }
   }, [connectStream, headers]);
@@ -210,6 +234,7 @@ export default function ZocoComputer() {
         setMessages([]);
         setPlan([]);
         setEvents([]);
+        setRuntime(null);
         setInput('');
         lastEventIdRef.current = 0;
       }
@@ -236,6 +261,7 @@ export default function ZocoComputer() {
       setMessages([{ role: 'user', content: prompt }]);
       setPlan([]);
       setEvents([]);
+      setRuntime(null);
       lastEventIdRef.current = 0;
       connectStream(data.id);
       void loadTasks();
@@ -276,6 +302,7 @@ export default function ZocoComputer() {
     setMessages([]);
     setPlan([]);
     setEvents([]);
+    setRuntime(null);
     setInput('');
     lastEventIdRef.current = 0;
   }, []);
@@ -285,9 +312,12 @@ export default function ZocoComputer() {
 
   const running = activeTask?.status === 'en_curso';
   const status = STATUS_META[activeTask?.status || 'pendiente'] || STATUS_META.pendiente;
-  const visibleEvents = events.filter(event => runtimeTab === 'all' || EVENT_META[event.type]?.panel === runtimeTab || (runtimeTab === 'activity' && EVENT_META[event.type]?.panel === 'activity'));
-  const activityEvents = events.filter(event => ['thinking', 'model_waiting', 'plan', 'plan_updated', 'tool_call', 'strategy_recovery', 'tool_rejected', 'tool_error', 'finished', 'paused', 'error'].includes(event.type)).slice(-8);
+  const eventPanel = (event: Evento): RuntimeTab => event.channel === 'terminal' ? 'terminal' : event.channel === 'files' ? 'files' : event.channel === 'web' ? 'web' : (EVENT_META[event.type]?.panel || 'activity');
+  const visibleEvents = events.filter(event => runtimeTab === 'all' || eventPanel(event) === runtimeTab || (runtimeTab === 'activity' && eventPanel(event) === 'activity'));
+  const activityEvents = events.filter(event => eventPanel(event) === 'activity').slice(-8);
   const currentModel = MODEL_OPTIONS.find(option => option.value === (activeTask?.model || model)) || MODEL_OPTIONS[0];
+  const runtimeDescription = runtime?.status_detail || (running ? 'El agente está coordinando el plan y las herramientas.' : activeTask?.status === 'pausada' ? 'La ejecución conserva el contexto y puede reanudarse con una estrategia distinta.' : 'Consulta la actividad, el plan y los resultados de esta tarea.');
+  const runtimeMeta = runtime?.active_tool ? `Herramienta: ${runtime.active_tool}` : runtime?.phase ? `Fase: ${runtime.phase}` : null;
 
   return (
     <div className="h-[100dvh] overflow-hidden bg-[#0b0d12] text-[#edf0f7] selection:bg-violet-400/30">
@@ -314,11 +344,11 @@ export default function ZocoComputer() {
 
           <section className="min-h-0 flex-1 overflow-y-auto px-5 py-5 xl:px-8">
             {!activeTask && <div className="mx-auto flex min-h-full max-w-2xl flex-col items-center justify-center pb-20 text-center"><div className="grid h-16 w-16 place-items-center rounded-2xl bg-gradient-to-br from-[#1c2151] to-[#725cff] text-2xl text-white shadow-[0_18px_45px_rgba(82,71,211,.3)]"><i className="fa-solid fa-wand-magic-sparkles" /></div><h2 className="mt-6 text-3xl font-bold tracking-[-.055em]">Delega un objetivo completo.</h2><p className="mt-3 max-w-xl text-sm leading-6 text-slate-500">Zoco convierte tu petición en un plan, usa herramientas reales y mantiene visible cada decisión en el espacio de trabajo.</p>{creationError && <p role="alert" className="mt-4 max-w-xl rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{creationError}</p>}<div className="mt-8 grid w-full gap-3 text-left sm:grid-cols-3">{['Investiga el mercado y prepara un informe con fuentes.', 'Analiza los archivos del workspace y resume los hallazgos.', 'Crea una aplicación y valida los pasos principales.'].map(suggestion => <button key={suggestion} onClick={() => setInput(suggestion)} className="rounded-2xl border border-[#e5e7ef] bg-white p-4 text-xs leading-5 text-slate-600 shadow-sm transition hover:-translate-y-0.5 hover:border-violet-300 hover:shadow-md">{suggestion}<i className="fa-solid fa-arrow-up-right-from-square ml-2 text-violet-500" /></button>)}</div></div>}
-            {activeTask && <div className="mx-auto max-w-3xl space-y-5"><div className="rounded-2xl border border-[#e2e5ed] bg-white p-5 shadow-[0_8px_30px_rgba(16,24,40,.04)]"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-xs font-bold tracking-[.14em] text-violet-600">EJECUCIÓN ACTUAL</p><p className="mt-2 text-sm leading-6 text-slate-500">{running ? 'El agente está coordinando el plan y las herramientas.' : activeTask.status === 'pausada' ? 'La ejecución conserva el contexto y puede reanudarse con una estrategia distinta.' : 'Consulta la actividad, el plan y los resultados de esta tarea.'}</p></div>{activeTask.status === 'pausada' && <button onClick={() => void sendMessage('Reanuda la tarea revisando el último resultado. Cambia de estrategia o herramienta; no repitas la misma llamada con los mismos argumentos.')} className="rounded-xl bg-[#171923] px-4 py-2.5 text-xs font-bold text-white hover:bg-[#2b2e3c]"><i className="fa-solid fa-rotate-right mr-1.5" />Reanudar con otra estrategia</button>}</div></div>
+            {activeTask && <div className="mx-auto max-w-3xl space-y-5"><div className="rounded-2xl border border-[#e2e5ed] bg-white p-5 shadow-[0_8px_30px_rgba(16,24,40,.04)]"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-xs font-bold tracking-[.14em] text-violet-600">EJECUCIÓN ACTUAL</p><p className="mt-2 text-sm leading-6 text-slate-500">{runtimeDescription}</p>{runtimeMeta && <p className="mt-2 inline-flex rounded-lg bg-violet-50 px-2 py-1 text-[10px] font-semibold text-violet-700">{runtimeMeta}{runtime?.elapsed_seconds ? ` · ${runtime.elapsed_seconds}s` : ''}</p>}</div>{activeTask.status === 'pausada' && <button onClick={() => void sendMessage('Reanuda la tarea revisando el último resultado. Cambia de estrategia o herramienta; no repitas la misma llamada con los mismos argumentos.')} className="rounded-xl bg-[#171923] px-4 py-2.5 text-xs font-bold text-white hover:bg-[#2b2e3c]"><i className="fa-solid fa-rotate-right mr-1.5" />Reanudar con otra estrategia</button>}</div></div>
               {messages.map((message, index) => <div key={`${message.role}-${index}`} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}><div className={`max-w-[88%] rounded-2xl px-4 py-3 text-sm leading-6 shadow-sm ${message.role === 'user' ? 'bg-[#171923] text-white' : 'border border-[#e3e5eb] bg-white text-slate-700'}`}>{message.content}</div></div>)}
               {plan.length > 0 && <section className="rounded-2xl border border-[#e3e5eb] bg-white p-5"><div className="flex items-center justify-between"><p className="text-xs font-bold tracking-[.14em] text-slate-500"><i className="fa-solid fa-diagram-project mr-2 text-violet-500" />PLAN VIVO</p><span className="text-[10px] font-semibold text-slate-400">{plan.filter(phase => phase.estado === 'completada').length}/{plan.length} completadas</span></div><ol className="mt-4 space-y-3">{plan.map((phase, index) => <li key={`${phase.titulo}-${index}`} className="flex items-center gap-3"><span className={`grid h-6 w-6 place-items-center rounded-full text-[10px] font-bold ${phase.estado === 'completada' ? 'bg-emerald-100 text-emerald-700' : phase.estado === 'en_curso' ? 'bg-violet-100 text-violet-700' : 'bg-slate-100 text-slate-500'}`}>{phase.estado === 'completada' ? <i className="fa-solid fa-check" /> : phase.estado === 'en_curso' ? <i className="fa-solid fa-spinner fa-spin" /> : index + 1}</span><span className={`text-sm ${phase.estado === 'completada' ? 'text-slate-400 line-through' : phase.estado === 'en_curso' ? 'font-semibold text-slate-800' : 'text-slate-500'}`}>{phase.titulo}</span></li>)}</ol></section>}
               {activityEvents.length > 0 && <section className="rounded-2xl border border-[#e3e5eb] bg-white p-5"><p className="text-xs font-bold tracking-[.14em] text-slate-500"><i className="fa-solid fa-timeline mr-2 text-violet-500" />CRONOLOGÍA RECIENTE</p><div className="mt-4 space-y-3">{activityEvents.map((event, index) => { const meta = EVENT_META[event.type] || { icon: 'fa-circle-info', label: event.type, tone: 'text-slate-500' }; return <article key={event.id || `${event.type}-${index}`} className="flex gap-3"><span className={`mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-slate-50 text-xs ${meta.tone}`}><i className={`fa-solid ${meta.icon}`} /></span><div className="min-w-0 flex-1 border-b border-slate-100 pb-3"><div className="flex items-center justify-between gap-3"><b className="text-xs text-slate-700">{meta.label}</b><span className="text-[10px] text-slate-400">{eventTime(event)}</span></div><p className="mt-1 whitespace-pre-wrap break-words text-xs leading-5 text-slate-500">{eventSummary(event)}</p></div></article>; })}</div></section>}
-              {running && <div className="flex items-center gap-2 px-2 text-xs text-violet-600"><span className="h-2 w-2 animate-pulse rounded-full bg-violet-500" />Zoco está trabajando sobre la siguiente fase.</div>}
+              {running && <div className="flex items-center gap-2 px-2 text-xs text-violet-600"><span className="h-2 w-2 animate-pulse rounded-full bg-violet-500" />{runtime?.active_tool ? `Zoco ejecuta ${runtime.active_tool} en tiempo real.` : 'Zoco está trabajando sobre la siguiente fase.'}</div>}
               <div ref={chatEndRef} />
             </div>}
           </section>
