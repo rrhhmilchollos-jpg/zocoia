@@ -119,5 +119,10 @@ export async function browserActionLocal({ taskId, accion, url, x, y, texto, tec
 export async function closeLocalBrowser(taskId) {
   const entry = browserByTask.get(taskId);
   browserByTask.delete(taskId);
-  try { await entry?.browser?.disconnect(); } catch { /* El navegador compartido continúa para otras tareas. */ }
+  try {
+    // `disconnect()` solo abandona el WebSocket y Browserless puede conservar
+    // la sesión Chrome en cola. `close()` finaliza únicamente esta sesión CDP,
+    // liberando la ranura visual sin detener el servicio compartido.
+    if (entry?.browser?.connected) await entry.browser.close();
+  } catch { /* La sesión puede haber terminado durante una cancelación. */ }
 }
