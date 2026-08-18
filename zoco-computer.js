@@ -943,24 +943,34 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
     setRuntimeState(db, task.id, { phase: 'agent_ready', status_detail: 'Agente listo para planificar.' }, 'task_started');
     recordEvent(db, task.id, 'task_started', { titulo: task.title, modelo: task.model, contexto: contextoPersistente.ruta, channel: 'agent' });
 
-    // Para solicitudes explícitas de inspección visual, abrimos primero la URL
-    // en Chromium y entregamos al modelo la captura y el texto visibles reales.
-    // Así no puede sustituir la observación por una conjetura o una llamada curl.
+    // Toda URL pública entregada por el usuario se abre primero en Chromium aislado.
+    // La captura, URL final y texto visible llegan al panel Web antes del razonamiento,
+    // de modo que el agente no sustituye la observación por curl ni por una conjetura.
     const visualMatch = String(task.title || '').match(/\b(?:https?:\/\/)?(?:www\.)?[a-z0-9][a-z0-9.-]*\.(?:es|com|org|net)(?:\/[^\s]*)?/i);
-    const visualRequested = /muestra(?:me)?|mu[eé]strame|qu[eé]\s+ves|pantalla|visual|navega(?:r)?/i.test(String(task.title || ''));
-    if (visualMatch && visualRequested) {
+    if (visualMatch) {
       const candidate = visualMatch[0];
       const visualUrl = /^https?:\/\//i.test(candidate) ? candidate : `https://${candidate}`;
+      setRuntimeState(db, task.id, {
+        phase: 'browser_loading', active_tool: 'navegador', channel: 'web',
+        status_detail: `Abriendo ${visualUrl} en el navegador visual aislado.`,
+      }, 'browser_preinspection_started');
       const visual = await browserAction({
         taskId: task.id,
         apiKey: E2B_API_KEY,
         accion: 'navegar',
         url: visualUrl,
-        onEvent: (type, payload) => recordEvent(db, task.id, type, payload),
+        onEvent: (type, payload) => recordEvent(db, task.id, type, { ...payload, channel: 'web', session_scope: 'isolated_guest' }),
       });
-      recordEvent(db, task.id, 'browser_action_done', { accion: 'navegar', url: visual.url || visualUrl, texto: visual.texto, proveedor: 'chromium_aislado' });
+      setRuntimeState(db, task.id, {
+        phase: visual.disponible ? 'browser_ready' : 'browser_error', active_tool: null, channel: 'web',
+        status_detail: visual.disponible ? `Página cargada: ${visual.url || visualUrl}` : visual.texto,
+      }, 'browser_preinspection_finished');
+      recordEvent(db, task.id, 'browser_action_done', {
+        accion: 'navegar', url: visual.url || visualUrl, texto: visual.texto,
+        proveedor: 'chromium_aislado', channel: 'web', session_scope: 'isolated_guest',
+      });
       db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)').run(
-        uuidv4(), task.id, 'user', `[Observación visual real ya disponible. Resume esta captura y texto, sin afirmar bloqueos inexistentes ni volver a navegar con terminal.]\n${visual.texto}`
+        uuidv4(), task.id, 'user', `[Observación visual real ya disponible desde Chromium aislado. Resume esta captura y texto; no uses terminal para navegar.]\n${visual.texto}`
       );
     }
 
