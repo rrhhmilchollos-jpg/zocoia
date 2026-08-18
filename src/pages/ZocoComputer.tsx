@@ -6,7 +6,9 @@ interface Fase { titulo: string; estado: 'pendiente' | 'en_curso' | 'completada'
 interface Msg { role: string; content: string; created_at?: string; }
 interface Evento { id?: number; type: string; ts?: string; [key: string]: any; }
 interface RuntimeState { phase?: string; iteration?: number; active_tool?: string | null; tool_run_id?: string; channel?: string; status_detail?: string; elapsed_seconds?: number; provider?: string; model?: string; last_progress_at?: string; [key: string]: any; }
-interface Task { id: string; title: string; status: string; model?: string; runtime_state?: string; runtime?: RuntimeState; created_at?: string; updated_at?: string; }
+interface Task { id: string; title: string; status: string; model?: string; browser_profile_id?: string | null; runtime_state?: string; runtime?: RuntimeState; created_at?: string; updated_at?: string; }
+interface BrowserProfile { id: string; label: string; status: string; last_used_at?: string | null; permissions?: Array<{ domain: string; permission: string; expires_at?: string | null }>; }
+interface BrowserApproval { id: string; task_id: string; profile_id?: string | null; domain?: string | null; action?: { accion?: string; url?: string | null }; status: string; }
 
 type RuntimeTab = 'all' | 'terminal' | 'files' | 'web' | 'activity';
 
@@ -51,6 +53,9 @@ const EVENT_META: Record<string, { icon: string; label: string; panel: RuntimeTa
   browser_action_done: { icon: 'fa-circle-check', label: 'Acción web completada', panel: 'web', tone: 'text-fuchsia-300' },
   browser_action: { icon: 'fa-arrow-pointer', label: 'Acción web', panel: 'web', tone: 'text-fuchsia-300' },
   browser_screenshot: { icon: 'fa-camera', label: 'Captura web', panel: 'web', tone: 'text-fuchsia-300' },
+  browser_approval_required: { icon: 'fa-shield-halved', label: 'Aprobación web requerida', panel: 'web', tone: 'text-amber-300' },
+  browser_action_approved: { icon: 'fa-shield-check', label: 'Permiso web concedido', panel: 'web', tone: 'text-emerald-300' },
+  browser_action_rejected: { icon: 'fa-shield-xmark', label: 'Permiso web rechazado', panel: 'web', tone: 'text-red-300' },
   port_exposed: { icon: 'fa-link', label: 'Servicio publicado', panel: 'activity', tone: 'text-emerald-300' },
   assistant_message: { icon: 'fa-comment-dots', label: 'Respuesta', panel: 'activity', tone: 'text-slate-300' },
   user_message: { icon: 'fa-user', label: 'Instrucción', panel: 'activity', tone: 'text-slate-300' },
@@ -70,6 +75,7 @@ const SSE_EVENT_TYPES = [
   ...Object.keys(EVENT_META),
   'sandbox_started', 'sandbox_unavailable', 'sandbox_command', 'sandbox_error',
   'todo_recited', 'task_resumed', 'task_stopped', 'browser_action_success', 'browser_action_error',
+  'browser_approval_required', 'browser_action_approved', 'browser_action_rejected',
 ];
 
 const STATUS_META: Record<string, { text: string; className: string; dot: string }> = {
@@ -129,6 +135,11 @@ export default function ZocoComputer() {
   const [showTaskRail, setShowTaskRail] = useState(true);
   const [taskMenuId, setTaskMenuId] = useState<string | null>(null);
   const [taskActionError, setTaskActionError] = useState<string | null>(null);
+  const [browserProfiles, setBrowserProfiles] = useState<BrowserProfile[]>([]);
+  const [selectedBrowserProfileId, setSelectedBrowserProfileId] = useState<string>('');
+  const [browserApprovals, setBrowserApprovals] = useState<BrowserApproval[]>([]);
+  const [browserControlError, setBrowserControlError] = useState<string | null>(null);
+  const [bridgePairing, setBridgePairing] = useState<{ profile: BrowserProfile; pairingCode: string; expires_in: string } | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const runtimeEndRef = useRef<HTMLDivElement>(null);
@@ -147,6 +158,73 @@ export default function ZocoComputer() {
   }, [headers]);
 
   useEffect(() => { void loadTasks(); }, [loadTasks]);
+
+  const loadBrowserControls = useCallback(async () => {
+    try {
+      const [profilesResponse, approvalsResponse] = await Promise.all([
+        fetch(`${API_BASE}/api/computer/browser/profiles`, { headers: headers() }),
+        fetch(`${API_BASE}/api/computer/browser/approvals`, { headers: headers() }),
+      ]);
+      if (profilesResponse.ok) {
+        const profiles = await profilesResponse.json();
+        setBrowserProfiles(profiles);
+        setSelectedBrowserProfileId(current => current || profiles.find((profile: BrowserProfile) => profile.status === 'activo')?.id || '');
+      }
+      if (approvalsResponse.ok) setBrowserApprovals(await approvalsResponse.json());
+    } catch { /* El agente continúa disponible sin perfil persistente. */ }
+  }, [headers]);
+
+  useEffect(() => { void loadBrowserControls(); }, [loadBrowserControls]);
+
+  const createBrowserProfile = useCallback(async () => {
+    const label = window.prompt('Nombre para el perfil de navegador persistente:', 'Mi sesión web');
+    if (!label?.trim()) return;
+    setBrowserControlError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/computer/browser/profiles`, {
+        method: 'POST', headers: headers(), body: JSON.stringify({ label: label.trim() }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'No se pudo crear el perfil de navegador.');
+      setBrowserProfiles(previous => [data, ...previous]);
+      setSelectedBrowserProfileId(data.id);
+    } catch (error: any) {
+      setBrowserControlError(error.message || 'No se pudo crear el perfil de navegador.');
+    }
+  }, [headers]);
+
+  const createBridgePairing = useCallback(async () => {
+    const label = window.prompt('Nombre para tu navegador Chrome vinculado:', 'Chrome personal');
+    if (!label?.trim()) return;
+    setBrowserControlError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/computer/browser/bridge/pairings`, {
+        method: 'POST', headers: headers(), body: JSON.stringify({ label: label.trim() }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'No se pudo crear el código de conexión.');
+      setBridgePairing(data);
+      void loadBrowserControls();
+    } catch (error: any) {
+      setBrowserControlError(error.message || 'No se pudo crear el código de conexión.');
+    }
+  }, [headers, loadBrowserControls]);
+
+  const resolveBrowserApproval = useCallback(async (approval: BrowserApproval, approved: boolean) => {
+    setBrowserControlError(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/computer/browser/approvals/${approval.id}/resolve`, {
+        method: 'POST', headers: headers(), body: JSON.stringify({ approved }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'No se pudo resolver la aprobación.');
+      setBrowserApprovals(previous => previous.filter(item => item.id !== approval.id));
+      void loadBrowserControls();
+      if (approved) void loadTasks();
+    } catch (error: any) {
+      setBrowserControlError(error.message || 'No se pudo resolver la aprobación.');
+    }
+  }, [headers, loadBrowserControls, loadTasks]);
 
   const connectStream = useCallback((taskId: string) => {
     eventSourceRef.current?.close();
@@ -175,6 +253,8 @@ export default function ZocoComputer() {
           setRuntime(previous => ({ ...(previous || {}), phase: 'stopped', active_tool: null, status_detail: event.mensaje || 'Tarea detenida.' }));
         }
         if (event.type === 'error') setActiveTask(previous => previous ? { ...previous, status: 'error' } : previous);
+        if (event.type === 'browser_approval_required') { void loadBrowserControls(); }
+        if (event.type === 'browser_action_approved' || event.type === 'browser_action_rejected') { void loadBrowserControls(); }
       } catch { /* Un evento malformado no interrumpe el stream. */ }
     };
     // `onmessage` conserva compatibilidad con eventos sin nombre. El servidor
@@ -185,7 +265,7 @@ export default function ZocoComputer() {
     SSE_EVENT_TYPES.forEach(type => stream.addEventListener(type, namedEventHandler));
     stream.onerror = () => { /* EventSource realiza la reconexión. */ };
     eventSourceRef.current = stream;
-  }, [loadTasks, token]);
+  }, [loadBrowserControls, loadTasks, token]);
 
   useEffect(() => () => eventSourceRef.current?.close(), []);
 
@@ -198,7 +278,7 @@ export default function ZocoComputer() {
       if (!response.ok) return;
       const data = await response.json();
       const snapshot = runtimeResponse.ok ? await runtimeResponse.json() : null;
-      setActiveTask({ id: data.id, title: data.title, status: data.status, model: data.model, runtime: snapshot?.runtime || data.runtime });
+      setActiveTask({ id: data.id, title: data.title, status: data.status, model: data.model, browser_profile_id: data.browser_profile_id || null, runtime: snapshot?.runtime || data.runtime });
       setRuntime(snapshot?.runtime || data.runtime || null);
       setMessages(data.messages || data.mensajes || []);
       setPlan(data.plan || []);
@@ -256,11 +336,11 @@ export default function ZocoComputer() {
     try {
       if (!token) throw new Error('Inicia sesión para crear una tarea autónoma.');
       const response = await fetch(`${API_BASE}/api/computer/tasks`, {
-        method: 'POST', headers: headers(), body: JSON.stringify({ prompt, model }),
+        method: 'POST', headers: headers(), body: JSON.stringify({ prompt, model, browserProfileId: selectedBrowserProfileId || null }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'No se pudo iniciar la tarea');
-      setActiveTask({ id: data.id, title: data.title, status: 'en_curso', model });
+      setActiveTask({ id: data.id, title: data.title, status: 'en_curso', model, browser_profile_id: data.browser_profile_id || null });
       setMessages([{ role: 'user', content: prompt }]);
       setPlan([]);
       setEvents([]);
@@ -274,7 +354,7 @@ export default function ZocoComputer() {
     } finally {
       setCreating(false);
     }
-  }, [connectStream, creating, headers, input, loadTasks, model, token]);
+  }, [connectStream, creating, headers, input, loadTasks, model, selectedBrowserProfileId, token]);
 
   const sendMessage = useCallback(async (contentOverride?: string) => {
     const content = (contentOverride ?? input).trim();
@@ -356,6 +436,7 @@ export default function ZocoComputer() {
               <div ref={chatEndRef} />
             </div>}
           </section>
+          <div className="border-t border-[#e4e6ec] bg-white px-4 pt-3"><div className="mx-auto max-w-3xl space-y-2">{browserControlError && <p role="alert" className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{browserControlError}</p>}<div className="flex flex-wrap items-center gap-2 rounded-xl border border-[#dfe2eb] bg-[#fbfcff] px-3 py-2"><i className="fa-solid fa-globe text-violet-600" /><span className="text-[11px] font-bold text-slate-600">Sesión web</span><select value={selectedBrowserProfileId} onChange={event => setSelectedBrowserProfileId(event.target.value)} className="min-w-0 flex-1 bg-transparent text-xs text-slate-700 outline-none"><option value="">Invitado aislado · solo lectura pública</option>{browserProfiles.filter(profile => profile.status === 'activo').map(profile => <option key={profile.id} value={profile.id}>{profile.label} · perfil persistente</option>)}</select><button onClick={() => void createBrowserProfile()} className="rounded-lg border border-violet-200 bg-white px-2.5 py-1.5 text-[10px] font-bold text-violet-700 hover:bg-violet-50"><i className="fa-solid fa-plus mr-1" />Perfil</button><button onClick={() => void createBridgePairing()} className="rounded-lg border border-sky-200 bg-white px-2.5 py-1.5 text-[10px] font-bold text-sky-700 hover:bg-sky-50"><i className="fa-brands fa-chrome mr-1" />Vincular Chrome</button></div>{bridgePairing && <div className="rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-[11px] text-sky-900"><div className="flex items-center justify-between gap-2"><b><i className="fa-brands fa-chrome mr-1.5" />Conecta {bridgePairing.profile.label}</b><button onClick={() => setBridgePairing(null)} aria-label="Cerrar código de conexión" className="text-sky-600 hover:text-sky-900"><i className="fa-solid fa-xmark" /></button></div><p className="mt-1">Descarga el puente, cárgalo como extensión descomprimida de Chrome y escribe este código temporal. Caduca en {bridgePairing.expires_in}.</p><div className="mt-2 flex flex-wrap items-center gap-2"><code className="rounded-lg bg-white px-2 py-1 font-bold tracking-[.15em] text-sky-900">{bridgePairing.pairingCode}</code><a href="/zoco-browser-bridge.zip" download className="rounded-lg bg-sky-700 px-2.5 py-1.5 font-bold text-white hover:bg-sky-800"><i className="fa-solid fa-download mr-1" />Descargar puente</a></div></div>}{browserApprovals.length > 0 && <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2"><p className="text-[11px] font-bold text-amber-900"><i className="fa-solid fa-shield-halved mr-1.5" />Acción web pendiente de aprobación</p>{browserApprovals.map(approval => <div key={approval.id} className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-amber-800"><span className="flex-1">{approval.action?.accion || 'Interacción'} en <b>{approval.domain || 'página actual'}</b>. Se permitirá interactuar con este dominio durante 8 horas.</span><button onClick={() => void resolveBrowserApproval(approval, true)} className="rounded-lg bg-emerald-600 px-2.5 py-1.5 font-bold text-white hover:bg-emerald-700">Permitir</button><button onClick={() => void resolveBrowserApproval(approval, false)} className="rounded-lg border border-amber-300 bg-white px-2.5 py-1.5 font-bold text-amber-800 hover:bg-amber-100">Rechazar</button></div>)}</div>}</div></div>
           <footer className="border-t border-[#e4e6ec] bg-white p-4"><div className="mx-auto flex max-w-3xl items-end gap-2 rounded-2xl border border-[#dfe2eb] bg-[#fbfcff] p-2 shadow-sm"><div className="hidden rounded-xl bg-[#f0f1f6] px-2 py-2 text-[10px] font-bold text-slate-500 sm:block">{activeTask ? 'CONTEXTO ACTIVO' : currentModel.label.toUpperCase()}</div><textarea value={input} onChange={event => setInput(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (activeTask) void sendMessage(); else void createTask(); } }} placeholder={activeTask ? 'Añade una instrucción, un criterio o una nueva prioridad…' : 'Describe lo que quieres delegar al agente…'} rows={1} className="min-h-[40px] flex-1 resize-none bg-transparent px-2 py-2 text-sm text-slate-700 outline-none placeholder:text-slate-400" /><button onClick={() => { if (activeTask) void sendMessage(); else void createTask(); }} disabled={creating || !input.trim()} className="grid h-10 w-10 place-items-center rounded-xl bg-[#171923] text-white transition hover:bg-violet-700 disabled:cursor-not-allowed disabled:opacity-35"><i className={`fa-solid ${creating ? 'fa-spinner fa-spin' : 'fa-arrow-up'} text-sm`} /></button></div></footer>
         </main>
 

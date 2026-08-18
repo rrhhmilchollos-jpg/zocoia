@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Zoco Browser Bridge</title>
+  <style>body{width:300px;margin:0;padding:16px;background:#101218;color:#eef1f7;font:13px Inter,system-ui,sans-serif}h1{font-size:15px;margin:0 0 10px}p{line-height:1.45;color:#aab1c2}.field{display:grid;gap:6px;margin:12px 0}input{border:1px solid #353a48;border-radius:8px;background:#171a22;color:white;padding:9px}button{width:100%;border:0;border-radius:8px;padding:10px;background:#8b7cff;color:#11131a;font-weight:800;cursor:pointer}button.secondary{margin-top:8px;background:#242938;color:#dfe4ef}#status{min-height:20px;font-size:12px;color:#aab1c2}</style>
+</head>
+<body>
+  <h1>Zoco Browser Bridge</h1>
+  <p>Conecta esta sesión de Chrome mediante un código temporal generado en Zoco. No se copian contraseñas ni cookies al servidor.</p>
+  <label class="field">Código temporal<input id="pairingCode" autocomplete="one-time-code" placeholder="XXXX-XXXX" /></label>
+  <button id="connect">Conectar esta sesión</button>
+  <button id="disconnect" class="secondary">Desconectar</button>
+  <p id="status">Sin conexión.</p>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

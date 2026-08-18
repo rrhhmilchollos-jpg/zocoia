@@ -26,6 +26,8 @@ services:
       - CONNECTION_TIMEOUT=600000
       - PREBOOT_CHROME=true
     shm_size: "1gb"
+    volumes:
+      - ./data/browser-profiles:/profiles
     networks:
       - zocoia_browser_egress
       - zocoia_control
@@ -58,6 +60,7 @@ services:
       - ZOCO_BROWSER_PROVIDER=local
       - ZOCO_BROWSER_WS_ENDPOINT=ws://zoco-browser:3000
       - ZOCO_BROWSER_TOKEN=${ZOCO_BROWSER_TOKEN}
+      - ZOCO_BROWSER_PROFILE_ROOT=/profiles
     depends_on:
       ollama:
         condition: service_healthy
@@ -66,6 +69,7 @@ services:
     restart: always
     volumes:
       - ./data:/data
+      - ./data/browser-profiles:/profiles:ro
     networks:
       - default
       - zocoia_control

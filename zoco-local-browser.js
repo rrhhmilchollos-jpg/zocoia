@@ -1,14 +1,30 @@
 import puppeteer from 'puppeteer-core';
 
 const browserByTask = new Map();
+const profileLocks = new Map();
 const BROWSER_WS_ENDPOINT = process.env.ZOCO_BROWSER_WS_ENDPOINT || 'ws://zoco-browser:3000';
 const BROWSER_TOKEN = process.env.ZOCO_BROWSER_TOKEN || '';
+const BROWSER_PROFILE_ROOT = process.env.ZOCO_BROWSER_PROFILE_ROOT || '/profiles';
 const BROWSER_ACTION_TIMEOUT_MS = Math.min(60000, Math.max(5000, Number(process.env.ZOCO_BROWSER_ACTION_TIMEOUT_MS || 30000)));
 
-function endpointForConnection() {
-  if (!BROWSER_TOKEN) return BROWSER_WS_ENDPOINT;
+function safeProfileId(profileId) {
+  const normalized = String(profileId || 'guest').trim().replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 96);
+  return normalized || 'guest';
+}
+
+function isPersistentProfile(profileId) {
+  return Boolean(profileId && safeProfileId(profileId) !== 'guest');
+}
+
+function endpointForConnection(profileId) {
   const url = new URL(BROWSER_WS_ENDPOINT);
-  url.searchParams.set('token', BROWSER_TOKEN);
+  if (BROWSER_TOKEN) url.searchParams.set('token', BROWSER_TOKEN);
+  // Cada perfil conserva exclusivamente sus propios cookies, localStorage y
+  // preferencias en un volumen privado del contenedor Browserless.
+  if (isPersistentProfile(profileId)) {
+    const launch = { args: [`--user-data-dir=${BROWSER_PROFILE_ROOT}/${safeProfileId(profileId)}`] };
+    url.searchParams.set('launch', Buffer.from(JSON.stringify(launch)).toString('base64'));
+  }
   return url.toString();
 }
 
@@ -33,19 +49,28 @@ async function bounded(promise, label) {
   }
 }
 
-async function getPage(taskId) {
+async function getPage(taskId, profileId) {
+  const normalizedProfile = safeProfileId(profileId);
   let entry = browserByTask.get(taskId);
   try {
-    if (entry?.browser?.connected && !entry.page?.isClosed()) return entry.page;
+    if (entry?.browser?.connected && !entry.page?.isClosed() && entry.profileId === normalizedProfile) return entry.page;
   } catch { /* Se reconecta abajo. */ }
 
-  const browser = await puppeteer.connect({ browserWSEndpoint: endpointForConnection(), defaultViewport: null });
+  if (isPersistentProfile(normalizedProfile)) {
+    const lockedBy = profileLocks.get(normalizedProfile);
+    if (lockedBy && lockedBy !== taskId) {
+      throw new Error('El perfil de navegador ya está siendo usado por otra tarea. Espera a que finalice o detén aquella ejecución.');
+    }
+  }
+
+  const browser = await puppeteer.connect({ browserWSEndpoint: endpointForConnection(normalizedProfile), defaultViewport: null });
   const pages = await browser.pages();
   const page = pages.find(candidate => !candidate.isClosed()) || await browser.newPage();
   await page.setViewport({ width: 1280, height: 800, deviceScaleFactor: 1 });
   page.setDefaultTimeout(BROWSER_ACTION_TIMEOUT_MS);
-  entry = { browser, page };
+  entry = { browser, page, profileId: normalizedProfile };
   browserByTask.set(taskId, entry);
+  if (isPersistentProfile(normalizedProfile)) profileLocks.set(normalizedProfile, taskId);
   return page;
 }
 
@@ -59,15 +84,17 @@ async function snapshot(page) {
   return { title, url, text, captura: Buffer.from(png).toString('base64') };
 }
 
-export async function browserActionLocal({ taskId, accion, url, x, y, texto, tecla, direccion, cantidad, onEvent = null }) {
+export async function browserActionLocal({ taskId, profileId = 'guest', accion, url, x, y, texto, tecla, direccion, cantidad, onEvent = null }) {
+  const normalizedProfile = safeProfileId(profileId);
   emit(onEvent, 'browser_action_start', {
     accion,
     url: url || null,
+    perfil: isPersistentProfile(normalizedProfile) ? 'persistente' : 'invitado_aislado',
     coordenadas: Number.isFinite(x) && Number.isFinite(y) ? { x: Math.round(x), y: Math.round(y) } : null,
   });
 
   try {
-    const page = await bounded(getPage(taskId), 'La conexión con Chromium');
+    const page = await bounded(getPage(taskId, normalizedProfile), 'La conexión con Chromium');
     switch (accion) {
       case 'navegar':
         if (!url || !/^https?:\/\//i.test(url)) throw new Error('Indica una URL completa que empiece por http:// o https://.');
@@ -99,8 +126,8 @@ export async function browserActionLocal({ taskId, accion, url, x, y, texto, tec
     }
 
     const estado = await bounded(snapshot(page), 'La captura de la página');
-    emit(onEvent, 'browser_screenshot', { imagen: estado.captura, accion, url: estado.url, titulo: estado.title, proveedor: 'chromium_aislado' });
-    emit(onEvent, 'browser_action_success', { accion, url: estado.url, titulo: estado.title, proveedor: 'chromium_aislado' });
+    emit(onEvent, 'browser_screenshot', { imagen: estado.captura, accion, url: estado.url, titulo: estado.title, perfil: isPersistentProfile(normalizedProfile) ? 'persistente' : 'invitado_aislado', proveedor: 'chromium_aislado' });
+    emit(onEvent, 'browser_action_success', { accion, url: estado.url, titulo: estado.title, perfil: isPersistentProfile(normalizedProfile) ? 'persistente' : 'invitado_aislado', proveedor: 'chromium_aislado' });
     return {
       disponible: true,
       captura: estado.captura,
@@ -119,10 +146,9 @@ export async function browserActionLocal({ taskId, accion, url, x, y, texto, tec
 export async function closeLocalBrowser(taskId) {
   const entry = browserByTask.get(taskId);
   browserByTask.delete(taskId);
+  if (entry?.profileId && profileLocks.get(entry.profileId) === taskId) profileLocks.delete(entry.profileId);
   try {
-    // `disconnect()` solo abandona el WebSocket y Browserless puede conservar
-    // la sesión Chrome en cola. `close()` finaliza únicamente esta sesión CDP,
-    // liberando la ranura visual sin detener el servicio compartido.
+    // `close()` finaliza únicamente esta sesión CDP y libera la ranura visual.
     if (entry?.browser?.connected) await entry.browser.close();
   } catch { /* La sesión puede haber terminado durante una cancelación. */ }
 }

@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Zoco Browser Bridge",
+  "version": "0.1.0",
+  "description": "Puente local y revocable entre Zoco y una sesión de Chrome autorizada por el usuario.",
+  "permissions": ["storage", "tabs", "scripting", "activeTab"],
+  "optional_host_permissions": ["https://*/*", "http://*/*"],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Zoco Browser Bridge",
+    "default_popup": "popup.html"
+  }
+}

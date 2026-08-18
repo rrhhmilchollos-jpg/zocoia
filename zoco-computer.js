@@ -23,6 +23,7 @@
  */
 
 import { spawn } from 'child_process';
+import crypto from 'crypto';
 import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
@@ -114,9 +115,82 @@ function ensureSchema(db) {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
+    -- Un perfil no almacena cookies en SQLite: solo contiene un identificador
+    -- opaco para el directorio privado que Browserless mantiene por usuario.
+    CREATE TABLE IF NOT EXISTS browser_profiles (
+      id          TEXT PRIMARY KEY,
+      user_id     TEXT NOT NULL,
+      label       TEXT NOT NULL,
+      profile_key TEXT NOT NULL UNIQUE,
+      status      TEXT NOT NULL DEFAULT 'activo',
+      created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+      last_used_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS browser_domain_permissions (
+      id          TEXT PRIMARY KEY,
+      profile_id  TEXT NOT NULL,
+      domain      TEXT NOT NULL,
+      permission  TEXT NOT NULL DEFAULT 'leer',
+      expires_at  TEXT,
+      created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(profile_id, domain)
+    );
+
+    CREATE TABLE IF NOT EXISTS browser_action_approvals (
+      id          TEXT PRIMARY KEY,
+      task_id     TEXT NOT NULL,
+      user_id     TEXT NOT NULL,
+      profile_id  TEXT,
+      domain      TEXT,
+      action_json TEXT NOT NULL,
+      status      TEXT NOT NULL DEFAULT 'pendiente',
+      expires_at  TEXT NOT NULL,
+      resolved_at TEXT,
+      created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS browser_bridge_pairs (
+      id          TEXT PRIMARY KEY,
+      user_id     TEXT NOT NULL,
+      code_hash   TEXT NOT NULL UNIQUE,
+      profile_id  TEXT NOT NULL,
+      expires_at  TEXT NOT NULL,
+      claimed_at  TEXT,
+      created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS browser_bridge_devices (
+      id          TEXT PRIMARY KEY,
+      user_id     TEXT NOT NULL,
+      profile_id  TEXT NOT NULL UNIQUE,
+      token_hash  TEXT NOT NULL UNIQUE,
+      status      TEXT NOT NULL DEFAULT 'activo',
+      browser     TEXT,
+      last_seen_at TEXT,
+      created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS browser_bridge_commands (
+      id          TEXT PRIMARY KEY,
+      task_id     TEXT,
+      device_id   TEXT NOT NULL,
+      action_json TEXT NOT NULL,
+      status      TEXT NOT NULL DEFAULT 'pendiente',
+      result_json TEXT,
+      created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+      completed_at TEXT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_computer_tasks_user   ON computer_tasks(user_id);
     CREATE INDEX IF NOT EXISTS idx_computer_msgs_task    ON computer_messages(task_id);
     CREATE INDEX IF NOT EXISTS idx_computer_events_task  ON computer_events(task_id, id);
+    CREATE INDEX IF NOT EXISTS idx_browser_profiles_user ON browser_profiles(user_id);
+    CREATE INDEX IF NOT EXISTS idx_browser_grants_profile ON browser_domain_permissions(profile_id, domain);
+    CREATE INDEX IF NOT EXISTS idx_browser_approvals_task ON browser_action_approvals(task_id, status);
+    CREATE INDEX IF NOT EXISTS idx_browser_bridge_pairs ON browser_bridge_pairs(code_hash, expires_at);
+    CREATE INDEX IF NOT EXISTS idx_browser_bridge_commands ON browser_bridge_commands(device_id, status);
   `);
 
   // Migración tolerante desde el esquema antiguo (columna `task` en inglés y
@@ -133,6 +207,10 @@ function ensureSchema(db) {
     if (!cols.includes('last_event_id')) db.exec('ALTER TABLE computer_tasks ADD COLUMN last_event_id INTEGER DEFAULT 0');
     if (!cols.includes('heartbeat_at')) db.exec('ALTER TABLE computer_tasks ADD COLUMN heartbeat_at TEXT');
     if (!cols.includes('cancel_requested_at')) db.exec('ALTER TABLE computer_tasks ADD COLUMN cancel_requested_at TEXT');
+    if (!cols.includes('browser_profile_id')) db.exec('ALTER TABLE computer_tasks ADD COLUMN browser_profile_id TEXT');
+    const profileCols = db.prepare('PRAGMA table_info(browser_profiles)').all().map(c => c.name);
+    if (!profileCols.includes('bridge_device_id')) db.exec('ALTER TABLE browser_profiles ADD COLUMN bridge_device_id TEXT');
+    if (!profileCols.includes('profile_kind')) db.exec("ALTER TABLE browser_profiles ADD COLUMN profile_kind TEXT NOT NULL DEFAULT 'chromium_persistente'");
     db.exec(`
       UPDATE computer_tasks SET status = CASE status
         WHEN 'running'   THEN 'en_curso'
@@ -154,6 +232,39 @@ const suscriptores = new Map(); // task_id -> Set<res>
 // Contexto efímero de la herramienta que está ejecutándose. Permite correlacionar
 // los eventos internos ya existentes sin reescribir cada adaptador de una vez.
 const activeToolRuns = new Map(); // task_id -> { tool_run_id, herramienta }
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function executeBrowserBridgeAction(db, task, args) {
+  const profile = db.prepare("SELECT * FROM browser_profiles WHERE id = ? AND user_id = ? AND profile_kind = 'chrome_bridge' AND status = 'activo'").get(task.browser_profile_id, task.user_id);
+  if (!profile?.bridge_device_id) return { disponible: false, texto: 'El perfil de Chrome vinculado ya no está disponible. Crea y vincula un perfil nuevo.' };
+  const actionMap = { navegar: 'navigate', captura: 'snapshot', clic: 'click', escribir: 'type' };
+  const type = actionMap[args.accion];
+  if (!type) return { disponible: false, texto: `La acción ${args.accion || 'solicitada'} no está disponible todavía en el puente de Chrome.` };
+  const commandId = crypto.randomUUID();
+  const action = { type, url: args.url || null, x: args.x, y: args.y, text: args.texto || null };
+  db.prepare("INSERT INTO browser_bridge_commands (id, task_id, device_id, action_json) VALUES (?, ?, ?, ?)")
+    .run(commandId, task.id, profile.bridge_device_id, JSON.stringify(action));
+  setRuntimeState(db, task.id, { phase: 'browser_bridge_waiting', active_tool: 'navegador', channel: 'web', status_detail: 'Esperando el resultado de la sesión de Chrome vinculada.' }, 'browser_bridge_command');
+  recordEvent(db, task.id, 'browser_bridge_command', { channel: 'web', command_id: commandId, action: type, profile_id: profile.id });
+
+  const deadline = Date.now() + 55000;
+  while (Date.now() < deadline) {
+    await sleep(1000);
+    const command = db.prepare('SELECT status, result_json FROM browser_bridge_commands WHERE id = ?').get(commandId);
+    if (!command || command.status === 'error') {
+      const result = command?.result_json ? (() => { try { return JSON.parse(command.result_json); } catch { return {}; } })() : {};
+      return { disponible: false, texto: result.error || 'El navegador vinculado rechazó la acción.' };
+    }
+    if (command.status === 'completado') {
+      const result = (() => { try { return JSON.parse(command.result_json || '{}'); } catch { return {}; } })();
+      if (result.screenshot) recordEvent(db, task.id, 'browser_screenshot', { channel: 'web', imagen: result.screenshot, proveedor: 'chrome_vinculado', url: result.url || null, titulo: result.title || null });
+      setRuntimeState(db, task.id, { phase: 'browser_ready', active_tool: null, channel: 'web', browser_url: result.url || null, browser_domain: (() => { try { return new URL(result.url).hostname.toLowerCase(); } catch { return null; } })(), status_detail: `Sesión de Chrome observada: ${result.title || result.url || 'página activa'}.` }, 'browser_bridge_result');
+      return { disponible: true, captura: result.screenshot || null, url: result.url || null, texto: `Navegador Chrome vinculado en ${result.url || 'página activa'}${result.title ? ` · ${result.title}` : ''}.\n\nContenido visible:\n${result.text || '(sin texto visible)'}` };
+    }
+  }
+  return { disponible: false, texto: 'El navegador vinculado no respondió dentro de 55 segundos. Comprueba que la extensión Zoco Browser Bridge está instalada y conectada.' };
+}
 
 function eventChannel(type, payload = {}) {
   if (payload.channel) return payload.channel;
@@ -837,8 +948,44 @@ async function executeTool(db, task, workspaceDir, name, args, context, runtime 
 
     case 'navegador': {
       try {
+        const accion = String(args.accion || '');
+        const esInteractiva = ['clic', 'escribir', 'tecla'].includes(accion);
+        if (esInteractiva) {
+          if (!task.browser_profile_id) {
+            return 'Para escribir, pulsar teclas o hacer clic debes seleccionar un perfil de navegador persistente y aprobar el dominio. La navegación y las capturas públicas sí están permitidas con el perfil de invitado aislado.';
+          }
+          const state = parseRuntimeState(task.runtime_state);
+          const targetUrl = String(args.url || state.browser_url || '');
+          let domain = null;
+          try { domain = new URL(targetUrl).hostname.toLowerCase(); } catch { /* se solicita una aprobación que el usuario puede revisar */ }
+          const grant = domain ? db.prepare(`SELECT permission FROM browser_domain_permissions
+            WHERE profile_id = ? AND domain = ? AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))`).get(task.browser_profile_id, domain) : null;
+          if (!grant || grant.permission !== 'interactuar') {
+            const existing = db.prepare(`SELECT id FROM browser_action_approvals
+              WHERE task_id = ? AND status = 'pendiente' AND datetime(expires_at) > datetime('now') ORDER BY created_at DESC LIMIT 1`).get(task.id);
+            const approvalId = existing?.id || context.uuidv4();
+            if (!existing) {
+              db.prepare(`INSERT INTO browser_action_approvals (id, task_id, user_id, profile_id, domain, action_json, status, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'pendiente', datetime('now', '+10 minutes'))`)
+                .run(approvalId, task.id, task.user_id, task.browser_profile_id, domain, JSON.stringify({ accion, url: targetUrl || null, texto: accion === 'escribir' ? String(args.texto || '').slice(0, 120) : null }));
+            }
+            setRuntimeState(db, task.id, { phase: 'awaiting_browser_approval', active_tool: null, channel: 'web', status_detail: `Esperando tu aprobación para interactuar con ${domain || 'esta página'}.` }, 'browser_approval_required');
+            recordEvent(db, task.id, 'browser_approval_required', { channel: 'web', approval_id: approvalId, domain, accion, profile_id: task.browser_profile_id });
+            db.prepare("UPDATE computer_tasks SET status = 'pausada', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(task.id);
+            return `Acción web detenida por seguridad. Se creó la aprobación ${approvalId} para ${domain || 'la página actual'}. El usuario debe aprobarla desde el panel antes de reanudar.`;
+          }
+        }
+        const profileKind = task.browser_profile_id
+          ? db.prepare('SELECT profile_kind FROM browser_profiles WHERE id = ? AND user_id = ?').get(task.browser_profile_id, task.user_id)?.profile_kind
+          : null;
+        if (profileKind === 'chrome_bridge') {
+          const bridged = await executeBrowserBridgeAction(db, task, args);
+          recordEvent(db, task.id, 'browser_action_done', { accion: args.accion, url: bridged.url || args.url || null, texto: bridged.texto, proveedor: 'chrome_vinculado', channel: 'web' });
+          return bridged.texto;
+        }
         const r = await browserAction({
           taskId: task.id,
+          profileId: task.browser_profile_id || 'guest',
           apiKey: E2B_API_KEY,
           accion: args.accion,
           url: args.url,
@@ -847,8 +994,12 @@ async function executeTool(db, task, workspaceDir, name, args, context, runtime 
           direccion: args.direccion, cantidad: args.cantidad,
           onEvent: (type, payload) => recordEvent(db, task.id, type, payload),
         });
+        const browserUrl = r.url || args.url || null;
+        if (browserUrl) {
+          setRuntimeState(db, task.id, { browser_url: browserUrl, browser_domain: (() => { try { return new URL(browserUrl).hostname.toLowerCase(); } catch { return null; } })() });
+        }
         recordEvent(db, task.id, 'browser_action_done', {
-          accion: args.accion, url: args.url || null, texto: r.texto, streamUrl: r.streamUrl || null,
+          accion: args.accion, url: browserUrl, texto: r.texto, streamUrl: r.streamUrl || null,
         });
         if (r.captura) {
           recordEvent(db, task.id, 'browser_screenshot', {
@@ -956,10 +1107,11 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
       }, 'browser_preinspection_started');
       const visual = await browserAction({
         taskId: task.id,
+        profileId: task.browser_profile_id || 'guest',
         apiKey: E2B_API_KEY,
         accion: 'navegar',
         url: visualUrl,
-        onEvent: (type, payload) => recordEvent(db, task.id, type, { ...payload, channel: 'web', session_scope: 'isolated_guest' }),
+        onEvent: (type, payload) => recordEvent(db, task.id, type, { ...payload, channel: 'web', session_scope: task.browser_profile_id ? 'perfil_persistente' : 'invitado_aislado' }),
       });
       setRuntimeState(db, task.id, {
         phase: visual.disponible ? 'browser_ready' : 'browser_error', active_tool: null, channel: 'web',
@@ -967,8 +1119,11 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
       }, 'browser_preinspection_finished');
       recordEvent(db, task.id, 'browser_action_done', {
         accion: 'navegar', url: visual.url || visualUrl, texto: visual.texto,
-        proveedor: 'chromium_aislado', channel: 'web', session_scope: 'isolated_guest',
+        proveedor: 'chromium_aislado', channel: 'web', session_scope: task.browser_profile_id ? 'perfil_persistente' : 'invitado_aislado',
       });
+      if (task.browser_profile_id && visual.disponible) {
+        db.prepare('UPDATE browser_profiles SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(task.browser_profile_id);
+      }
       db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)').run(
         uuidv4(), task.id, 'user', `[Observación visual real ya disponible desde Chromium aislado. Resume esta captura y texto; no uses terminal para navegar.]\n${visual.texto}`
       );
@@ -1056,6 +1211,156 @@ export function registerComputerRoutes({
 
   const propietario = (req, id) =>
     db.prepare('SELECT * FROM computer_tasks WHERE id = ? AND user_id = ?').get(id, req.auth.sub);
+  const perfilPropietario = (req, id) =>
+    db.prepare('SELECT * FROM browser_profiles WHERE id = ? AND user_id = ?').get(id, req.auth.sub);
+  const normalizarDominio = (raw) => {
+    try { return new URL(/^https?:\/\//i.test(String(raw || '')) ? raw : `https://${raw}`).hostname.toLowerCase(); } catch { return null; }
+  };
+  const serializarPerfil = (perfil) => {
+    const permisos = db.prepare('SELECT id, domain, permission, expires_at, created_at, updated_at FROM browser_domain_permissions WHERE profile_id = ? ORDER BY domain').all(perfil.id);
+    return { id: perfil.id, label: perfil.label, status: perfil.status, created_at: perfil.created_at, last_used_at: perfil.last_used_at, permissions: permisos };
+  };
+
+  // ── Perfiles y permisos del navegador ──
+  app.get('/api/computer/browser/profiles', authMiddleware, (req, res) => {
+    const perfiles = db.prepare('SELECT * FROM browser_profiles WHERE user_id = ? ORDER BY datetime(created_at) DESC').all(req.auth.sub);
+    res.json(perfiles.map(serializarPerfil));
+  });
+
+  app.post('/api/computer/browser/profiles', authMiddleware, (req, res) => {
+    const label = String(req.body?.label || 'Mi navegador').trim().slice(0, 80);
+    if (!label) return res.status(400).json({ error: 'El nombre del perfil es obligatorio.' });
+    const id = uuidv4();
+    // No se guarda ningún secreto ni cookie en SQLite; la clave solo identifica
+    // el directorio privado de Chromium en el volumen aislado.
+    const profileKey = `zoco_${req.auth.sub.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 36)}_${id.replace(/-/g, '')}`;
+    db.prepare('INSERT INTO browser_profiles (id, user_id, label, profile_key, status) VALUES (?, ?, ?, ?, \'activo\')')
+      .run(id, req.auth.sub, label, profileKey);
+    res.status(201).json(serializarPerfil(perfilPropietario(req, id)));
+  });
+
+  app.patch('/api/computer/browser/profiles/:id', authMiddleware, (req, res) => {
+    const perfil = perfilPropietario(req, req.params.id);
+    if (!perfil) return res.status(404).json({ error: 'Perfil de navegador no encontrado.' });
+    const label = req.body?.label === undefined ? perfil.label : String(req.body.label).trim().slice(0, 80);
+    const status = req.body?.status === 'revocado' ? 'revocado' : req.body?.status === 'activo' ? 'activo' : perfil.status;
+    if (!label) return res.status(400).json({ error: 'El nombre del perfil es obligatorio.' });
+    db.prepare('UPDATE browser_profiles SET label = ?, status = ? WHERE id = ? AND user_id = ?').run(label, status, perfil.id, req.auth.sub);
+    res.json(serializarPerfil(perfilPropietario(req, perfil.id)));
+  });
+
+  app.put('/api/computer/browser/profiles/:id/domains', authMiddleware, (req, res) => {
+    const perfil = perfilPropietario(req, req.params.id);
+    if (!perfil) return res.status(404).json({ error: 'Perfil de navegador no encontrado.' });
+    const domain = normalizarDominio(req.body?.domain);
+    const permission = ['leer', 'interactuar'].includes(req.body?.permission) ? req.body.permission : 'leer';
+    if (!domain) return res.status(400).json({ error: 'Indica un dominio válido.' });
+    const expiresAt = req.body?.expires_at ? new Date(req.body.expires_at).toISOString() : null;
+    db.prepare(`INSERT INTO browser_domain_permissions (id, profile_id, domain, permission, expires_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(profile_id, domain) DO UPDATE SET permission = excluded.permission, expires_at = excluded.expires_at, updated_at = CURRENT_TIMESTAMP`)
+      .run(uuidv4(), perfil.id, domain, permission, expiresAt);
+    res.json(serializarPerfil(perfilPropietario(req, perfil.id)));
+  });
+
+  app.delete('/api/computer/browser/profiles/:id/domains/:domain', authMiddleware, (req, res) => {
+    const perfil = perfilPropietario(req, req.params.id);
+    const domain = normalizarDominio(req.params.domain);
+    if (!perfil || !domain) return res.status(404).json({ error: 'Permiso de navegador no encontrado.' });
+    db.prepare('DELETE FROM browser_domain_permissions WHERE profile_id = ? AND domain = ?').run(perfil.id, domain);
+    res.status(204).end();
+  });
+
+  // ── Puente autenticado de navegador local ──
+  // La extensión solo recibe un token de dispositivo revocable. Nunca recibe ni
+  // transmite cookies, contraseñas o la sesión JWT de Zoco.
+  app.post('/api/computer/browser/bridge/pairings', authMiddleware, (req, res) => {
+    const label = String(req.body?.label || 'Chrome personal').trim().slice(0, 80);
+    const profileId = uuidv4();
+    const profileKey = `bridge_${req.auth.sub.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 36)}_${profileId.replace(/-/g, '')}`;
+    const rawCode = crypto.randomBytes(5).toString('hex').toUpperCase();
+    const pairingCode = `${rawCode.slice(0, 5)}-${rawCode.slice(5)}`;
+    const codeHash = crypto.createHash('sha256').update(pairingCode).digest('hex');
+    db.prepare(`INSERT INTO browser_profiles (id, user_id, label, profile_key, profile_kind, status)
+                VALUES (?, ?, ?, ?, 'chrome_bridge', 'pendiente')`).run(profileId, req.auth.sub, label, profileKey);
+    db.prepare(`INSERT INTO browser_bridge_pairs (id, user_id, code_hash, profile_id, expires_at)
+                VALUES (?, ?, ?, ?, datetime('now', '+10 minutes'))`).run(uuidv4(), req.auth.sub, codeHash, profileId);
+    res.status(201).json({ profile: serializarPerfil(perfilPropietario(req, profileId)), pairingCode, expires_in: '10 minutos' });
+  });
+
+  app.post('/api/browser-bridge/pair', (req, res) => {
+    const pairingCode = String(req.body?.pairingCode || '').trim().toUpperCase();
+    if (!/^[A-F0-9]{5}-[A-F0-9]{5}$/.test(pairingCode)) return res.status(400).json({ error: 'Código de emparejamiento inválido.' });
+    const codeHash = crypto.createHash('sha256').update(pairingCode).digest('hex');
+    const pair = db.prepare(`SELECT * FROM browser_bridge_pairs WHERE code_hash = ? AND claimed_at IS NULL AND datetime(expires_at) > datetime('now')`).get(codeHash);
+    if (!pair) return res.status(410).json({ error: 'El código ha caducado, ya fue usado o no existe.' });
+    const deviceId = uuidv4();
+    const deviceToken = crypto.randomBytes(32).toString('base64url');
+    const tokenHash = crypto.createHash('sha256').update(deviceToken).digest('hex');
+    db.prepare(`INSERT INTO browser_bridge_devices (id, user_id, profile_id, token_hash, browser, last_seen_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`).run(deviceId, pair.user_id, pair.profile_id, tokenHash, String(req.body?.browser || 'chrome-extension').slice(0, 80));
+    db.prepare("UPDATE browser_bridge_pairs SET claimed_at = CURRENT_TIMESTAMP WHERE id = ?").run(pair.id);
+    db.prepare("UPDATE browser_profiles SET bridge_device_id = ?, profile_kind = 'chrome_bridge', status = 'activo', last_used_at = CURRENT_TIMESTAMP WHERE id = ?").run(deviceId, pair.profile_id);
+    res.json({ deviceToken });
+  });
+
+  const bridgeDevice = (rawToken) => {
+    if (!rawToken) return null;
+    const hash = crypto.createHash('sha256').update(String(rawToken)).digest('hex');
+    return db.prepare("SELECT * FROM browser_bridge_devices WHERE token_hash = ? AND status = 'activo'").get(hash);
+  };
+
+  app.post('/api/browser-bridge/poll', (req, res) => {
+    const device = bridgeDevice(req.body?.deviceToken);
+    if (!device) return res.status(401).json({ error: 'Dispositivo de navegador no autorizado.' });
+    db.prepare('UPDATE browser_bridge_devices SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?').run(device.id);
+    const commands = db.prepare("SELECT id, action_json FROM browser_bridge_commands WHERE device_id = ? AND status = 'pendiente' ORDER BY datetime(created_at) ASC LIMIT 5").all(device.id)
+      .map(row => ({ id: row.id, action: (() => { try { return JSON.parse(row.action_json); } catch { return {}; } })() }));
+    if (commands.length) db.prepare("UPDATE browser_bridge_commands SET status = 'entregado' WHERE id IN (" + commands.map(() => '?').join(',') + ")").run(...commands.map(command => command.id));
+    res.json({ commands });
+  });
+
+  app.post('/api/browser-bridge/events', (req, res) => {
+    const device = bridgeDevice(req.body?.deviceToken);
+    if (!device) return res.status(401).json({ error: 'Dispositivo de navegador no autorizado.' });
+    const command = db.prepare('SELECT * FROM browser_bridge_commands WHERE id = ? AND device_id = ?').get(req.body?.commandId, device.id);
+    if (!command || command.status !== 'entregado') return res.status(404).json({ error: 'Comando de navegador no encontrado.' });
+    const result = req.body?.ok ? req.body?.result || {} : { error: String(req.body?.error || 'El navegador local no pudo ejecutar la acción.') };
+    db.prepare("UPDATE browser_bridge_commands SET status = ?, result_json = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?")
+      .run(req.body?.ok ? 'completado' : 'error', JSON.stringify(result), command.id);
+    if (command.task_id) recordEvent(db, command.task_id, req.body?.ok ? 'browser_bridge_result' : 'browser_bridge_error', { channel: 'web', command_id: command.id, ...result });
+    res.json({ ok: true });
+  });
+
+  app.get('/api/computer/browser/approvals', authMiddleware, (req, res) => {
+    const rows = db.prepare(`SELECT id, task_id, profile_id, domain, action_json, status, expires_at, resolved_at, created_at
+                             FROM browser_action_approvals WHERE user_id = ? AND status = 'pendiente' AND datetime(expires_at) > datetime('now')
+                             ORDER BY datetime(created_at) DESC LIMIT 50`).all(req.auth.sub);
+    res.json(rows.map(row => ({ ...row, action: (() => { try { return JSON.parse(row.action_json); } catch { return {}; } })() })));
+  });
+
+  app.post('/api/computer/browser/approvals/:id/resolve', authMiddleware, (req, res) => {
+    const approval = db.prepare('SELECT * FROM browser_action_approvals WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
+    if (!approval || approval.status !== 'pendiente') return res.status(404).json({ error: 'Aprobación pendiente no encontrada.' });
+    const approved = req.body?.approved === true;
+    const status = approved ? 'aprobada' : 'rechazada';
+    db.prepare('UPDATE browser_action_approvals SET status = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ?').run(status, approval.id);
+    if (approved && approval.profile_id && approval.domain) {
+      db.prepare(`INSERT INTO browser_domain_permissions (id, profile_id, domain, permission, expires_at, updated_at)
+                  VALUES (?, ?, ?, 'interactuar', datetime('now', '+8 hours'), CURRENT_TIMESTAMP)
+                  ON CONFLICT(profile_id, domain) DO UPDATE SET permission = 'interactuar', expires_at = datetime('now', '+8 hours'), updated_at = CURRENT_TIMESTAMP`)
+        .run(uuidv4(), approval.profile_id, approval.domain);
+    }
+    recordEvent(db, approval.task_id, approved ? 'browser_action_approved' : 'browser_action_rejected', { channel: 'web', domain: approval.domain, approval_id: approval.id, permission: approved ? 'interactuar durante 8 horas' : null });
+    const task = db.prepare('SELECT * FROM computer_tasks WHERE id = ? AND user_id = ?').get(approval.task_id, req.auth.sub);
+    if (approved && task && ['pausada', 'detenida'].includes(task.status) && !enEjecucion.has(task.id)) {
+      db.prepare("UPDATE computer_tasks SET status = 'en_curso', cancel_requested_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(task.id);
+      const refreshed = db.prepare('SELECT * FROM computer_tasks WHERE id = ?').get(task.id);
+      setRuntimeState(db, task.id, { phase: 'resuming_after_browser_approval', active_tool: null, channel: 'web', status_detail: `Permiso concedido para ${approval.domain}. Reanudando la tarea.` }, 'browser_approval_resumed');
+      setImmediate(() => lanzarTarea({ db, uuidv4, task: refreshed, makeCallModel }));
+    }
+    res.json({ id: approval.id, status, permission_expires_in: approved ? '8 horas' : null });
+  });
 
   // `EventSource` del navegador no permite enviar cabeceras personalizadas, por
   // lo que el token del stream SSE viaja en la query. Este middleware lo
@@ -1072,7 +1377,7 @@ export function registerComputerRoutes({
   app.get('/api/computer/tasks', authMiddleware, (req, res) => {
     try {
       const tareas = db.prepare(
-        `SELECT id, title, status, model, plan, result, runtime_state, last_event_id, heartbeat_at, cancel_requested_at, created_at, updated_at
+        `SELECT id, title, status, model, browser_profile_id, plan, result, runtime_state, last_event_id, heartbeat_at, cancel_requested_at, created_at, updated_at
            FROM computer_tasks WHERE user_id = ?
           ORDER BY datetime(COALESCE(updated_at, created_at)) DESC LIMIT 100`
       ).all(req.auth.sub);
@@ -1097,13 +1402,20 @@ export function registerComputerRoutes({
 
       const id = uuidv4();
       const modelo = resolverModelo(req.body?.model);
+      const browserProfileId = req.body?.browserProfileId ? String(req.body.browserProfileId) : null;
+      if (browserProfileId) {
+        const profile = perfilPropietario(req, browserProfileId);
+        if (!profile || profile.status !== 'activo') {
+          return res.status(400).json({ error: 'El perfil de navegador seleccionado no existe, no te pertenece o está revocado.' });
+        }
+      }
 
       db.prepare(
-        `INSERT INTO computer_tasks (id, user_id, title, status, model, runtime_state, created_at, updated_at)
-         VALUES (?, ?, ?, 'en_curso', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
-      ).run(id, req.auth.sub, titulo, modelo, JSON.stringify({
+        `INSERT INTO computer_tasks (id, user_id, title, status, model, browser_profile_id, runtime_state, created_at, updated_at)
+         VALUES (?, ?, ?, 'en_curso', ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+      ).run(id, req.auth.sub, titulo, modelo, browserProfileId, JSON.stringify({
         phase: 'queued', iteration: 0, active_tool: null, provider: process.env.AI_PROVIDER || 'ollama',
-        model: modelo, started_at: null, last_progress_at: new Date().toISOString(), status_detail: 'Tarea en cola de preparación.',
+        model: modelo, browser_profile_id: browserProfileId, started_at: null, last_progress_at: new Date().toISOString(), status_detail: 'Tarea en cola de preparación.',
       }));
 
       db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)')
@@ -1113,7 +1425,7 @@ export function registerComputerRoutes({
       recordEvent(db, id, 'task_queued', { channel: 'agent', titulo, modelo });
 
       // Respondemos ya: el panel se suscribirá al stream por separado.
-      res.status(201).json({ id, title: titulo, status: 'en_curso', model: modelo });
+      res.status(201).json({ id, title: titulo, status: 'en_curso', model: modelo, browser_profile_id: browserProfileId });
 
       lanzarTarea({ db, uuidv4, task, makeCallModel });
     } catch (err) {
@@ -1135,7 +1447,7 @@ export function registerComputerRoutes({
         ...(() => { try { return JSON.parse(e.payload || '{}'); } catch { return {}; } })(),
       }));
       res.json({
-        task: { id: task.id, title: task.title, status: task.status, model: task.model, result: task.result },
+        task: { id: task.id, title: task.title, status: task.status, model: task.model, browser_profile_id: task.browser_profile_id, result: task.result },
         runtime,
         live: enEjecucion.has(task.id),
         last_event_id: task.last_event_id || lastEvents.at(-1)?.event_id || 0,
