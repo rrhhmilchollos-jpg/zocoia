@@ -49,6 +49,15 @@ const EVENT_META: Record<string, { icon: string; label: string; panel: RuntimeTa
   error: { icon: 'fa-circle-xmark', label: 'Error de ejecución', panel: 'activity', tone: 'text-red-300' },
 };
 
+// El backend transmite eventos SSE con `event: <tipo>`. EventSource solo invoca
+// `onmessage` para el tipo por defecto, por lo que se registran también todos los
+// tipos nombrados que el runtime puede emitir.
+const SSE_EVENT_TYPES = [
+  ...Object.keys(EVENT_META),
+  'sandbox_started', 'sandbox_unavailable', 'sandbox_command', 'sandbox_error',
+  'todo_recited', 'task_resumed', 'task_stopped',
+];
+
 const STATUS_META: Record<string, { text: string; className: string; dot: string }> = {
   en_curso: { text: 'En curso', className: 'border-violet-400/25 bg-violet-400/10 text-violet-200', dot: 'bg-violet-300 animate-pulse' },
   completada: { text: 'Completada', className: 'border-emerald-400/25 bg-emerald-400/10 text-emerald-200', dot: 'bg-emerald-300' },
@@ -119,7 +128,7 @@ export default function ZocoComputer() {
   const connectStream = useCallback((taskId: string) => {
     eventSourceRef.current?.close();
     const stream = new EventSource(`${API_BASE}/api/computer/tasks/${taskId}/events?token=${encodeURIComponent(token || '')}&lastEventId=${lastEventIdRef.current}`);
-    stream.onmessage = (raw) => {
+    const ingestEvent = (raw: MessageEvent<string>) => {
       try {
         const event: Evento = JSON.parse(raw.data);
         const sequence = Number.parseInt(raw.lastEventId || '0', 10);
@@ -137,6 +146,12 @@ export default function ZocoComputer() {
         if (event.type === 'error') setActiveTask(previous => previous ? { ...previous, status: 'error' } : previous);
       } catch { /* Un evento malformado no interrumpe el stream. */ }
     };
+    // `onmessage` conserva compatibilidad con eventos sin nombre. El servidor
+    // utiliza además `event: thinking`, `event: tool_call`, etc.; esos tipos se
+    // escuchan explícitamente para que la actividad sea visible sin recargar.
+    stream.onmessage = ingestEvent;
+    const namedEventHandler = (raw: Event) => ingestEvent(raw as MessageEvent<string>);
+    SSE_EVENT_TYPES.forEach(type => stream.addEventListener(type, namedEventHandler));
     stream.onerror = () => { /* EventSource realiza la reconexión. */ };
     eventSourceRef.current = stream;
   }, [loadTasks, token]);
