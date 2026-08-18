@@ -21,6 +21,18 @@ function keyForBrowser(key) {
   return map[String(key || '')] || String(key || '');
 }
 
+async function bounded(promise, label) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} superó ${Math.round(BROWSER_ACTION_TIMEOUT_MS / 1000)} segundos.`)), BROWSER_ACTION_TIMEOUT_MS); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function getPage(taskId) {
   let entry = browserByTask.get(taskId);
   try {
@@ -55,11 +67,11 @@ export async function browserActionLocal({ taskId, accion, url, x, y, texto, tec
   });
 
   try {
-    const page = await getPage(taskId);
+    const page = await bounded(getPage(taskId), 'La conexión con Chromium');
     switch (accion) {
       case 'navegar':
         if (!url || !/^https?:\/\//i.test(url)) throw new Error('Indica una URL completa que empiece por http:// o https://.');
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: BROWSER_ACTION_TIMEOUT_MS });
+        await bounded(page.goto(url, { waitUntil: 'domcontentloaded', timeout: BROWSER_ACTION_TIMEOUT_MS }), 'La carga de la página');
         await new Promise(resolve => setTimeout(resolve, 1200));
         break;
       case 'clic':
@@ -86,7 +98,7 @@ export async function browserActionLocal({ taskId, accion, url, x, y, texto, tec
         throw new Error(`Acción de navegador no soportada: ${accion}.`);
     }
 
-    const estado = await snapshot(page);
+    const estado = await bounded(snapshot(page), 'La captura de la página');
     emit(onEvent, 'browser_screenshot', { imagen: estado.captura, accion, url: estado.url, titulo: estado.title, proveedor: 'chromium_aislado' });
     emit(onEvent, 'browser_action_success', { accion, url: estado.url, titulo: estado.title, proveedor: 'chromium_aislado' });
     return {
@@ -97,6 +109,7 @@ export async function browserActionLocal({ taskId, accion, url, x, y, texto, tec
       streamUrl: null,
     };
   } catch (error) {
+    await closeLocalBrowser(taskId);
     const message = `Navegador visual aislado no disponible: ${error.message}`;
     emit(onEvent, 'browser_action_error', { accion, error: message });
     return { disponible: false, captura: null, url: null, texto: message, streamUrl: null };
