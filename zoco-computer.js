@@ -858,6 +858,27 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
     }
     recordEvent(db, task.id, 'task_started', { titulo: task.title, modelo: task.model, contexto: contextoPersistente.ruta });
 
+    // Para solicitudes explícitas de inspección visual, abrimos primero la URL
+    // en Chromium y entregamos al modelo la captura y el texto visibles reales.
+    // Así no puede sustituir la observación por una conjetura o una llamada curl.
+    const visualMatch = String(task.title || '').match(/\b(?:https?:\/\/)?(?:www\.)?[a-z0-9][a-z0-9.-]*\.(?:es|com|org|net)(?:\/[^\s]*)?/i);
+    const visualRequested = /muestra(?:me)?|mu[eé]strame|qu[eé]\s+ves|pantalla|visual|navega(?:r)?/i.test(String(task.title || ''));
+    if (visualMatch && visualRequested) {
+      const candidate = visualMatch[0];
+      const visualUrl = /^https?:\/\//i.test(candidate) ? candidate : `https://${candidate}`;
+      const visual = await browserAction({
+        taskId: task.id,
+        apiKey: E2B_API_KEY,
+        accion: 'navegar',
+        url: visualUrl,
+        onEvent: (type, payload) => recordEvent(db, task.id, type, payload),
+      });
+      recordEvent(db, task.id, 'browser_action_done', { accion: 'navegar', url: visual.url || visualUrl, texto: visual.texto, proveedor: 'chromium_aislado' });
+      db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)').run(
+        uuidv4(), task.id, 'user', `[Observación visual real ya disponible. Resume esta captura y texto, sin afirmar bloqueos inexistentes ni volver a navegar con terminal.]\n${visual.texto}`
+      );
+    }
+
   // `makeCallModel` construye el invocador ya ligado al usuario: comprueba
   // créditos y cuenta activa, descuenta el consumo y devuelve la forma
   // OpenAI `data.choices[0].message` que espera el bucle.
