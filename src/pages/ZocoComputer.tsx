@@ -9,6 +9,11 @@ interface Task { id: string; title: string; status: string; model?: string; crea
 
 type RuntimeTab = 'all' | 'terminal' | 'files' | 'web' | 'activity';
 
+// Las peticiones convencionales pueden pasar por el proxy web. El stream SSE
+// se conecta al servicio persistente para conservar el envío inmediato de cada
+// evento y evitar buffering intermedio en despliegues estáticos.
+const SSE_API_BASE = import.meta.env.VITE_SSE_API_URL || 'https://api.zocoia.es';
+
 const MODEL_OPTIONS = [
   { value: 'zoco-max', label: 'Zoco Max', description: 'Razonamiento ampliado' },
   { value: 'zoco-plus', label: 'Zoco Plus', description: 'Equilibrado' },
@@ -127,7 +132,7 @@ export default function ZocoComputer() {
 
   const connectStream = useCallback((taskId: string) => {
     eventSourceRef.current?.close();
-    const stream = new EventSource(`${API_BASE}/api/computer/tasks/${taskId}/events?token=${encodeURIComponent(token || '')}&lastEventId=${lastEventIdRef.current}`);
+    const stream = new EventSource(`${SSE_API_BASE}/api/computer/tasks/${taskId}/events?token=${encodeURIComponent(token || '')}&lastEventId=${lastEventIdRef.current}`);
     const ingestEvent = (raw: MessageEvent<string>) => {
       try {
         const event: Evento = JSON.parse(raw.data);
