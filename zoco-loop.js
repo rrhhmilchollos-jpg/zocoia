@@ -68,19 +68,31 @@ function recoverTextToolCall(text, tools, uuidv4) {
   try { parsed = JSON.parse(cleaned); } catch {}
 
   let rawName = parsed?.name || parsed?.tool || parsed?.function?.name;
+  let compactArgs = null;
   if (!rawName) {
     const nameMatch = cleaned.match(/["']?name["']?\s*:\s*["']?([A-Za-z0-9_-]+)["']?/i);
     rawName = nameMatch?.[1];
+  }
+  // Qwen a veces expresa una tool call como `{gestionar_plan [fases] {...}}`
+  // en vez del JSON OpenAI. Solo recuperamos el nombre y el último objeto JSON;
+  // no se evalúa texto arbitrario ni se aceptan herramientas no declaradas.
+  if (!rawName) {
+    const compact = cleaned.match(/^\{?\s*([A-Za-z_][A-Za-z0-9_-]*)\s*(?:\[[^\]]+\])?\s*(\{[\s\S]*\})\s*\}?$/);
+    if (compact) {
+      rawName = compact[1];
+      try { compactArgs = JSON.parse(compact[2]); } catch { compactArgs = null; }
+    }
   }
   const candidates = [rawName, aliases[rawName]].filter(Boolean);
   const name = candidates.find((candidate) => known.has(candidate));
   if (!name) return null;
 
-  let args = parsed?.arguments ?? parsed?.args ?? parsed?.parameters ?? parsed?.input ?? {};
+  let args = parsed?.arguments ?? parsed?.args ?? parsed?.parameters ?? parsed?.input ?? compactArgs ?? {};
   if (typeof args === 'string') {
     try { args = JSON.parse(args); } catch { args = {}; }
   }
   if (!args || typeof args !== 'object' || Array.isArray(args)) args = {};
+  if (name === 'gestionar_plan' && args.fases && !Array.isArray(args.fases)) args = { ...args, fases: [args.fases] };
   return {
     id: `text-tool-${uuidv4()}`,
     type: 'function',
