@@ -225,6 +225,18 @@ export async function runAgentLoop({
     recordEvent(db, task.id, 'thinking', { iteracion: i + 1, contexto: 'todo.md' });
 
     // ── 3. Llamar al modelo ──
+    // Ollama en CPU puede tardar en preparar el contexto. El latido deja una
+    // evidencia verificable en la interfaz sin fingir razonamiento ni ocultar
+    // que el modelo sigue calculando.
+    const inferenceStartedAt = Date.now();
+    const inferenceHeartbeat = setInterval(() => {
+      const elapsedSeconds = Math.max(1, Math.round((Date.now() - inferenceStartedAt) / 1000));
+      recordEvent(db, task.id, 'model_waiting', {
+        iteracion: i + 1,
+        segundos: elapsedSeconds,
+        mensaje: `El modelo local continúa preparando la siguiente acción (${elapsedSeconds}s).`,
+      });
+    }, 8000);
     let data;
     try {
       data = await callModel(pruneHistory(messages), tools, 'auto');
@@ -245,6 +257,8 @@ export async function runAgentLoop({
       recordEvent(db, task.id, 'error', { mensaje: `Error del modelo: ${err.message}` });
       db.prepare("UPDATE computer_tasks SET status = 'error', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(task.id);
       return;
+    } finally {
+      clearInterval(inferenceHeartbeat);
     }
 
     const msg = data.choices?.[0]?.message || {};

@@ -23,6 +23,7 @@ const MODEL_OPTIONS = [
 const EVENT_META: Record<string, { icon: string; label: string; panel: RuntimeTab; tone: string }> = {
   task_started: { icon: 'fa-play', label: 'Ejecución iniciada', panel: 'activity', tone: 'text-emerald-300' },
   thinking: { icon: 'fa-sparkles', label: 'Razonando', panel: 'activity', tone: 'text-violet-300' },
+  model_waiting: { icon: 'fa-microchip', label: 'Modelo local activo', panel: 'activity', tone: 'text-cyan-300' },
   plan: { icon: 'fa-diagram-project', label: 'Plan actualizado', panel: 'activity', tone: 'text-sky-300' },
   plan_updated: { icon: 'fa-diagram-project', label: 'Plan actualizado', panel: 'activity', tone: 'text-sky-300' },
   tool_call: { icon: 'fa-wand-magic-sparkles', label: 'Herramienta', panel: 'activity', tone: 'text-amber-300' },
@@ -74,6 +75,7 @@ const STATUS_META: Record<string, { text: string; className: string; dot: string
 
 function eventSummary(event: Evento): string {
   if (event.type === 'thinking') return event.texto || `Iteración ${event.iteracion || 'actual'}: preparando la siguiente acción.`;
+  if (event.type === 'model_waiting') return event.mensaje || `El modelo local continúa activo (${event.segundos || 0}s).`;
   if (event.type === 'tool_call') return `${event.herramienta || 'herramienta'} · ${event.argumentos || 'sin argumentos visibles'}`;
   if (event.type === 'tool_result') return event.salida || '(herramienta terminada sin salida)';
   if (event.type === 'terminal_start') return `${event.comando ? `$ ${event.comando}` : 'Iniciando terminal…'}${event.directorio ? `\nDirectorio: ${event.directorio}` : ''}`;
@@ -245,7 +247,7 @@ export default function ZocoComputer() {
   const running = activeTask?.status === 'en_curso';
   const status = STATUS_META[activeTask?.status || 'pendiente'] || STATUS_META.pendiente;
   const visibleEvents = events.filter(event => runtimeTab === 'all' || EVENT_META[event.type]?.panel === runtimeTab || (runtimeTab === 'activity' && EVENT_META[event.type]?.panel === 'activity'));
-  const activityEvents = events.filter(event => ['thinking', 'plan', 'plan_updated', 'tool_call', 'strategy_recovery', 'tool_rejected', 'tool_error', 'finished', 'paused', 'error'].includes(event.type)).slice(-8);
+  const activityEvents = events.filter(event => ['thinking', 'model_waiting', 'plan', 'plan_updated', 'tool_call', 'strategy_recovery', 'tool_rejected', 'tool_error', 'finished', 'paused', 'error'].includes(event.type)).slice(-8);
   const currentModel = MODEL_OPTIONS.find(option => option.value === (activeTask?.model || model)) || MODEL_OPTIONS[0];
 
   return (
