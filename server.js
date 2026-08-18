@@ -78,6 +78,10 @@ const OLLAMA_MODEL_MAP = {
 const OLLAMA_URL = process.env.OLLAMA_BASE_URL || process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || 'local-ollama';
 const OLLAMA_TIMEOUT_MS = parseInt(process.env.OLLAMA_TIMEOUT_MS || '300000', 10);
+// El ordenador necesita llamadas breves para planificar y elegir herramientas;
+// limitar la salida evita que un modelo local de CPU reserve 4.096 tokens cuando
+// normalmente basta un JSON o un resultado final conciso.
+const COMPUTER_MODEL_MAX_TOKENS = Math.min(2048, Math.max(256, parseInt(process.env.COMPUTER_MODEL_MAX_TOKENS || '768', 10)));
 const ANTHROPIC_TIMEOUT_MS = parseInt(process.env.ANTHROPIC_TIMEOUT_MS || '120000', 10);
 
 function resolveOllamaModel(modeloZocoia) {
@@ -1418,7 +1422,7 @@ if (registerComputerRoutes) {
         const userCheck = db.prepare('SELECT creditos, activo FROM users WHERE id = ?').get(userId);
         if (!userCheck || !userCheck.activo) { const e = new Error('Cuenta desactivada'); e.status = 403; throw e; }
         if (userCheck.creditos <= BALANCE_BLOCK_THRESHOLD) { const e = new Error('Créditos insuficientes'); e.status = 402; throw e; }
-        const data = await callChatModel({ provider: aiConfig.provider, model: resolvedModel, messages: msgs, maxTokens: 4096, tools, toolChoice });
+        const data = await callChatModel({ provider: aiConfig.provider, model: resolvedModel, messages: msgs, maxTokens: COMPUTER_MODEL_MAX_TOKENS, tools, toolChoice });
         const totalTokens = data.usage?.total_tokens || 0;
         const coste = totalTokens * 0.000002;
         if (coste > 0) {
