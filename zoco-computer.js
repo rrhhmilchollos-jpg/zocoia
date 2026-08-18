@@ -1143,6 +1143,7 @@ export function registerComputerRoutes({
       db.prepare("UPDATE computer_tasks SET status = 'detenida', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .run(task.id);
       recordEvent(db, task.id, 'stopped', { mensaje: 'Tarea detenida por el usuario.' });
+      void closeLocalBrowser(task.id);
       res.json({ ok: true });
     } catch (err) {
       console.error('[ZocoComputer] error deteniendo tarea:', err);
@@ -1197,6 +1198,7 @@ export function registerComputerRoutes({
         db.prepare('DELETE FROM computer_tasks WHERE id = ? AND user_id = ?').run(task.id, req.auth.sub);
       });
       borrar();
+      await closeLocalBrowser(task.id);
       await fsp.rm(workspaceFor(task.id), { recursive: true, force: true });
       res.json({ ok: true, id: task.id });
     } catch (err) {
