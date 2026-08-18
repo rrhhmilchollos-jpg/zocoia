@@ -14,6 +14,22 @@ services:
       retries: 20
       start_period: 30s
 
+  zoco-browser:
+    image: browserless/chrome:latest
+    container_name: zocoia-browser
+    restart: always
+    expose:
+      - "3000"
+    environment:
+      - TOKEN=${ZOCO_BROWSER_TOKEN}
+      - MAX_CONCURRENT_SESSIONS=1
+      - CONNECTION_TIMEOUT=600000
+      - PREBOOT_CHROME=true
+    shm_size: "1gb"
+    networks:
+      - zocoia_browser_egress
+      - zocoia_control
+
   zocoia-api:
     build:
       context: .
@@ -39,9 +55,14 @@ services:
       - ALLOWED_ORIGINS=https://zocoia.es,https://www.zocoia.es,https://marisai.es,https://www.marisai.es
       - SANDBOX_RUNNER_URL=http://zocoia-sandbox-runner:8080
       - SANDBOX_RUNNER_TOKEN=${SANDBOX_RUNNER_TOKEN}
+      - ZOCO_BROWSER_PROVIDER=local
+      - ZOCO_BROWSER_WS_ENDPOINT=ws://zoco-browser:3000
+      - ZOCO_BROWSER_TOKEN=${ZOCO_BROWSER_TOKEN}
     depends_on:
       ollama:
         condition: service_healthy
+      zoco-browser:
+        condition: service_started
     restart: always
     volumes:
       - ./data:/data
@@ -60,3 +81,6 @@ networks:
   zocoia_internal:
     external: true
     name: zocoia_internal
+  zocoia_browser_egress:
+    name: zocoia_browser_egress
+    driver: bridge

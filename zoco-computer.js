@@ -30,6 +30,7 @@ import path from 'path';
 import { buildComputerSystemPrompt } from './zoco-prompt.js';
 import { runAgentLoop, recoverOrphanTasks } from './zoco-loop.js';
 import { applyFileEdits, browserAction, exposePort } from './zoco-tools-extra.js';
+import { closeLocalBrowser } from './zoco-local-browser.js';
 import { createSandboxSession, executeInSandbox, closeSandboxSession } from './zoco-sandbox-client.js';
 
 // ─── Configuración ────────────────────────────────────────────────────────────
@@ -39,6 +40,7 @@ const TOOL_TIMEOUT_MS = parseInt(process.env.COMPUTER_TOOL_TIMEOUT_MS || '180000
 const MAX_OUTPUT_CHARS = parseInt(process.env.COMPUTER_MAX_OUTPUT_CHARS || '12000', 10);
 const PUBLIC_BASE = process.env.COMPUTER_PUBLIC_BASE || '';
 const E2B_API_KEY = process.env.E2B_API_KEY || '';
+const BROWSER_PROVIDER = String(process.env.ZOCO_BROWSER_PROVIDER || 'local').trim().toLowerCase();
 
 // Modelos ofrecidos al usuario con identificadores internos estables. El backend
 // los resuelve al modelo físico del proveedor activo para evitar enviar IDs de
@@ -873,7 +875,7 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
     buildSystemPrompt: () => buildComputerSystemPrompt({
       taskTitle: task.title,
       workspaceDir,
-      tieneNavegador: Boolean(E2B_API_KEY),
+      tieneNavegador: BROWSER_PROVIDER !== 'e2b' || Boolean(E2B_API_KEY),
     }),
     tools: TOOLS,
       context: {
@@ -895,6 +897,7 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
     })
     .finally(() => {
       closeSandboxSession(sandboxSessionId);
+      void closeLocalBrowser(task.id);
       enEjecucion.delete(task.id);
     });
   };

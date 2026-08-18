@@ -11,6 +11,9 @@
 // -----------------------------------------------------------------------------
 
 import fsp from 'fs/promises';
+import { browserActionLocal } from './zoco-local-browser.js';
+
+const BROWSER_PROVIDER = String(process.env.ZOCO_BROWSER_PROVIDER || 'local').trim().toLowerCase();
 
 // ─── Edición quirúrgica de archivos ──────────────────────────────────────────
 
@@ -72,6 +75,9 @@ async function getDesktop(taskId, apiKey) {
 // Ejecuta una acción del navegador visual. Devuelve texto para el modelo y,
 // opcionalmente, una captura en base64 y la URL del stream en vivo.
 export async function browserAction({ taskId, apiKey, accion, url, x, y, texto, tecla, direccion, cantidad, onEvent = null }) {
+  if (BROWSER_PROVIDER !== 'e2b') {
+    return browserActionLocal({ taskId, accion, url, x, y, texto, tecla, direccion, cantidad, onEvent });
+  }
   const emitir = (type, payload = {}) => {
     if (typeof onEvent === 'function') onEvent(type, payload);
   };
