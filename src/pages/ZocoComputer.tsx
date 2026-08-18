@@ -170,7 +170,10 @@ export default function ZocoComputer() {
           void loadTasks();
         }
         if (event.type === 'paused') setActiveTask(previous => previous ? { ...previous, status: 'pausada' } : previous);
-        if (event.type === 'stopped') setActiveTask(previous => previous ? { ...previous, status: 'detenida' } : previous);
+        if (event.type === 'stopped') {
+          setActiveTask(previous => previous ? { ...previous, status: 'detenida' } : previous);
+          setRuntime(previous => ({ ...(previous || {}), phase: 'stopped', active_tool: null, status_detail: event.mensaje || 'Tarea detenida.' }));
+        }
         if (event.type === 'error') setActiveTask(previous => previous ? { ...previous, status: 'error' } : previous);
       } catch { /* Un evento malformado no interrumpe el stream. */ }
     };
@@ -293,6 +296,7 @@ export default function ZocoComputer() {
     if (!activeTask) return;
     await fetch(`${API_BASE}/api/computer/tasks/${activeTask.id}/stop`, { method: 'POST', headers: headers() }).catch(() => undefined);
     setActiveTask(previous => previous ? { ...previous, status: 'detenida' } : previous);
+    setRuntime(previous => ({ ...(previous || {}), phase: 'cancelling', active_tool: null, status_detail: 'Cancelación solicitada; liberando recursos.' }));
     void loadTasks();
   }, [activeTask, headers, loadTasks]);
 
