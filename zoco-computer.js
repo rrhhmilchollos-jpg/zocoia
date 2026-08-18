@@ -1127,6 +1127,24 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
       db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)').run(
         uuidv4(), task.id, 'user', `[Observación visual real ya disponible desde Chromium aislado. Resume esta captura y texto; no uses terminal para navegar.]\n${visual.texto}`
       );
+
+      // Las peticiones que solo piden mostrar o describir una URL ya tienen un
+      // resultado verificable. No se delegan de nuevo al modelo local, porque
+      // eso añadía minutos de espera sin aportar una acción adicional.
+      const esConsultaVisualDirecta = /\b(?:muestrame|muéstrame|qué ves|que ves|describe(?:\s+brevemente)?\s+(?:lo\s+)?que\s+ves|qué\s+se\s+ve)\b/i.test(String(task.title || ''))
+        && !/\b(?:crea|construye|desarrolla|implementa|edita|corrige|proyecto|aplicaci[oó]n)\b/i.test(String(task.title || ''));
+      if (visual.disponible && esConsultaVisualDirecta) {
+        const resumen = `He abierto ${visual.url || visualUrl} en el navegador visual de Zoco.\n\n${String(visual.texto || '').slice(0, 2400)}\n\nLa captura real y el contenido observado están disponibles en la pestaña Web del ordenador.`;
+        db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)').run(uuidv4(), task.id, 'assistant', resumen);
+        db.prepare("UPDATE computer_tasks SET status = 'completada', result = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(resumen, task.id);
+        setRuntimeState(db, task.id, { phase: 'completed', active_tool: null, channel: 'web', status_detail: 'Inspección visual completada con captura y texto reales.', completed_at: new Date().toISOString() }, 'visual_inspection_completed');
+        recordEvent(db, task.id, 'finished', { resumen, channel: 'agent', archivos: [] });
+        closeSandboxSession(sandboxSessionId);
+        void closeLocalBrowser(task.id);
+        runtimeSessions.delete(task.id);
+        enEjecucion.delete(task.id);
+        return;
+      }
     }
 
   // `makeCallModel` construye el invocador ya ligado al usuario: comprueba
