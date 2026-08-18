@@ -1142,9 +1142,17 @@ export function registerComputerRoutes({
         return res.status(503).json({ error: aiConfigurationError() || 'El motor de IA no está configurado en el servidor.' });
       }
 
-      db.prepare("UPDATE computer_tasks SET status = 'en_curso', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(task.id);
+      // Un reintento debe conservar el objetivo del usuario, no las respuestas
+      // erróneas del modelo anterior: esas respuestas se reinyectarían como
+      // contexto y pueden provocar que repita una estrategia fallida.
+      db.transaction(() => {
+        db.prepare("DELETE FROM computer_messages WHERE task_id = ? AND role = 'assistant'").run(task.id);
+        db.prepare("UPDATE computer_tasks SET status = 'en_curso', plan = NULL, result = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(task.id);
+        db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)')
+          .run(uuidv4(), task.id, 'user', '[Reintento limpio] Ejecuta el objetivo original desde cero. Revisa los resultados de las herramientas y no repitas una acción fallida.');
+      })();
       const fresh = db.prepare('SELECT * FROM computer_tasks WHERE id = ?').get(task.id);
-      recordEvent(db, task.id, 'task_retried', { mensaje: 'Tarea reintentada manualmente por el usuario.' });
+      recordEvent(db, task.id, 'task_retried', { mensaje: 'Tarea reintentada desde un contexto limpio.' });
       lanzarTarea({ db, uuidv4, task: fresh, makeCallModel });
       res.json({ ok: true, id: task.id, status: 'en_curso' });
     } catch (err) {
