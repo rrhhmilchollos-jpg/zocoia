@@ -289,6 +289,43 @@ export default function ZocoComputer() {
     } catch { /* Se mantiene el estado de la tarea anterior. */ }
   }, [connectStream, headers]);
 
+  // El SSE es la vía inmediata. Este sondeo es una red de seguridad: si una
+  // extensión, proxy o red local retrasa EventSource, el usuario sigue viendo
+  // el estado operativo y los eventos persistidos de una tarea en curso.
+  useEffect(() => {
+    const taskId = activeTask?.id;
+    if (!taskId || !['en_curso', 'pendiente'].includes(activeTask?.status || '')) return;
+    let cancelled = false;
+    const syncRuntime = async () => {
+      try {
+        const [taskResponse, runtimeResponse] = await Promise.all([
+          fetch(`${API_BASE}/api/computer/tasks/${taskId}`, { headers: headers() }),
+          fetch(`${API_BASE}/api/computer/tasks/${taskId}/runtime`, { headers: headers() }),
+        ]);
+        if (cancelled || !taskResponse.ok) return;
+        const data = await taskResponse.json();
+        const snapshot = runtimeResponse.ok ? await runtimeResponse.json() : null;
+        if (cancelled) return;
+        setActiveTask(previous => previous?.id === taskId ? { ...previous, status: data.status, runtime: snapshot?.runtime || data.runtime } : previous);
+        if (snapshot?.runtime || data.runtime) setRuntime(snapshot?.runtime || data.runtime);
+        const recoveredEvents = data.events || data.eventos || [];
+        if (recoveredEvents.length) {
+          setEvents(previous => {
+            const byId = new Map<number, Evento>();
+            [...previous, ...recoveredEvents].forEach((event: Evento & { seq?: number }) => {
+              const id = Number(event.seq || event.id || 0);
+              if (id) byId.set(id, { ...event, id });
+            });
+            return [...byId.values()].sort((a, b) => Number(a.id || 0) - Number(b.id || 0)).slice(-500);
+          });
+        }
+      } catch { /* El siguiente ciclo reintentará sin afectar la tarea. */ }
+    };
+    void syncRuntime();
+    const timer = window.setInterval(syncRuntime, 3000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [activeTask?.id, activeTask?.status, headers]);
+
   const retryTask = useCallback(async (taskId: string) => {
     setTaskActionError(null);
     try {
