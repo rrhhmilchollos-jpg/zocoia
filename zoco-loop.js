@@ -19,9 +19,12 @@
 const MAX_ITERATIONS = parseInt(process.env.COMPUTER_MAX_ITERATIONS || '60', 10);
 // Nº de turnos (mensajes) que se conservan íntegros en el contexto. Los más
 // antiguos se resumen para no exceder la ventana del modelo en tareas largas.
-const MAX_CONTEXT_MESSAGES = parseInt(process.env.COMPUTER_MAX_CONTEXT_MESSAGES || '80', 10);
+const MAX_CONTEXT_MESSAGES = Math.min(32, Math.max(8, parseInt(process.env.COMPUTER_MAX_CONTEXT_MESSAGES || '24', 10)));
 // Recordatorios consecutivos sin tool call antes de rendirse.
-const MAX_NUDGES = 3;
+// En un motor local lento, repetir varios turnos sin una acción real convierte una
+// tarea vacía en varios minutos de espera. Un único aviso basta: se pausa y queda
+// disponible para que el usuario aclare el siguiente paso.
+const MAX_NUDGES = 1;
 const MAX_REPEATED_TOOL_CALLS = Math.min(
   5,
   Math.max(2, parseInt(process.env.COMPUTER_MAX_REPEATED_TOOL_CALLS || '3', 10))
@@ -270,9 +273,21 @@ export async function runAgentLoop({
     try {
       data = await callModel(pruneHistory(messages), tools, 'auto');
     } catch (err) {
-      // Los errores transitorios (429, 529, timeouts) merecen un reintento con
-      // espera antes de declarar la tarea fallida.
-      const transitorio = /429|5\d\d|timeout|ECONNRESET|overloaded|rate.?limit/i.test(err.message || '');
+      // Un timeout de Ollama no se reintenta en silencio: si se repite, una sola
+      // tarea puede consumir muchos minutos sin ejecutar una herramienta. Se pausa
+      // de forma recuperable y deja el motivo explícito en el runtime.
+      if (err?.status === 504) {
+        const aviso = 'El modelo local tardó demasiado en responder. La tarea se ha pausado para evitar más espera; puedes reanudarla cuando el motor esté disponible o cambiar de estrategia.';
+        db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)')
+          .run(uuidv4(), task.id, 'assistant', aviso);
+        db.prepare("UPDATE computer_tasks SET status = 'pausada', result = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+          .run(aviso, task.id);
+        setRuntimeState(db, task.id, { phase: 'paused', active_tool: null, status_detail: aviso });
+        recordEvent(db, task.id, 'paused', { mensaje: aviso, channel: 'agent' });
+        return;
+      }
+      // Los errores transitorios no relacionados con timeout reciben un único reintento.
+      const transitorio = /429|5\d\d|ECONNRESET|overloaded|rate.?limit/i.test(err.message || '');
       if (transitorio && i < MAX_ITERATIONS - 1) {
         const espera = Math.min(30000, 3000 * (nudges + 1));
         recordEvent(db, task.id, 'thinking', {

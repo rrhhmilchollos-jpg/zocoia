@@ -77,12 +77,40 @@ const OLLAMA_MODEL_MAP = {
 };
 const OLLAMA_URL = process.env.OLLAMA_BASE_URL || process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || 'local-ollama';
-const OLLAMA_TIMEOUT_MS = parseInt(process.env.OLLAMA_TIMEOUT_MS || '300000', 10);
+// Una llamada del ordenador no puede monopolizar una tarea durante varios minutos.
+// El bucle la pausará de forma recuperable si el motor local no responde en este plazo.
+const OLLAMA_TIMEOUT_MS = Math.min(120000, Math.max(30000, parseInt(process.env.OLLAMA_TIMEOUT_MS || '75000', 10)));
 // El ordenador necesita llamadas breves para planificar y elegir herramientas;
 // limitar la salida evita que un modelo local de CPU reserve 4.096 tokens cuando
 // normalmente basta un JSON o un resultado final conciso.
 const COMPUTER_MODEL_MAX_TOKENS = Math.min(2048, Math.max(256, parseInt(process.env.COMPUTER_MODEL_MAX_TOKENS || '768', 10)));
 const ANTHROPIC_TIMEOUT_MS = parseInt(process.env.ANTHROPIC_TIMEOUT_MS || '120000', 10);
+
+// Ollama incorpora el esquema de herramientas dentro del prompt. Conservamos la
+// validación JSON pero retiramos explicaciones largas para no ocupar la ventana
+// de contexto del modelo local antes de que pueda tomar su primera decisión.
+function compactOllamaTools(tools = []) {
+  const compactSchema = (schema) => {
+    if (!schema || typeof schema !== 'object') return schema;
+    const out = {};
+    for (const key of ['type', 'enum', 'required', 'additionalProperties']) {
+      if (schema[key] !== undefined) out[key] = schema[key];
+    }
+    if (schema.properties && typeof schema.properties === 'object') {
+      out.properties = Object.fromEntries(Object.entries(schema.properties).map(([key, value]) => [key, compactSchema(value)]));
+    }
+    if (schema.items) out.items = compactSchema(schema.items);
+    return out;
+  };
+  return tools.map((tool) => ({
+    type: 'function',
+    function: {
+      name: tool?.function?.name,
+      description: tool?.function?.name || 'herramienta',
+      ...(tool?.function?.parameters ? { parameters: compactSchema(tool.function.parameters) } : {}),
+    },
+  })).filter((tool) => tool.function.name);
+}
 
 function resolveOllamaModel(modeloZocoia) {
   if (!modeloZocoia) return OLLAMA_MODEL_MAP['zoco-plus'];
@@ -742,7 +770,7 @@ async function callOllamaChatModel({ ollamaModel, messages, maxTokens, temperatu
           messages,
           max_tokens: maxTokens || 4096,
           temperature: typeof temperature === 'number' ? temperature : 0.7,
-          ...(tools?.length ? { tools } : {}),
+          ...(tools?.length ? { tools: compactOllamaTools(tools) } : {}),
           ...(tools?.length && toolChoice ? { tool_choice: toolChoice } : {}),
         }),
         signal: controller.signal,
