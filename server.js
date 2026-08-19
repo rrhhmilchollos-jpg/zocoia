@@ -79,11 +79,14 @@ const OLLAMA_URL = process.env.OLLAMA_BASE_URL || process.env.OLLAMA_URL || 'htt
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || 'local-ollama';
 // Una llamada del ordenador no puede monopolizar una tarea durante varios minutos.
 // El bucle la pausará de forma recuperable si el motor local no responde en este plazo.
-const OLLAMA_TIMEOUT_MS = Math.min(120000, Math.max(30000, parseInt(process.env.OLLAMA_TIMEOUT_MS || '75000', 10)));
-// El ordenador necesita llamadas breves para planificar y elegir herramientas;
-// limitar la salida evita que un modelo local de CPU reserve 4.096 tokens cuando
-// normalmente basta un JSON o un resultado final conciso.
-const COMPUTER_MODEL_MAX_TOKENS = Math.min(2048, Math.max(256, parseInt(process.env.COMPUTER_MODEL_MAX_TOKENS || '768', 10)));
+const OLLAMA_TIMEOUT_MS = Math.min(90000, Math.max(25000, parseInt(process.env.OLLAMA_TIMEOUT_MS || '45000', 10)));
+// El ordenador necesita decisiones muy breves: una herramienta o una respuesta
+// final. Un presupuesto contenido evita que el modelo local de CPU genere texto
+// innecesario antes de actuar.
+const COMPUTER_MODEL_MAX_TOKENS = Math.min(768, Math.max(128, parseInt(process.env.COMPUTER_MODEL_MAX_TOKENS || '384', 10)));
+const OLLAMA_SYSTEM_PROMPT_LIMIT = 5000;
+const OLLAMA_TURN_LIMIT = 1800;
+const OLLAMA_MAX_TURNS = 10;
 const ANTHROPIC_TIMEOUT_MS = parseInt(process.env.ANTHROPIC_TIMEOUT_MS || '120000', 10);
 
 // Ollama incorpora el esquema de herramientas dentro del prompt. Conservamos la
@@ -115,6 +118,46 @@ function compactOllamaTools(tools = []) {
 function resolveOllamaModel(modeloZocoia) {
   if (!modeloZocoia) return OLLAMA_MODEL_MAP['zoco-plus'];
   return OLLAMA_MODEL_MAP[modeloZocoia] || String(modeloZocoia);
+}
+
+// Ollama incorpora los mensajes y las definiciones de herramientas en el prompt.
+// Para un modelo local pequeño, enviar todo el historial y todas las herramientas
+// en cada iteración degrada la latencia y termina en timeouts. Conservamos siempre
+// el sistema, el objetivo reciente y solo las herramientas pertinentes a la acción.
+function compactOllamaMessages(messages = []) {
+  const normalise = (message, limit) => ({
+    ...message,
+    content: typeof message?.content === 'string'
+      ? message.content.slice(0, limit)
+      : message?.content,
+  });
+  const system = messages.find((message) => message?.role === 'system');
+  const rest = messages.filter((message) => message?.role !== 'system').slice(-OLLAMA_MAX_TURNS);
+  return [
+    ...(system ? [normalise(system, OLLAMA_SYSTEM_PROMPT_LIMIT)] : []),
+    ...rest.map((message) => normalise(message, OLLAMA_TURN_LIMIT)),
+  ];
+}
+
+function selectOllamaTools(tools = [], messages = []) {
+  const latestText = [...messages].reverse()
+    .find((message) => message?.role === 'user' && typeof message?.content === 'string')?.content
+    ?.toLowerCase() || '';
+  const namesFor = (patterns) => tools.filter((tool) => {
+    const name = String(tool?.function?.name || '').toLowerCase();
+    return patterns.some((pattern) => pattern.test(name));
+  });
+  const baseline = namesFor([/gestionar.?plan/, /entregar.?resultado/, /controlar.?ordenador/]);
+  const isWeb = /https?:\/\/|\burl\b|web|navega|página|pagina|sitio/.test(latestText);
+  const isProject = /aplicaci[oó]n|app|proyecto|c[oó]digo|archivo|web|p[aá]gina/.test(latestText);
+  const specialised = isWeb
+    ? namesFor([/navegador|browser|leer.?pagina|busqueda.?web/])
+    : isProject
+      ? namesFor([/create.?file|escribir.?archivo|create.?folder|crear.?carpeta|read.?file|leer.?archivo|list.?files|listar.?archivos|terminal|execute.?code|ejecutar.?codigo/])
+      : namesFor([/navegador|browser|terminal|create.?file|escribir.?archivo|read.?file|leer.?archivo/]);
+  const selected = [...baseline, ...specialised];
+  const unique = Array.from(new Map(selected.map((tool) => [tool?.function?.name, tool])).values());
+  return unique.length ? unique.slice(0, 6) : tools.slice(0, 6);
 }
 
 function getAIProviderConfig() {
@@ -767,10 +810,11 @@ async function callOllamaChatModel({ ollamaModel, messages, maxTokens, temperatu
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OLLAMA_API_KEY}` },
         body: JSON.stringify({
           model: ollamaModel,
-          messages,
-          max_tokens: maxTokens || 4096,
-          temperature: typeof temperature === 'number' ? temperature : 0.7,
-          ...(tools?.length ? { tools: compactOllamaTools(tools) } : {}),
+          messages: compactOllamaMessages(messages),
+          max_tokens: Math.min(COMPUTER_MODEL_MAX_TOKENS, maxTokens || COMPUTER_MODEL_MAX_TOKENS),
+          temperature: typeof temperature === 'number' ? temperature : 0.2,
+          stream: false,
+          ...(tools?.length ? { tools: compactOllamaTools(selectOllamaTools(tools, messages)) } : {}),
           ...(tools?.length && toolChoice ? { tool_choice: toolChoice } : {}),
         }),
         signal: controller.signal,
