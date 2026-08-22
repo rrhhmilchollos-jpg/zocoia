@@ -53,8 +53,7 @@ services:
       - OLLAMA_MODEL_MAX=${OLLAMA_MODEL_MAX:-qwen2.5-coder:3b}
       - OLLAMA_MODEL_LAB=${OLLAMA_MODEL_LAB:-qwen2.5-coder:3b}
       - OLLAMA_TIMEOUT_MS=${OLLAMA_TIMEOUT_MS:-300000}
-      - NEOBANCO_BACKEND_URL=http://neobanco-preview:8000
-      - ALLOWED_ORIGINS=https://zocoia.es,https://www.zocoia.es,https://marisai.es,https://www.marisai.es
+      - ALLOWED_ORIGINS=https://zocoia.es,https://www.zocoia.es
       - SANDBOX_RUNNER_URL=http://zocoia-sandbox-runner:8080
       - SANDBOX_RUNNER_TOKEN=${SANDBOX_RUNNER_TOKEN}
       - ZOCO_BROWSER_PROVIDER=local
@@ -77,8 +76,8 @@ services:
 
 networks:
   default:
-    name: maris-ai_default
-    external: true
+    name: zocoia_default
+    driver: bridge
   zocoia_control:
     external: true
     name: zocoia_control

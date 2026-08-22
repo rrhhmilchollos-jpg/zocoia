@@ -1081,11 +1081,16 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
       started_at: new Date().toISOString(), status_detail: 'Preparando el workspace y el entorno aislado.',
     }, 'task_initializing');
     const contextoPersistente = await sincronizarContextoTarea(db, task, workspaceDir);
+    // Registrar la sesión antes de crear recursos. Así el botón Detener puede
+    // cancelar incluso durante la preparación inicial, sin depender de que la
+    // sandbox haya respondido ya.
     let sandboxSessionId = null;
+    runtimeSessions.set(task.id, { sandboxSessionId: null, cancelled: false });
     try {
       const sandbox = await createSandboxSession(task.id);
       sandboxSessionId = sandbox.session_id;
-      runtimeSessions.set(task.id, { sandboxSessionId, cancelled: false });
+      const runtime = runtimeSessions.get(task.id);
+      if (runtime) runtime.sandboxSessionId = sandboxSessionId;
       setRuntimeState(db, task.id, { sandbox_session_id: sandboxSessionId, phase: 'sandbox_ready', status_detail: 'Sandbox efímera preparada.' });
       recordEvent(db, task.id, 'sandbox_started', { perfil: 'efímera restringida', red: 'interna sin salida', channel: 'terminal' });
     } catch (err) {
@@ -1121,6 +1126,15 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
         accion: 'navegar', url: visual.url || visualUrl, texto: visual.texto,
         proveedor: 'chromium_aislado', channel: 'web', session_scope: task.browser_profile_id ? 'perfil_persistente' : 'invitado_aislado',
       });
+      const estadoTrasNavegador = db.prepare('SELECT status FROM computer_tasks WHERE id = ?').get(task.id);
+      if (!estadoTrasNavegador || estadoTrasNavegador.status === 'detenida' || runtimeSessions.get(task.id)?.cancelled) {
+        setRuntimeState(db, task.id, { phase: 'stopped', active_tool: null, channel: 'web', status_detail: 'Tarea detenida durante la observación visual; no se iniciará razonamiento adicional.' }, 'browser_cancelled');
+        if (sandboxSessionId) void closeSandboxSession(sandboxSessionId);
+        void closeLocalBrowser(task.id);
+        runtimeSessions.delete(task.id);
+        enEjecucion.delete(task.id);
+        return;
+      }
       if (task.browser_profile_id && visual.disponible) {
         db.prepare('UPDATE browser_profiles SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(task.browser_profile_id);
       }
@@ -1131,7 +1145,7 @@ function lanzarTarea({ db, uuidv4, task, makeCallModel }) {
       // Las peticiones que solo piden mostrar o describir una URL ya tienen un
       // resultado verificable. No se delegan de nuevo al modelo local, porque
       // eso añadía minutos de espera sin aportar una acción adicional.
-      const esConsultaVisualDirecta = /\b(?:muestrame|muéstrame|qué ves|que ves|describe(?:\s+brevemente)?\s+(?:lo\s+)?que\s+ves|qué\s+se\s+ve)\b/i.test(String(task.title || ''))
+      const esConsultaVisualDirecta = /\b(?:muestrame|muéstrame|qué ves|que ves|describe(?:\s+brevemente)?(?:\s+(?:lo\s+)?que\s+ves)?|describ[ei]|enumera|resume|resumen|qué\s+se\s+ve)\b/i.test(String(task.title || ''))
         && !/\b(?:crea|construye|desarrolla|implementa|edita|corrige|proyecto|aplicaci[oó]n)\b/i.test(String(task.title || ''));
       if (visual.disponible && esConsultaVisualDirecta) {
         const resumen = `He abierto ${visual.url || visualUrl} en el navegador visual de Zoco.\n\n${String(visual.texto || '').slice(0, 2400)}\n\nLa captura real y el contenido observado están disponibles en la pestaña Web del ordenador.`;

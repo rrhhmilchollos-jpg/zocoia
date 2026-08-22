@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useAuth, API_BASE } from '../context/AuthContext';
 
@@ -52,6 +52,7 @@ const EVENT_META: Record<string, { icon: string; label: string; panel: RuntimeTa
   browser_action_start: { icon: 'fa-hourglass-start', label: 'Acción web iniciada', panel: 'web', tone: 'text-fuchsia-300' },
   browser_action_done: { icon: 'fa-circle-check', label: 'Acción web completada', panel: 'web', tone: 'text-fuchsia-300' },
   browser_action: { icon: 'fa-arrow-pointer', label: 'Acción web', panel: 'web', tone: 'text-fuchsia-300' },
+  browser_action_success: { icon: 'fa-circle-check', label: 'Navegador actualizado', panel: 'web', tone: 'text-emerald-300' },
   browser_screenshot: { icon: 'fa-camera', label: 'Captura web', panel: 'web', tone: 'text-fuchsia-300' },
   browser_approval_required: { icon: 'fa-shield-halved', label: 'Aprobación web requerida', panel: 'web', tone: 'text-amber-300' },
   browser_action_approved: { icon: 'fa-shield-check', label: 'Permiso web concedido', panel: 'web', tone: 'text-emerald-300' },
@@ -116,6 +117,19 @@ function eventTime(event: Evento): string {
   if (!timestamp) return 'Ahora';
   const date = new Date(timestamp);
   return Number.isNaN(date.valueOf()) ? 'Ahora' : date.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function compactRuntimeEvents(events: Evento[]): Evento[] {
+  const compacted: Evento[] = [];
+  for (const event of events) {
+    const previous = compacted.at(-1);
+    if (event.type === 'model_waiting' && previous?.type === 'model_waiting') {
+      compacted[compacted.length - 1] = event;
+      continue;
+    }
+    compacted.push(event);
+  }
+  return compacted;
 }
 
 export default function ZocoComputer() {
@@ -434,8 +448,9 @@ export default function ZocoComputer() {
   const running = activeTask?.status === 'en_curso';
   const status = STATUS_META[activeTask?.status || 'pendiente'] || STATUS_META.pendiente;
   const eventPanel = (event: Evento): RuntimeTab => event.channel === 'terminal' ? 'terminal' : event.channel === 'files' ? 'files' : event.channel === 'web' ? 'web' : (EVENT_META[event.type]?.panel || 'activity');
-  const visibleEvents = events.filter(event => runtimeTab === 'all' || eventPanel(event) === runtimeTab || (runtimeTab === 'activity' && eventPanel(event) === 'activity'));
-  const activityEvents = events.filter(event => eventPanel(event) === 'activity').slice(-8);
+  const compactedEvents = useMemo(() => compactRuntimeEvents(events), [events]);
+  const visibleEvents = compactedEvents.filter(event => runtimeTab === 'all' || eventPanel(event) === runtimeTab || (runtimeTab === 'activity' && eventPanel(event) === 'activity'));
+  const activityEvents = compactedEvents.filter(event => eventPanel(event) === 'activity').slice(-8);
   const currentModel = MODEL_OPTIONS.find(option => option.value === (activeTask?.model || model)) || MODEL_OPTIONS[0];
   const runtimeDescription = runtime?.status_detail || (running ? 'El agente está coordinando el plan y las herramientas.' : activeTask?.status === 'pausada' ? 'La ejecución conserva el contexto y puede reanudarse con una estrategia distinta.' : 'Consulta la actividad, el plan y los resultados de esta tarea.');
   const runtimeMeta = runtime?.active_tool ? `Herramienta: ${runtime.active_tool}` : runtime?.phase ? `Fase: ${runtime.phase}` : null;
