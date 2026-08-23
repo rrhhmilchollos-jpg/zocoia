@@ -253,7 +253,13 @@ export default function ZocoComputer() {
           if (event.status) setActiveTask(previous => previous ? { ...previous, status: event.status } : previous);
         }
         if (event.type === 'runtime_state' && event.runtime) setRuntime(event.runtime);
-        setEvents(previous => [...previous.slice(-499), { ...event, id: sequence || event.id }]);
+        // `assistant_message` y `user_message` son turnos de conversación normal:
+        // ya se muestran en el panel de chat (más abajo, o al enviarlos), así que
+        // no se añaden también al timeline de Hitos de ejecución para evitar que
+        // una respuesta conversacional aparezca "dentro del contenedor".
+        if (event.type !== 'assistant_message' && event.type !== 'user_message') {
+          setEvents(previous => [...previous.slice(-499), { ...event, id: sequence || event.id }]);
+        }
         if ((event.type === 'plan_updated' || event.type === 'plan') && Array.isArray(event.fases)) setPlan(event.fases);
         if (event.type === 'assistant_message') setMessages(previous => [...previous, { role: 'assistant', content: event.texto || event.mensaje || '' }]);
         if (event.type === 'finished') {

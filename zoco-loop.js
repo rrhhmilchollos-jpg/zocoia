@@ -322,8 +322,13 @@ export async function runAgentLoop({
     }
 
     // ── 4. Emitir el razonamiento real del modelo ──
-    // El texto que acompaña a una tool call es el "pensamiento" que el usuario ve.
-    if (texto) {
+    // El texto que acompaña a una tool call es el "pensamiento" que el usuario ve
+    // en el panel de Hitos de ejecución. Si el modelo NO ha llamado a ninguna
+    // herramienta, ese texto es una respuesta conversacional normal (p. ej.
+    // "hola, ¿en qué te ayudo?"), no razonamiento de una tarea — así que no debe
+    // aparecer como "Razonando" dentro del contenedor: se registra más abajo
+    // únicamente como `assistant_message`, que el frontend muestra como chat.
+    if (texto && toolCalls.length > 0) {
       recordEvent(db, task.id, 'thinking', { iteracion: i + 1, texto });
     }
 
