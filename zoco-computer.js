@@ -606,9 +606,24 @@ const TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'responder_al_usuario',
+      description:
+        'Responde directamente al usuario con texto cuando la pregunta o petición NO requiere ejecutar ninguna herramienta: saludos, preguntas generales de conocimiento, aclaraciones, o cuando el usuario pide tu opinión. NO uses esta herramienta si necesitas buscar información, ejecutar código, navegar o crear archivos — en ese caso usa las herramientas apropiadas.',
+      parameters: {
+        type: 'object',
+        properties: {
+          respuesta: { type: 'string', description: 'Respuesta completa al usuario.' },
+        },
+        required: ['respuesta'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'mensaje_usuario',
       description:
-        'Envía un mensaje al usuario para informar de un hito relevante. No lo uses en cada iteración: el usuario ya ve todas tus acciones.',
+        'Envía un mensaje al usuario para informar de un hito relevante durante una tarea. No lo uses en cada iteración: el usuario ya ve todas tus acciones.',
       parameters: {
         type: 'object',
         properties: {
@@ -1020,6 +1035,16 @@ async function executeTool(db, task, workspaceDir, name, args, context, runtime 
       } catch (err) {
         return `No se pudo exponer el puerto: ${err.message}`;
       }
+    }
+
+    case 'responder_al_usuario': {
+      const respuesta = String(args.respuesta || '').trim();
+      if (!respuesta) return 'La respuesta no puede estar vacía.';
+      db.prepare('INSERT INTO computer_messages (id, task_id, role, content) VALUES (?, ?, ?, ?)')
+        .run(context.uuidv4(), task.id, 'assistant', respuesta);
+      recordEvent(db, task.id, 'assistant_message', { texto: respuesta });
+      // Señal especial: el bucle cerrará la tarea como completada después de esto
+      return { __finish: true, resumen: respuesta, archivos: [] };
     }
 
     case 'mensaje_usuario': {

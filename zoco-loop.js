@@ -70,6 +70,9 @@ function recoverTextToolCall(text, tools, uuidv4) {
     busquedaWeb: 'busqueda_web',
     leerPagina: 'leer_pagina',
     browser: 'navegador',
+    responderAlUsuario: 'responder_al_usuario',
+    responder: 'responder_al_usuario',
+    mensajeUsuario: 'mensaje_usuario',
   };
   const known = new Set((tools || []).map((tool) => tool?.function?.name).filter(Boolean));
   let parsed = null;
@@ -360,11 +363,11 @@ export async function runAgentLoop({
       messages.push({
         role: 'user',
         content:
-          '[Sistema] Has respondido con texto pero sin llamar a ninguna herramienta, así que no se ' +
-          'ha ejecutado ninguna acción real y la tarea NO está terminada. Debes responder llamando ' +
-          'a una herramienta: usa "gestionar_plan" si aún no hay plan, las herramientas de trabajo ' +
-          'para avanzar, o "entregar_resultado" si de verdad ya has completado todo y los ' +
-          'entregables existen en el workspace.',
+          '[Sistema] Has respondido con texto pero sin llamar a ninguna herramienta. ' +
+          'Si tu respuesta anterior ya contiene la respuesta completa al usuario (pregunta simple, saludo, opinión, información general), ' +
+          'llama ahora a "responder_al_usuario" con esa misma respuesta para entregarla correctamente. ' +
+          'Si la tarea requiere ejecutar acciones reales, usa las herramientas apropiadas (gestionar_plan, terminal, busqueda_web, etc.) ' +
+          'o "entregar_resultado" si todo está completado y los entregables existen en el workspace.',
       });
       continue;
     }
