@@ -799,7 +799,10 @@ async function callAnthropicChatModel({ claudeModel, messages, maxTokens, temper
 }
 
 async function callOllamaChatModel({ ollamaModel, messages, maxTokens, temperature, tools, toolChoice }) {
-  const endpoint = `${OLLAMA_URL.replace(/\/+$/, '')}/v1/chat/completions`;
+  // La ruta OpenAI-compatible /v1/chat/completions puede fallar detrás de
+  // Cloudflare Tunnel cuando la respuesta se cierra como stream. La API nativa
+  // /api/chat devuelve el mismo resultado de forma fiable y soporta tools.
+  const endpoint = `${OLLAMA_URL.replace(/\/+$/, '')}/api/chat`;
   let lastErr;
   for (let attempt = 0; attempt < 2; attempt++) {
     const controller = new AbortController();
@@ -811,11 +814,12 @@ async function callOllamaChatModel({ ollamaModel, messages, maxTokens, temperatu
         body: JSON.stringify({
           model: ollamaModel,
           messages: compactOllamaMessages(messages),
-          max_tokens: Math.min(COMPUTER_MODEL_MAX_TOKENS, maxTokens || COMPUTER_MODEL_MAX_TOKENS),
-          temperature: typeof temperature === 'number' ? temperature : 0.2,
           stream: false,
+          options: {
+            num_predict: Math.min(COMPUTER_MODEL_MAX_TOKENS, maxTokens || COMPUTER_MODEL_MAX_TOKENS),
+            temperature: typeof temperature === 'number' ? temperature : 0.2,
+          },
           ...(tools?.length ? { tools: compactOllamaTools(selectOllamaTools(tools, messages)) } : {}),
-          ...(tools?.length && toolChoice ? { tool_choice: toolChoice } : {}),
         }),
         signal: controller.signal,
       });
@@ -825,7 +829,25 @@ async function callOllamaChatModel({ ollamaModel, messages, maxTokens, temperatu
         error.status = response.status;
         throw error;
       }
-      return body;
+      const message = body?.message || {};
+      const promptTokens = body?.prompt_eval_count || 0;
+      const completionTokens = body?.eval_count || 0;
+      return {
+        choices: [{
+          message: {
+            role: message.role || 'assistant',
+            content: message.content || '',
+            ...(Array.isArray(message.tool_calls) ? { tool_calls: message.tool_calls } : {}),
+          },
+          finish_reason: Array.isArray(message.tool_calls) && message.tool_calls.length ? 'tool_calls' : 'stop',
+        }],
+        usage: {
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          total_tokens: promptTokens + completionTokens,
+        },
+        model: body?.model || ollamaModel,
+      };
     } catch (error) {
       lastErr = error;
       if (error.name === 'AbortError') {
