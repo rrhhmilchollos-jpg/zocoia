@@ -832,14 +832,28 @@ async function callOllamaChatModel({ ollamaModel, messages, maxTokens, temperatu
       const message = body?.message || {};
       const promptTokens = body?.prompt_eval_count || 0;
       const completionTokens = body?.eval_count || 0;
+      const toolCalls = Array.isArray(message.tool_calls)
+        ? message.tool_calls.map((call, index) => {
+          const fn = call?.function || {};
+          const rawArguments = fn.arguments ?? call?.arguments ?? {};
+          return {
+            id: call?.id || `call_${uuidv4()}_${index}`,
+            type: 'function',
+            function: {
+              name: fn.name || call?.name || '',
+              arguments: typeof rawArguments === 'string' ? rawArguments : JSON.stringify(rawArguments),
+            },
+          };
+        }).filter((call) => call.function.name)
+        : [];
       return {
         choices: [{
           message: {
             role: message.role || 'assistant',
             content: message.content || '',
-            ...(Array.isArray(message.tool_calls) ? { tool_calls: message.tool_calls } : {}),
+            ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
           },
-          finish_reason: Array.isArray(message.tool_calls) && message.tool_calls.length ? 'tool_calls' : 'stop',
+          finish_reason: toolCalls.length ? 'tool_calls' : 'stop',
         }],
         usage: {
           prompt_tokens: promptTokens,
