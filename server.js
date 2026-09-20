@@ -760,7 +760,7 @@ async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temp
     try {
       const resp = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: auth },
+        headers: { 'Content-Type': 'application/json', ...(auth ? { Authorization: auth } : {}) },
         body: JSON.stringify({
           model,
           messages,
@@ -1410,8 +1410,9 @@ app.post('/api/keys', authMiddleware, (req, res) => {
 app.delete('/api/keys/:id', authMiddleware, (req, res) => {
   const key = db.prepare('SELECT * FROM api_keys WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
   if (!key) return res.status(404).json({ error: 'Clave no encontrada' });
-  db.prepare('DELETE FROM api_keys WHERE id = ?').run(req.params.id);
-  res.json({ ok: true });
+  // Revocación lógica: conservar siempre la clave, su propietario y su historial.
+  db.prepare('UPDATE api_keys SET revoked = 1 WHERE id = ? AND user_id = ?').run(req.params.id, req.auth.sub);
+  res.json({ ok: true, revoked: true });
 });
 
 // Renombrar una API key (el Dashboard llama a PUT /api/keys/:id al editar).
