@@ -834,7 +834,10 @@ async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temp
   let lastErr;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
-      return await doFetch(endpoint, `Bearer ${OLLAMA_API_KEY}`, ollamaModel, ollamaOptions);
+      // El túnel público de Ollama no usa una API key. Enviar la credencial
+      // interna de Render provoca 403 en Cloudflare/Ollama. Las credenciales
+      // de proveedores externos se mantienen en sus propios flujos.
+      return await doFetch(endpoint, null, ollamaModel, ollamaOptions);
     } catch (err) {
       lastErr = err;
       if (err.name === 'AbortError') {
