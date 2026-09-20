@@ -624,10 +624,20 @@ function authMiddleware(req, res, next) {
   // La clave se valida contra su hash sha256 en la tabla api_keys, se marca
   // el last_used_at, y la petición actúa en nombre del dueño de la clave.
   if (token.startsWith('sk-zoco-')) {
-    const check = validateZocoApiKey(db, token);
+    let check = validateZocoApiKey(db, token);
+    // Render's SQLite volume is not guaranteed on legacy services. Keep the
+    // server-to-server MarisAI key usable across a container replacement by
+    // allowing one explicitly configured deployment key. It is never exposed
+    // by the UI and is scoped to the configured admin owner.
+    if (!check.valid && process.env.ZOCOIA_API_KEY && token === process.env.ZOCOIA_API_KEY) {
+      const owner = db.prepare('SELECT id FROM users WHERE email = ?').get((process.env.ADMIN_EMAIL || '').toLowerCase());
+      if (owner) check = { valid: true, keyId: null, ownerId: owner.id, keyName: 'deployment-key' };
+    }
     if (!check.valid) return res.status(401).json({ error: `API Key inválida: ${check.reason}` });
 
-    const keyRow = db.prepare('SELECT key_type, monthly_tokens_used, usage_month FROM api_keys WHERE id = ?').get(check.keyId);
+    const keyRow = check.keyId
+      ? db.prepare('SELECT key_type, monthly_tokens_used, usage_month FROM api_keys WHERE id = ?').get(check.keyId)
+      : { key_type: 'pago', monthly_tokens_used: 0, usage_month: null };
     if (keyRow?.key_type === 'gratuita') {
       const month = currentUsageMonth();
       // Si cambiamos de mes desde la última petición, el contador se resetea
@@ -642,7 +652,7 @@ function authMiddleware(req, res, next) {
     }
 
     try {
-      db.prepare('UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(check.keyId);
+      if (check.keyId) db.prepare('UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(check.keyId);
     } catch {}
     const owner = db.prepare('SELECT id, is_admin, is_support FROM users WHERE id = ?').get(check.ownerId);
     if (!owner) return res.status(401).json({ error: 'La cuenta propietaria de la clave no existe' });
@@ -967,7 +977,13 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
     if (!Number.isFinite(n)) return fallback;
     return Math.min(max, Math.max(min, n));
   };
-  const numPredict = clamp(agenteData.num_predict, 256, 8192, 4096);
+  // If an OpenAI-compatible caller supplies max_tokens, it is the hard
+  // generation limit for this request. The previous code always defaulted to
+  // 4096 Ollama tokens, even for tiny smoke tests and MarisAI requests that
+  // explicitly asked for 1–32 tokens; through the Cloudflare tunnel that could
+  // keep the model busy until the upstream request failed.
+  const requestedNumPredict = maxTokensInput ?? agenteData.num_predict;
+  const numPredict = clamp(requestedNumPredict, 1, 8192, 4096);
   const numCtx = clamp(agenteData.num_ctx, 2048, 16384, 8192);
   const temperature = clamp(temperatureInput ?? agenteData.temperature, 0, 1.2, 0.7);
   const maxTokens = maxTokensInput || numPredict;
