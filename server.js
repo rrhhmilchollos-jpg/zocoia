@@ -774,6 +774,7 @@ async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temp
       });
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({}));
+        console.error('[Ollama] provider response', { status: resp.status, body: err });
         const e = new Error(err.error?.message || 'Error al llamar al modelo de IA');
         // No propagar errores del proveedor como si fueran credenciales de
         // ZocoIA. La API key sk-zoco ya se valida antes de llegar aquí.
