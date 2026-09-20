@@ -240,6 +240,7 @@ const OLLAMA_MODEL_MAP = {
 // cualquier string en su endpoint /v1). 127.0.0.1:11434 es el default local.
 const OLLAMA_URL = process.env.OLLAMA_BASE_URL || process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || 'ollama';
+const OLLAMA_CONFIGURED = !!(process.env.OLLAMA_BASE_URL || process.env.OLLAMA_URL);
 // Timeout generoso para modelos locales (la primera carga del modelo en
 // VRAM puede tardar; los modelos locales son más lentos que la nube).
 const OLLAMA_TIMEOUT_MS = parseInt(process.env.OLLAMA_TIMEOUT_MS || '300000', 10);
@@ -695,6 +696,33 @@ app.get(['/health', '/salud'], (req, res) => {
   res.json({ status: 'ok', message: 'Zoco IA conectado con éxito' });
 });
 
+// OpenAI-compatible discovery endpoint for server-side integrations such as
+// MarisAI. It reports public aliases only and checks Ollama reachability.
+app.get('/v1/models', authMiddleware, async (req, res) => {
+  if (USE_OPENAI_ENGINE) {
+    return res.json({
+      object: 'list',
+      data: Object.keys(OPENAI_MODEL_MAP).map((id) => ({ id, object: 'model', owned_by: 'zocoia', available: true })),
+    });
+  }
+  try {
+    const response = await fetch(`${OLLAMA_URL.replace(/\/+$/, '')}/api/tags`, {
+      headers: { Authorization: `Bearer ${OLLAMA_API_KEY}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) return res.status(502).json({ error: 'El proveedor de modelos no está disponible', code: 'ai_provider_unavailable' });
+    const installed = new Set((Array.isArray(body?.models) ? body.models : []).map((model) => model?.name).filter(Boolean));
+    res.json({
+      object: 'list',
+      data: Object.entries(OLLAMA_MODEL_MAP).map(([id, providerModel]) => ({ id, object: 'model', owned_by: 'zocoia', available: installed.has(providerModel), provider_model: providerModel })),
+    });
+  } catch (error) {
+    console.error('[v1/models] proveedor no disponible:', error?.message || error);
+    res.status(502).json({ error: 'No se pudo conectar con el proveedor de modelos', code: 'ai_provider_unavailable' });
+  }
+});
+
 // Compatibilidad DeepSeek-R1: si el modelo detrás del motor emite su
 // razonamiento en <think>...</think>, se elimina SIEMPRE antes de devolver la
 // respuesta a los clientes (Maris AI parsea código/JSON de estas respuestas y
@@ -737,7 +765,10 @@ async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temp
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({}));
         const e = new Error(err.error?.message || 'Error al llamar al modelo de IA');
-        e.status = resp.status;
+        // No propagar errores del proveedor como si fueran credenciales de
+        // ZocoIA. La API key sk-zoco ya se valida antes de llegar aquí.
+        e.status = resp.status === 429 ? 503 : 502;
+        e.code = 'ai_provider_error';
         throw e;
       }
       return await resp.json();
@@ -823,7 +854,7 @@ async function callChatModel({ ollamaUrl, ollamaModel, messages, maxTokens, temp
 async function processChatCompletion(authSub, { agentId, messages, model, temperature: temperatureInput, max_tokens: maxTokensInput, sessionSkills, tools: requestTools, tool_choice: requestToolChoice, apiKeyId, apiKeyType }) {
   // Motor exclusivo Ollama: no se exige ninguna API key en la nube. OLLAMA_URL
   // siempre tiene valor (default http://127.0.0.1:11434).
-  if (!OLLAMA_URL) {
+  if (!USE_OPENAI_ENGINE && !OLLAMA_CONFIGURED) {
     const e = new Error('OLLAMA_BASE_URL no configurada en el servidor'); e.status = 503; throw e;
   }
 
