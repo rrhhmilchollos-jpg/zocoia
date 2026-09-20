@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
+import dns from 'node:dns';
 import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
@@ -21,6 +22,10 @@ import { registerRevolutRoutes } from './revolut-controller.js';
 import { registerBillingRoutes } from './usage-billing.js';
 import { registerAgentStreamRoutes } from './agent-stream.js';
 import { registerEventStreamRoute, emitirEventoAgente } from './eventos-agente.js';
+
+// Render instances may receive an IPv6 DNS answer but have no usable IPv6
+// egress. Prefer IPv4 for the Cloudflare Ollama tunnel.
+dns.setDefaultResultOrder('ipv4first');
 
 dotenv.config();
 
