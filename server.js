@@ -230,16 +230,48 @@ const MODELOS_VALIDOS = [
 // en el servidor de Ollama (nombres exactos de `ollama list`). Sobreescribible
 // por entorno sin tocar código: OLLAMA_MODEL_FLASH/PLUS/MAX/LAB.
 const OLLAMA_MODEL_MAP = {
-  'zoco-flash': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash',
-  'zoco-plus':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',
-  'zoco-max':   process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
-  'zoco-lab':   process.env.OLLAMA_MODEL_LAB   || 'Zoco-Lab',
+  'zoco-flash': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash:latest',
+  'zoco-plus':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus:latest',
+  'zoco-max':   process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max:latest',
+  'zoco-lab':   process.env.OLLAMA_MODEL_LAB   || 'Zoco-Lab:latest',
   // Alias históricos de Maris AI → mismos modelos locales.
-  'maris-velox': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash', 'maris-velox-1b': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash',
-  'maris-core':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',  'maris-core-7b':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus',
-  'maris-pro':   process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',   'maris-pro-32b':  process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
-  'maris-beta':  process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',   'maris-beta-70b': process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max',
+  'maris-velox': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash:latest', 'maris-velox-1b': process.env.OLLAMA_MODEL_FLASH || 'Zoco-Flash:latest',
+  'maris-core':  process.env.OLLAMA_MODEL_PLUS  || 'Zoco-Plus:latest',  'maris-core-7b': process.env.OLLAMA_MODEL_PLUS || 'Zoco-Plus:latest',
+  'maris-pro':   process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max:latest',   'maris-pro-32b': process.env.OLLAMA_MODEL_MAX || 'Zoco-Max:latest',
+  'maris-beta':  process.env.OLLAMA_MODEL_MAX   || 'Zoco-Max:latest',   'maris-beta-70b': process.env.OLLAMA_MODEL_MAX || 'Zoco-Max:latest',
 };
+
+// Catálogo dinámico: cada modelo instalado en Ollama recibe un alias estable
+// `zoco-*`, sin ocultar los cuatro aliases comerciales existentes.
+const DYNAMIC_OLLAMA_MODEL_MAP = new Map();
+const OLLAMA_CATALOG_CACHE = { expiresAt: 0, models: [] };
+const modelSlug = (name) => String(name || '')
+  .toLowerCase().replace(/:latest$/i, '').replace(/[^a-z0-9]+/g, '-')
+  .replace(/^-+|-+$/g, '').slice(0, 64);
+const zocoAliasForModel = (name) => `zoco-${modelSlug(name)}`;
+const modelBase = (name) => String(name || '').replace(/:latest$/i, '').toLowerCase();
+async function fetchOllamaCatalog() {
+  const now = Date.now();
+  if (OLLAMA_CATALOG_CACHE.expiresAt > now) return OLLAMA_CATALOG_CACHE.models;
+  const response = await fetch(`${OLLAMA_URL.replace(/\/+$/, '')}/api/tags`, {
+    headers: { Authorization: `Bearer ${OLLAMA_API_KEY}` },
+    signal: AbortSignal.timeout(8000),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`Ollama tags HTTP ${response.status}`);
+  const models = Array.isArray(body?.models) ? body.models.filter((m) => m?.name) : [];
+  DYNAMIC_OLLAMA_MODEL_MAP.clear();
+  for (const model of models) {
+    const alias = zocoAliasForModel(model.name);
+    if (!OLLAMA_MODEL_MAP[alias]) DYNAMIC_OLLAMA_MODEL_MAP.set(alias, model.name);
+  }
+  OLLAMA_CATALOG_CACHE.models = models;
+  OLLAMA_CATALOG_CACHE.expiresAt = now + 30000;
+  return models;
+}
+const installedProviderModel = (configured, models) => (
+  models.find((m) => modelBase(m.name) === modelBase(configured))?.name || configured
+);
 
 // Endpoint OpenAI-compatible de Ollama. apiKey "ollama" (Ollama acepta
 // cualquier string en su endpoint /v1). 127.0.0.1:11434 es el default local.
@@ -727,10 +759,20 @@ app.get('/v1/models', authMiddleware, async (req, res) => {
     });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) return res.status(502).json({ error: 'El proveedor de modelos no está disponible', code: 'ai_provider_unavailable' });
-    const installed = new Set((Array.isArray(body?.models) ? body.models : []).map((model) => model?.name).filter(Boolean));
+    const models = await fetchOllamaCatalog();
+    const installed = new Set(models.map((model) => model?.name).filter(Boolean));
+    const fixed = Object.entries(OLLAMA_MODEL_MAP).map(([id, configuredModel]) => {
+      const providerModel = installedProviderModel(configuredModel, models);
+      const details = models.find((model) => model.name === providerModel)?.details || {};
+      return { id, object: 'model', owned_by: 'zocoia', available: installed.has(providerModel), provider_model: providerModel, tier: id.startsWith('zoco-') ? id.slice(5) : undefined, details };
+    });
+    const dynamic = [...DYNAMIC_OLLAMA_MODEL_MAP.entries()].map(([id, providerModel]) => {
+      const source = models.find((model) => model.name === providerModel) || {};
+      return { id, object: 'model', owned_by: 'zocoia', available: true, provider_model: providerModel, tier: 'ollama', details: source.details || {}, capabilities: source.capabilities || [] };
+    });
     res.json({
       object: 'list',
-      data: Object.entries(OLLAMA_MODEL_MAP).map(([id, providerModel]) => ({ id, object: 'model', owned_by: 'zocoia', available: installed.has(providerModel), provider_model: providerModel })),
+      data: [...fixed, ...dynamic.filter((model) => !fixed.some((item) => item.provider_model === model.provider_model))],
     });
   } catch (error) {
     console.error('[v1/models] proveedor no disponible:', error?.message || error);
@@ -974,7 +1016,14 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
   // traduce SIEMPRE al modelo real creado en el servidor de Ollama. Si el
   // agente/petición trae directamente un nombre de modelo de Ollama (p.ej.
   // "deepseek-r1", "qwen2.5-coder"), se usa tal cual.
-  const modeloFinal = OLLAMA_MODEL_MAP[modeloZocoia] || modeloZocoia;
+  // Actualiza el catálogo antes de resolver para que un modelo recién instalado
+  // funcione aunque el usuario lo use directamente desde el chat o MarisAI.
+  if (!USE_OPENAI_ENGINE) {
+    try { await fetchOllamaCatalog(); } catch (error) {
+      console.warn('[IA] No se pudo actualizar el catálogo dinámico:', error?.message || error);
+    }
+  }
+  const modeloFinal = OLLAMA_MODEL_MAP[modeloZocoia] || DYNAMIC_OLLAMA_MODEL_MAP.get(modeloZocoia) || modeloZocoia;
   console.log(USE_OPENAI_ENGINE
     ? `[IA] ${modeloZocoia} → ${resolveOpenAiModel(modeloFinal)} via OpenAI (${OPENAI_BASE_URL})`
     : `[IA] ${modeloZocoia} → ${modeloFinal} via Ollama (${OLLAMA_URL})`);
@@ -1213,9 +1262,12 @@ app.get('/api/cache/stats', authMiddleware, (req, res) => {
   });
 });
 
-app.put('/api/user/modelo', authMiddleware, (req, res) => {
+app.put('/api/user/modelo', authMiddleware, async (req, res) => {
   const { modelo } = req.body || {};
-  if (!MODELOS_VALIDOS.includes(modelo)) return res.status(400).json({ error: 'Modelo no válido' });
+  if (!MODELOS_VALIDOS.includes(modelo)) {
+    try { await fetchOllamaCatalog(); } catch {}
+    if (!DYNAMIC_OLLAMA_MODEL_MAP.has(modelo)) return res.status(400).json({ error: 'Modelo no válido' });
+  }
 
   db.prepare('UPDATE users SET modelo_activo = ? WHERE id = ?').run(modelo, req.auth.sub);
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.auth.sub);

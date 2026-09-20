@@ -16,6 +16,7 @@ interface MemoriaMensaje { id: string; role: string; content: string; created_at
 interface Payment { id: string; amount: number; credits: number; status: string; created_at: string; }
 interface CreditPack { id: string; euros: number; credits: number; label: string; }
 interface ChatMsg { role: string; content: string; cacheReadTokens?: number; }
+interface ModeloCatalogo { id: string; provider_model?: string; available?: boolean; details?: Record<string, any>; tier?: string; }
 
 function fmtEUR(n: number) { return `${(n || 0).toFixed(2)} €`; }
 function fmtDate(s: string) { return new Date(s).toLocaleDateString('es-ES'); }
@@ -26,6 +27,11 @@ const MODELOS = [
   { nombre: 'Zoco-Max', backend: 'zoco-max', badge: null, ollamaModel: 'OLLAMA_MODEL_MAX', tags: ['Proyectos complejos','Agentes','Programación'], color: 'from-orange-400 to-rose-500', icon: '◈' },
   { nombre: 'Zoco-Lab', backend: 'zoco-lab', badge: 'Beta', ollamaModel: 'OLLAMA_MODEL_LAB', tags: ['Experimental','Investigación','Nuevas capacidades'], color: 'from-purple-500 to-indigo-600', icon: '✦' },
 ];
+
+function nombreModelo(id: string) {
+  if (id.startsWith('zoco-')) return `Zoco-${id.slice(5).split('-').map(p => p.charAt(0).toUpperCase() + p.slice(1)).join('-')}`;
+  return id;
+}
 
 const RESOURCE_SECTIONS = [
   { key: 'archivo', label: 'Archivos', icon: '📁' },
@@ -46,6 +52,7 @@ export default function Dashboard() {
   const [keys, setKeys] = useState<ApiKey[]>([]);
   const [resourcesByType, setResourcesByType] = useState<Record<string, Recurso[]>>({});
   const [selectedModel, setSelectedModel] = useState('zoco-plus');
+  const [modelosDisponibles, setModelosDisponibles] = useState<ModeloCatalogo[]>(MODELOS.map(m => ({ id: m.backend, available: true })));
   
   // Modales
   const [agentModalOpen, setAgentModalOpen] = useState(false);
@@ -65,7 +72,8 @@ export default function Dashboard() {
     if (activeTab === 'panel' || activeTab === 'billing') loadBilling();
     if (activeTab === 'panel' || activeTab === 'agentes' || activeTab === 'mis-agentes') loadAgentes();
     if (activeTab === 'keys') loadKeys();
-  }, [activeTab]);
+    if (token) loadModelos();
+  }, [activeTab, token]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -89,6 +97,16 @@ export default function Dashboard() {
     try {
       const r = await fetch(`${API_BASE}/api/keys`, { headers: authHeaders() });
       if (r.ok) setKeys(await r.json());
+    } catch (e) {}
+  };
+
+  const loadModelos = async () => {
+    try {
+      const r = await fetch(`${API_BASE}/v1/models`, { headers: authHeaders() });
+      if (!r.ok) return;
+      const d = await r.json();
+      const disponibles = Array.isArray(d.data) ? d.data.filter((m: ModeloCatalogo) => m.available !== false) : [];
+      if (disponibles.length) setModelosDisponibles(disponibles);
     } catch (e) {}
   };
 
@@ -283,7 +301,7 @@ export default function Dashboard() {
               <div className="flex items-center justify-between mb-4 pb-4 border-b border-[#222]">
                 <div className="flex items-center space-x-3">
                   <select value={selectedModel} onChange={e => setSelectedModel(e.target.value)} className="bg-[#1a1a1a] border border-[#333] text-white text-xs rounded-lg px-3 py-1.5 outline-none focus:border-purple-500">
-                    {MODELOS.map(m => <option key={m.backend} value={m.backend}>{m.nombre}</option>)}
+                    {modelosDisponibles.map(m => <option key={m.id} value={m.id}>{nombreModelo(m.id)}{m.provider_model && !['zoco-flash','zoco-plus','zoco-max','zoco-lab'].includes(m.id) ? ` · ${m.provider_model}` : ''}</option>)}
                   </select>
                   {activeAgent && <span className="text-xs bg-purple-900/30 text-purple-300 px-2 py-1 rounded-full border border-purple-800/50">🤖 {activeAgent.name}</span>}
                 </div>
