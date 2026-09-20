@@ -254,7 +254,6 @@ async function fetchOllamaCatalog() {
   const now = Date.now();
   if (OLLAMA_CATALOG_CACHE.expiresAt > now) return OLLAMA_CATALOG_CACHE.models;
   const response = await fetch(`${OLLAMA_URL.replace(/\/+$/, '')}/api/tags`, {
-    headers: { Authorization: `Bearer ${OLLAMA_API_KEY}` },
     signal: AbortSignal.timeout(8000),
   });
   const body = await response.json().catch(() => ({}));
@@ -754,7 +753,6 @@ app.get('/v1/models', authMiddleware, async (req, res) => {
   }
   try {
     const response = await fetch(`${OLLAMA_URL.replace(/\/+$/, '')}/api/tags`, {
-      headers: { Authorization: `Bearer ${OLLAMA_API_KEY}` },
       signal: AbortSignal.timeout(5000),
     });
     const body = await response.json().catch(() => ({}));
