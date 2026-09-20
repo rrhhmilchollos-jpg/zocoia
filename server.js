@@ -163,7 +163,7 @@ function selectOllamaTools(tools = [], messages = []) {
 function getAIProviderConfig() {
   const requested = String(process.env.AI_PROVIDER || 'ollama').trim().toLowerCase();
   if (requested === 'ollama' || requested === 'local') {
-    return { provider: 'ollama', configured: !!OLLAMA_URL, modelResolver: resolveOllamaModel, label: 'Ollama local' };
+    return { provider: 'ollama', configured: !!(process.env.OLLAMA_BASE_URL || process.env.OLLAMA_URL), modelResolver: resolveOllamaModel, label: 'Ollama local' };
   }
   if (requested === 'anthropic' || requested === 'claude') {
     return { provider: 'anthropic', configured: !!process.env.ANTHROPIC_API_KEY, modelResolver: resolveClaudeModel, label: 'Claude Anthropic' };
@@ -171,7 +171,7 @@ function getAIProviderConfig() {
   if (requested === 'auto') {
     return process.env.ANTHROPIC_API_KEY
       ? { provider: 'anthropic', configured: true, modelResolver: resolveClaudeModel, label: 'Claude Anthropic' }
-      : { provider: 'ollama', configured: !!OLLAMA_URL, modelResolver: resolveOllamaModel, label: 'Ollama local' };
+      : { provider: 'ollama', configured: !!(process.env.OLLAMA_BASE_URL || process.env.OLLAMA_URL), modelResolver: resolveOllamaModel, label: 'Ollama local' };
   }
   return { provider: requested, configured: false, modelResolver: resolveOllamaModel, label: requested };
 }
@@ -826,7 +826,11 @@ async function callOllamaChatModel({ ollamaModel, messages, maxTokens, temperatu
       const body = await response.json().catch(() => ({}));
       if (!response.ok) {
         const error = new Error(body?.error?.message || body?.error || `Ollama respondió HTTP ${response.status}`);
-        error.status = response.status;
+        // No propagar 401/403 del proveedor como si fueran credenciales de
+        // ZocoIA. La clave del cliente ya fue validada por authMiddleware;
+        // cualquier fallo posterior es un error de upstream.
+        error.status = response.status === 429 ? 503 : 502;
+        error.code = 'ai_provider_error';
         throw error;
       }
       const message = body?.message || {};
@@ -1067,6 +1071,34 @@ async function processChatCompletion(authSub, { agentId, messages, model, temper
 // ─── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get(['/health', '/salud'], (req, res) => res.json({ status: 'ok', message: 'Zoco IA conectado con éxito' }));
+
+// OpenAI-compatible discovery endpoint used by integrations such as MarisAI.
+// It reports public aliases only and verifies that the configured Ollama tags
+// are actually reachable from the backend runtime.
+app.get('/v1/models', authMiddleware, async (req, res) => {
+  try {
+    const response = await fetch(`${OLLAMA_URL.replace(/\/+$/, '')}/api/tags`, {
+      headers: { Authorization: `Bearer ${OLLAMA_API_KEY}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      return res.status(502).json({ error: 'El proveedor de modelos no está disponible', code: 'ai_provider_unavailable' });
+    }
+    const installed = new Set((Array.isArray(body?.models) ? body.models : []).map((model) => model?.name).filter(Boolean));
+    const aliases = Object.entries(OLLAMA_MODEL_MAP).map(([alias, configuredModel]) => ({
+      id: alias,
+      object: 'model',
+      owned_by: 'zocoia',
+      available: installed.has(configuredModel),
+      provider_model: configuredModel,
+    }));
+    res.json({ object: 'list', data: aliases });
+  } catch (error) {
+    console.error('[v1/models] proveedor no disponible:', error?.message || error);
+    res.status(502).json({ error: 'No se pudo conectar con el proveedor de modelos', code: 'ai_provider_unavailable' });
+  }
+});
 
 if (registerEventStreamRoute) {
   try {
