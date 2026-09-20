@@ -1313,8 +1313,10 @@ app.post('/api/keys', authMiddleware, (req, res) => {
 app.delete('/api/keys/:id', authMiddleware, (req, res) => {
   const key = db.prepare('SELECT * FROM api_keys WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.sub);
   if (!key) return res.status(404).json({ error: 'Clave no encontrada' });
-  db.prepare('DELETE FROM api_keys WHERE id = ?').run(req.params.id);
-  res.json({ ok: true });
+  // Las API keys son registros auditables y nunca se eliminan físicamente.
+  // El botón existente conserva su semántica manual, pero revoca la clave.
+  db.prepare('UPDATE api_keys SET revoked = 1 WHERE id = ?').run(req.params.id);
+  res.json({ ok: true, revoked: true, id: req.params.id });
 });
 
 app.put('/api/keys/:id', authMiddleware, (req, res) => {
